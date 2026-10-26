@@ -81,6 +81,7 @@ from asr import (                                            # noqa: E402
 from llm import from_env                                    # noqa: E402
 from linkmeta import (                                      # noqa: E402
     card_info,
+    card_note,
     enabled as link_enabled,
     extract_urls,
     frames_available,
@@ -424,14 +425,93 @@ async def _plain_with_mentions(event: MessageEvent) -> str:
     return "".join(parts).strip()
 
 
+def _reply_segments(raw) -> list:
+    """被引用消息的段：可能是 Message / 段数组 / CQ 字符串，统一成段列表。"""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            return list(Message(raw))
+        except Exception:                     # noqa: BLE001   解析失败就当没有内容
+            return []
+    segs = []
+    for s in raw:
+        if isinstance(s, MessageSegment):
+            segs.append(s)
+        elif isinstance(s, dict):
+            segs.append(MessageSegment(s.get("type") or "", s.get("data") or {}))
+    return segs
+
+
+async def _reply_bits(bot, raw) -> list:
+    """把一条被引用消息渲染成人话：文字原样、图片判读、卡片摘要、语音转写。"""
+    bits = []
+    for s in _reply_segments(raw):
+        stype, sdata = s.type, dict(s.data or {})
+        if stype == "text" and str(sdata.get("text") or "").strip():
+            bits.append(f"「{str(sdata['text']).strip()[:120]}」")
+        elif stype in ("image", "mface"):
+            url = sdata.get("url") or sdata.get("file") or ""
+            data = None
+            if url.startswith("http"):
+                data = await asyncio.get_running_loop().run_in_executor(
+                    None, download_image, url)
+            if not data:
+                bits.append("（引用的图片没拉到）")
+                continue
+            try:
+                info = await asyncio.wait_for(classify_image_bytes(data), timeout=20)
+                d = _img_note([info]).strip("（）")
+                bits.append(d or "一张图片")
+            except Exception:                 # noqa: BLE001
+                bits.append("（引用的图片没看清）")
+        elif stype == "json":
+            info = card_info(sdata.get("data"))
+            if not info:
+                bits.append("（引用的卡片没解析出来）")
+                continue
+            note = card_note(info).strip("（）")
+            if info.get("url"):
+                note = f"{note}｜链接={info['url']}"
+            bits.append(note)
+            logger.info(f"[jinyu] 引用卡片已展开 "
+                        f"标题={info.get('title') or info.get('desc')!r}")
+        elif stype == "record":
+            text = ""
+            try:
+                raw_voice = await fetch_voice(bot, sdata)
+                if raw_voice:
+                    text = await asyncio.wait_for(
+                        asyncio.to_thread(asr_transcribe, raw_voice), timeout=60)
+            except Exception:                 # noqa: BLE001  语音转写失败只降级
+                text = ""
+            bits.append(f"「语音：{text[:120]}」" if text
+                        else "（一条语音，没听清）")
+    return bits
+
+
 async def _expand_reply(event: MessageEvent) -> str:
     """把「引用」展开成人话：引用了谁、原文是什么、引用的图里有什么。
 
-    以前引用只留下 [CQ:reply,id=xxx]，前台模型不知道用户在回应哪句话/哪张图。
-    文字直接取原消息；图片下载后走视觉判读（按 md5 缓存，引用刚发过的图基本
-    零成本）。任何一步失败都降级为「引用了一条消息」，绝不影响正常回复。
+    NoneBot v11 适配器会把 reply 段从 event.message 里摘走、把原消息放进
+    event.reply（onebot/v11/bot.py 的 _check_reply），所以在 message 里找
+    reply 段永远找不到——必须读 event.reply，否则引用内容一律为空。
+    适配器取原消息失败时 reply 段会留在 message 里，这时再走 get_msg 兜底。
+    任何一步失败都降级为「引用了一条消息」，绝不影响正常回复。
     """
     notes = []
+    bot = get_bot()
+    reply = getattr(event, "reply", None)
+    if reply is not None:
+        sender = getattr(reply, "sender", None)
+        who = (getattr(sender, "nickname", "") or
+               str(getattr(sender, "user_id", "") or "某人"))
+        try:
+            bits = await _reply_bits(bot, getattr(reply, "message", None))
+        except Exception:                     # noqa: BLE001   展开失败只降级
+            bits = []
+        notes.append(f"（引用 {who} 的消息：{'；'.join(bits)}）" if bits
+                     else f"（引用了 {who} 的一条消息）")
     for seg in event.message:
         if seg.type != "reply":
             continue
@@ -442,46 +522,18 @@ async def _expand_reply(event: MessageEvent) -> str:
         if not mid:
             continue
         try:
-            bot = get_bot()
             src = await bot.call_api("get_msg", message_id=mid)
         except Exception:                     # noqa: BLE001   消息太旧/已撤回等
             notes.append("（引用了一条已查不到的消息）")
             continue
         sender = src.get("sender") or {}
         who = sender.get("nickname") or str(sender.get("user_id") or "某人")
-        bits = []
-        for s in src.get("message") or []:
-            stype, sdata = s.get("type"), (s.get("data") or {})
-            if stype == "text" and str(sdata.get("text") or "").strip():
-                bits.append(f"「{str(sdata['text']).strip()[:120]}」")
-            elif stype in ("image", "mface"):
-                url = sdata.get("url") or sdata.get("file") or ""
-                data = None
-                if url.startswith("http"):
-                    data = await asyncio.get_running_loop().run_in_executor(
-                        None, download_image, url)
-                if not data:
-                    bits.append("（引用的图片没拉到）")
-                    continue
-                try:
-                    info = await asyncio.wait_for(classify_image_bytes(data), timeout=20)
-                    d = _img_note([info]).strip("（）")
-                    bits.append(d or "一张图片")
-                except Exception:         # noqa: BLE001
-                    bits.append("（引用的图片没看清）")
-            elif stype == "record":
-                text = ""
-                try:
-                    raw = await fetch_voice(bot, sdata)
-                    if raw:
-                        text = await asyncio.wait_for(
-                            asyncio.to_thread(asr_transcribe, raw), timeout=60)
-                except Exception:         # noqa: BLE001  语音转写失败只降级
-                    text = ""
-                bits.append(f"「语音：{text[:120]}」" if text
-                            else "（一条语音，没听清）")
+        bits = await _reply_bits(bot, src.get("message"))
         notes.append(f"（引用 {who} 的消息：{'；'.join(bits)}）" if bits
                      else f"（引用了 {who} 的一条消息）")
+    if notes:
+        logger.info(f"[jinyu] 引用已展开 user={event.user_id} "
+                    f"内容={'；'.join(notes)[:100]!r}")
     return "".join(notes)
 
 
@@ -531,16 +583,26 @@ async def _link_notes(text: str, event: MessageEvent) -> str:
             info = card_info((seg.data or {}).get("data"))
             if info:
                 cards.append(info)
-    urls = extract_urls(text)
-    for card in cards:
-        if card["url"] not in urls:
-            urls.append(card["url"])
-    if not urls:
-        return ""
-    urls = urls[:3]
-    card_by_url = {c["url"]: c for c in cards}
-    want_frames = bool(_VIDEO_INTENT.search(text))
     notes = []
+    urls = []
+    for card in cards:
+        if card.get("url"):
+            if card["url"] not in urls:
+                urls.append(card["url"])
+        else:                                   # 小程序卡片常常没有能打开的网页地址
+            note = card_note(card)
+            if note:
+                notes.append(note)
+                logger.info(f"[jinyu] 卡片无链接，只注入摘要 "
+                            f"{card.get('title') or card.get('desc')!r}")
+    for url in extract_urls(text):
+        if url not in urls:
+            urls.append(url)
+    if not urls:
+        return "".join(notes)
+    urls = urls[:3]
+    card_by_url = {c["url"]: c for c in cards if c.get("url")}
+    want_frames = bool(_VIDEO_INTENT.search(text))
     for url in urls:
         host = urlparse(url).hostname or ""
         try:
@@ -1063,8 +1125,9 @@ async def _handle(event: MessageEvent):
     text = await _plain_with_mentions(event)
     has_img = any(seg.type in ("image", "mface") for seg in event.message)
     has_voice = _has_voice(event)
+    has_card = any(seg.type == "json" for seg in event.message)   # 分享卡片常常没有文字
     is_group = isinstance(event, GroupMessageEvent)
-    if not text and not has_img and not has_voice:
+    if not text and not has_img and not has_voice and not has_card:
         return
     if mw is None:
         _media_futs.pop(str(event.message_id), None)
@@ -1129,17 +1192,18 @@ async def _handle(event: MessageEvent):
     infos, quote_note, voice_note, link_note = await asyncio.gather(
         _media(), _qnote(), _vnote(), _lnote())
     if not text:
+        # 纯卡片/纯引用也可能承载全部信息，别让它变成「没看清内容」
         text = (_img_note(infos) if has_img else "") or voice_note or quote_note \
-            or "（发来一条消息，但没看清内容）"
+            or link_note or "（发来一条消息，但没看清内容）"
     else:
         if has_img:
             text += _img_note(infos)
         if voice_note:
             text += voice_note
-    if quote_note and quote_note not in text:
-        text += quote_note
-    if link_note:
-        text += link_note
+        if quote_note and quote_note not in text:
+            text += quote_note
+        if link_note:
+            text += link_note
     if remind_note:
         text += remind_note
     if _silent_count.get(sid, 0) >= MAX_SILENT:
