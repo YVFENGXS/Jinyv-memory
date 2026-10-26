@@ -37,7 +37,7 @@
   RP_LINK                           选填，1/0 链接抓取，默认 1
   RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
   RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
-  RP_ADMIN_QQ                       选填，允许 /save /tags /find /img /sticker /voice /testrich 的 QQ
+  RP_ADMIN_QQ                       选填，允许 /persona /save /tags /find /img /sticker /voice /testrich 的 QQ
   RP_SESSION_EPOCH_HOURS            选填，闲置多少小时后开启新会话 epoch，默认 48，0=不轮换
   RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
 """
@@ -85,6 +85,7 @@ from linkmeta import (                                      # noqa: E402
     note_for as link_note_for,
     video_frames_note,
 )
+import persona as persona_mod                               # noqa: E402
 from persona import PERSONA                                 # noqa: E402
 from richmsg import (                                       # noqa: E402
     DOWNLOAD_LIMIT,
@@ -725,6 +726,37 @@ async def _on_poke(event) -> None:
         await _send_poke(event)
 
 
+_PERSONA_TAG = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]{3,})(?![A-Za-z0-9_])")
+
+
+def _persona_report(event: MessageEvent) -> str:
+    """当前会话实际生效的人设：词条、正文、禁忌与附加规则（只读）。"""
+    core = str(PERSONA.get("core") or "")
+    tags: list[str] = []
+    # 词条还包括 persona.py 头部的【PERSONA_LOAD】清单（如 CETACEA_LOLI）
+    for tag in _PERSONA_TAG.findall((persona_mod.__doc__ or "") + core):
+        if tag != "PERSONA_LOAD" and tag not in tags:   # 头部标签不是人设词条
+            tags.append(tag)
+    extra = []
+    if rich_enabled():
+        extra.append("富消息说明（图片/贴纸/语音/搜图标记）")
+    if isinstance(event, GroupMessageEvent):
+        extra.append("群聊模式（说话人前缀、按昵称互动）")
+    parts = [
+        f"【当前会话】{_sid(event)}｜角色={PERSONA.get('name') or '?'}"
+        f"｜{'群聊' if isinstance(event, GroupMessageEvent) else '私聊'}",
+        f"【角色词条】{' / '.join(tags) or '无'}",
+        "【人设正文】\n" + core,
+    ]
+    if PERSONA.get("taboo_words"):
+        parts.append("【禁忌词】" + "、".join(map(str, PERSONA["taboo_words"])))
+    if PERSONA.get("forbidden_punct"):
+        parts.append("【禁用标点】" + "".join(map(str, PERSONA["forbidden_punct"])))
+    parts.append(f"【风格】{PERSONA.get('style') or '默认'}")
+    parts.append("【附加规则】" + ("、".join(extra) if extra else "无"))
+    return "\n".join(parts)
+
+
 async def _admin(event: MessageEvent, text: str) -> bool:
     """管理员自测/管理命令，绕过模型。"""
     if not ADMIN or str(event.user_id) not in ADMIN:
@@ -741,6 +773,9 @@ async def _admin(event: MessageEvent, text: str) -> bool:
                 mw.session_identity, sid, CID, EPOCH_SECONDS,
                 force=True, flush_timeout=EPOCH_FLUSH)
         await matcher.finish(f"已开新会话（{new_sid}），长期事实和 strict 承诺已继承。")
+        return True
+    if cmd in ("persona", "人设"):
+        await matcher.finish(_persona_report(event))
         return True
     if cmd == "voice" and arg:
         audio = await tts_audio(arg)
