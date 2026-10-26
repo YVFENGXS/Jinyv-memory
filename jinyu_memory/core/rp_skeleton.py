@@ -18,6 +18,7 @@ R6-R9 阶段二：事件卡扩列（rel_hooks / knowledge_boundary / importance 
 """
 import copy, hashlib, json, logging, math, queue, re, sqlite3, threading, time, uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import conflict, promise, retriever
 from persona_guard import PersonaGuard
@@ -44,6 +45,45 @@ CROSS_TOKEN_MAX = 600    # 跨会话两段合计 token 上限（含标签与开�
 # 头尾双锚（人设 + 账本）永远不截断——它们被丢等于角色失去身份。
 WARN_RATIO, PRE_RATIO, HARD_RATIO, FUSE_RATIO = 0.6, 0.7, 0.8, 0.9
 SURGERY_TARGET = 0.4
+
+
+# ---------- 时间感知：模型看不到墙上的钟，得把「现在」写进上下文 ----------
+WEEK_CN = "周一周二周三周四周五周六周日"
+RECENT_GAP_SECONDS = 1800   # 热窗相邻消息间隔 ≥30 分钟时，给用户消息加时间戳前缀
+
+
+def _parse_utc(ts) -> "datetime | None":
+    """库里 created_at 是 SQLite UTC 文本（datetime('now')），转本地时区；坏值返回 None。"""
+    try:
+        return datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S") \
+            .replace(tzinfo=timezone.utc).astimezone()
+    except (TypeError, ValueError):
+        return None
+
+
+def _human_gap(sec: float) -> str:
+    if sec >= 172800:
+        return f"{sec / 86400:.0f} 天"
+    if sec >= 5400:
+        return f"{sec / 3600:.0f} 小时"
+    return f"{max(1, round(sec / 60)):.0f} 分钟"
+
+
+def _now_line(last_dt=None) -> str:
+    """「现在几点」锚：随账本每轮注入；距最近一条消息太久时补一句人话间隔。"""
+    now = datetime.now().astimezone()
+    wk = WEEK_CN[now.weekday() * 2: now.weekday() * 2 + 2]
+    line = f"当前时间：{now:%Y-%m-%d %H:%M} {wk}"
+    if last_dt is not None:
+        sec = (now - last_dt).total_seconds()
+        if sec >= RECENT_GAP_SECONDS:
+            line += f"（距最近一条消息已约 {_human_gap(sec)}）"
+    return line
+
+
+def _stamp(dt: datetime, now: datetime) -> str:
+    fmt = "%Y-%m-%d %H:%M" if dt.year != now.year else "%m-%d %H:%M"
+    return f"[{dt:{fmt}}]"
 
 
 def est_tokens(text: str, profile: str = "cl100k") -> int:
@@ -210,7 +250,8 @@ class DB:
                              (sid, cid)).fetchone()[0]
 
     def get_turns(self, sid, cid, lo=1, hi=None):  # 闭区间 [lo, hi]；hi=None 到最新
-        sql = "SELECT turn_idx, role, content FROM turns WHERE session_id=? AND character_id=? AND turn_idx>=?"
+        sql = "SELECT turn_idx, role, content, created_at FROM turns" \
+              " WHERE session_id=? AND character_id=? AND turn_idx>=?"
         args = [sid, cid, lo]
         if hi is not None:
             sql += " AND turn_idx<=?"
@@ -531,7 +572,8 @@ class RPContextMiddleware:
             self._last_error = f"{type(e).__name__}: {e}"
             logger.exception("前台上下文构建失败，降级为仅人设 sid=%s cid=%s", sid, cid)
             turn = self._fallback_turn.get((sid, cid), 0) + 1
-            msgs, degraded = [{"role": "system", "content": persona["core"]}], True
+            msgs, degraded = [{"role": "system",
+                               "content": persona["core"] + "\n" + _now_line()}], True
         self._fallback_turn[(sid, cid)] = turn
         msgs.append({"role": "user", "content": user_input})   # R1：只在末尾注入一次
         reply = self._guard_reply(msgs, persona, sid, cid)
@@ -606,8 +648,10 @@ class RPContextMiddleware:
                                   limit=self.recall_limit,
                                   exclude_ids=shown | {c["event_id"] for c in strict})
         hits = [(s, c) for s, c in hits if not retriever.suspicious(c["summary"])]
-        ledger_txt = (f"情绪：{lg['mood']}\n地点：{lg['location'] or '未知'}\n关系："
-                      + json.dumps(lg["relationship"], ensure_ascii=False))
+        last_dt = _parse_utc(turns[-1].get("created_at")) if turns else None
+        ledger_txt = _now_line(last_dt) + (
+            f"\n情绪：{lg['mood']}\n地点：{lg['location'] or '未知'}\n关系："
+            + json.dumps(lg["relationship"], ensure_ascii=False))
         open_promises = [retriever.clean_text(t, 40) for t in promise.texts(lg)]
         if open_promises:
             ledger_txt += "\n未兑现承诺：" + "；".join(open_promises)
@@ -641,7 +685,18 @@ class RPContextMiddleware:
         if strict_skipped:
             logger.info("strict 卡超出注入上限 %d，本次跳过 sid=%s cid=%s：%s",
                         STRICT_CARD_MAX, sid, cid, "；".join(strict_skipped))
-        recent = [{"role": t["role"], "content": t["content"]} for t in turns]
+        recent, prev_dt = [], None                          # 热窗时间标注：见 _stamp / RECENT_GAP_SECONDS
+        now = datetime.now().astimezone()
+        for t in turns:
+            dt = _parse_utc(t.get("created_at"))
+            gap_open = dt is not None and (prev_dt is None or
+                                           (dt - prev_dt).total_seconds() >= RECENT_GAP_SECONDS)
+            if t["role"] == "user" and t["content"] and gap_open:
+                recent.append({"role": "user", "content": f"{_stamp(dt, now)} {t['content']}"})
+            else:
+                recent.append({"role": t["role"], "content": t["content"]})
+            if dt is not None:
+                prev_dt = dt
         out, dropped, level = self._fit(anchors, sections, recent, sid, cid)
         if dropped and turns:                          # 手术确实丢了轮次才投；level 仅用于可读
             f = max(self._floor.get((sid, cid), 0), turns[dropped - 1]["turn_idx"])

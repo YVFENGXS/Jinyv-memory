@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """回归测试：python test_regression.py
 阶段一：R1 消息不重复 / R2 归档确定性 / R3 shutdown 冲刷 / R4 token 上界 /
         R5 归档失败可见化与重试 / 会话隔离 / 重启恢复 / 幂等
@@ -8,20 +8,7 @@
         R12 停用字与追问判定 / R13 规则召回注入 strict 卡 /
         R14 同批建兑不误报 / R15 候选清单一致性 / R16 空区间单事务
 """
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / "examples"))
-sys.path.insert(0, str(ROOT.parent / "jinyu_memory" / "core"))
-
-
-def tmp(name):
-    """跨平台临时库路径（测试不写死 /tmp，Windows 也能直接跑）。"""
-    return str(Path(tempfile.gettempdir()) / name)
-
-import json, math, sqlite3, tempfile, time
+import json, math, sqlite3, time
 from pathlib import Path
 
 import retriever
@@ -166,7 +153,7 @@ def test_archive_deterministic():
     """R2：同一脚本连跑 3 次，卡数/区间/游标/账本完全一致。"""
     snapshots = []
     for i in range(3):
-        db_path = tmp(f"rp_det_{i}.db")
+        db_path = f"/tmp/rp_det_{i}.db"
         mw, _ = run_session(db_path, "s1", SCRIPT)
         db = mw.db
         snapshots.append({
@@ -185,7 +172,7 @@ def test_archive_deterministic():
 
 def test_no_duplicate_user_message():
     """R1：当前用户消息只注入一次。"""
-    mw, front = run_session(tmp("rp_dup.db"), "s1", ["这把伞是你的吗？"])
+    mw, front = run_session("/tmp/rp_dup.db", "s1", ["这把伞是你的吗？"])
     users = [m for m in front.last_messages if m["role"] == "user"]
     assert len(users) == 1, front.last_messages
     assert users[0]["content"] == "这把伞是你的吗？"
@@ -194,7 +181,7 @@ def test_no_duplicate_user_message():
 
 def test_shutdown_flush_odd_turn():
     """R3：11 轮（奇数余量）后 shutdown 冲刷，热窗口恰为 keep_recent=2。"""
-    mw, _ = run_session(tmp("rp_flush.db"), "s1", SCRIPT + ["他把伞骨一根根摆回柜台"])
+    mw, _ = run_session("/tmp/rp_flush.db", "s1", SCRIPT + ["他把伞骨一根根摆回柜台"])
     db = mw.db
     cursor, max_turn = db.get_cursor("s1", "c1"), db.max_turn("s1", "c1")
     assert max_turn == 11, max_turn
@@ -214,7 +201,7 @@ def test_shutdown_segmented_flush():
     """
     # 快后端：追平 + 区间有界
     mw = RPContextMiddleware(MockFront("沈青梧"), SlowBack(0.01),
-                             fresh(tmp("rp_flush_fast.db")),
+                             fresh("/tmp/rp_flush_fast.db"),
                              archive_batch=2, shutdown_timeout=5)
     for text in SCRIPT[:9]:
         mw.chat(text, PERSONA, "s1", "c1")
@@ -227,7 +214,7 @@ def test_shutdown_segmented_flush():
 
     # 坏后端：记录失败后立即放弃，不等满超时
     mw = RPContextMiddleware(MockFront("沈青梧"), SlowBack(0.01, fail=True),
-                             fresh(tmp("rp_flush_fail.db")),
+                             fresh("/tmp/rp_flush_fail.db"),
                              archive_batch=2, shutdown_timeout=5)
     for text in SCRIPT[:6]:
         mw.chat(text, PERSONA, "s1", "c1")
@@ -240,7 +227,7 @@ def test_shutdown_segmented_flush():
 
     # 慢后端：总超时封顶，残留保留在库里等下次自然归档
     mw = RPContextMiddleware(MockFront("沈青梧"), SlowBack(1.0),
-                             fresh(tmp("rp_flush_slow.db")),
+                             fresh("/tmp/rp_flush_slow.db"),
                              archive_batch=2, shutdown_timeout=0.6)
     for text in SCRIPT[:6]:
         mw.chat(text, PERSONA, "s1", "c1")
@@ -256,7 +243,7 @@ def test_shutdown_segmented_flush():
 
 def test_isolation_and_restart():
     """P0-2 / P0-4：跨会话隔离 + 新实例（重启）恢复。"""
-    db_path = tmp("rp_iso.db")
+    db_path = "/tmp/rp_iso.db"
     mw, _ = run_session(db_path, "s1", SCRIPT)
     assert mw.db.load_ledger("s1", "c1")["relationship"]["trust"] == 0.2
 
@@ -270,7 +257,7 @@ def test_isolation_and_restart():
 
 def test_idempotency_keys_distinct():
     """P0-1：每个归档区间一个幂等键，不重复。"""
-    mw, _ = run_session(tmp("rp_idem.db"), "s1", SCRIPT)
+    mw, _ = run_session("/tmp/rp_idem.db", "s1", SCRIPT)
     db = mw.db
     with db._c() as c:
         total, distinct = c.execute(
@@ -298,7 +285,7 @@ def test_token_estimate_upper_bound():
 
 def test_archive_failure_visible_and_retry():
     """R5：后台持续失败 → 按区间累计 attempts/last_error，游标不动；恢复后重试成功并清账。"""
-    db_path = tmp("rp_fail.db")
+    db_path = "/tmp/rp_fail.db"
     for suffix in ("", "-wal", "-shm"):
         Path(db_path + suffix).unlink(missing_ok=True)
     db = DB(db_path)
@@ -335,7 +322,7 @@ def test_archive_failure_visible_and_retry():
 
 def test_recall_core_word_and_boundary():
     """R6：核心词回退（旧伞 被「伞」召回）+ knowledge_boundary=player 不注入 + 冲突降权。"""
-    db = fresh(tmp("rp_recall.db"))
+    db = fresh("/tmp/rp_recall.db")
     base = dict(session_id="s1", character_id="c1", turn_start=1, turn_end=2,
                 summary="他把旧伞修好送回来", state_changes={}, entity_hooks=["旧伞"],
                 importance=0.5, knowledge_boundary="both")
@@ -354,7 +341,7 @@ def test_recall_core_word_and_boundary():
 
 def test_summary_self_repair():
     """R7：首次校验失败 → 回喂错误重试一次 → 卡正常入库，失败表无记录。"""
-    db = fresh(tmp("rp_repair.db"))
+    db = fresh("/tmp/rp_repair.db")
     back = FlakyBack()
     mw = RPContextMiddleware(MockFront("沈青梧"), back, db)
     for text in SCRIPT[:4]:
@@ -368,7 +355,7 @@ def test_summary_self_repair():
 
 def test_conflict_flags_only():
     """R8：重复摘要 + 兑现未知承诺 → 标注但照常入库（不拦截）。"""
-    db = fresh(tmp("rp_conflict.db"))
+    db = fresh("/tmp/rp_conflict.db")
     mw = RPContextMiddleware(MockFront("沈青梧"), DupBack(), db)
     for text in SCRIPT[:6]:                             # 6 轮 = 2 个归档批次
         mw.chat(text, PERSONA, "s1", "c1")
@@ -383,7 +370,7 @@ def test_conflict_flags_only():
 
 def test_persona_hard_rule_regenerate():
     """R9：禁忌词命中 → 带纠正提示重生成一次 → 最终回复合规，计数 1。"""
-    db = fresh(tmp("rp_guard.db"))
+    db = fresh("/tmp/rp_guard.db")
     front = FlipFront()
     persona = dict(PERSONA, taboo_words=["该死的"])
     mw = RPContextMiddleware(front, MockBack(), db)
@@ -406,7 +393,7 @@ def _card(**kw):
 
 def test_promise_lifecycle():
     """R10：建承诺 → 下批 prompt 带候选 ID → 按 ID 兑现出账（不进未兑现段）。"""
-    db = fresh(tmp("rp_promise.db"))
+    db = fresh("/tmp/rp_promise.db")
     back = PromiseBack()
     mw = RPContextMiddleware(MockFront("沈青梧"), back, db)
     for text in SCRIPT[:6]:                             # 6 轮 = 2 个归档批次
@@ -422,7 +409,7 @@ def test_promise_lifecycle():
 
 def test_promise_unmatched_keeps_open():
     """R10b：兑现文本配不上账本 → 承诺保持 open + 记 unmatched，宁可漏关不可错关。"""
-    db = fresh(tmp("rp_promise_open.db"))
+    db = fresh("/tmp/rp_promise_open.db")
     mw = RPContextMiddleware(MockFront("沈青梧"), BadResolveBack(), db)
     for text in SCRIPT[:6]:
         mw.chat(text, PERSONA, "s1", "c1")
@@ -436,7 +423,7 @@ def test_promise_unmatched_keeps_open():
 
 def test_archive_transaction_atomic():
     """R11：卡/账本/游标/清失败同一事务——落库失败时四者都不变，内存账本不被污染。"""
-    db = fresh(tmp("rp_tx.db"))
+    db = fresh("/tmp/rp_tx.db")
     mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db)
     orig = db.commit_archive
 
@@ -464,7 +451,7 @@ def test_archive_transaction_atomic():
 
 def test_duplicate_commit_no_double_apply():
     """R11b：撞幂等键 = 重复投递：不覆盖账本，但游标照常推进。"""
-    db = fresh(tmp("rp_dup_commit.db"))
+    db = fresh("/tmp/rp_dup_commit.db")
     card = _card(event_id="E1", idempotency_key="same",
                  state_changes={"relationship": {"trust": 0.2}})
     lg1 = {"relationship": {"trust": 0.2}, "mood": "平静", "location": "", "promises": []}
@@ -489,7 +476,7 @@ def test_stop_chars_and_recall_intent():
 
 def test_rule_recall_injects_strict():
     """R13：强追问词 → strict 卡进【硬记忆】；普通闲聊不注入。"""
-    db = fresh(tmp("rp_strict.db"))
+    db = fresh("/tmp/rp_strict.db")
     db.insert_card(_card(event_id="E_strict", idempotency_key="k1"))
     db.insert_card(_card(event_id="E_recent", idempotency_key="k2", turn_start=3, turn_end=4,
                          summary="客人问起天气", entity_hooks=["天气"], precision="normal"))
@@ -510,7 +497,7 @@ def test_rule_recall_injects_strict():
 
 def test_conflict_same_batch_promise():
     """R14：同批「既建又兑」是合法兑现，R2 不得误报。"""
-    db = fresh(tmp("rp_samebatch.db"))
+    db = fresh("/tmp/rp_samebatch.db")
     mw = RPContextMiddleware(MockFront("沈青梧"), SameBatchBack(), db)
     for text in SCRIPT[:4]:                             # 4 轮 = 1 个归档批次
         mw.chat(text, PERSONA, "s1", "c1")
@@ -535,7 +522,7 @@ def test_promise_prompt_consistency():
 
 def test_advance_cursor_clears_failures():
     """R16：空区间推进游标与清失败同一事务。"""
-    db = fresh(tmp("rp_advance.db"))
+    db = fresh("/tmp/rp_advance.db")
     db.record_failure("s1", "c1", 3, 4, "boom")
     db.advance_cursor("s1", "c1", 3, 4)
     assert db.get_cursor("s1", "c1") == 4, db.get_cursor("s1", "c1")
@@ -586,7 +573,7 @@ class RestateBack:
 
 def test_same_batch_restatement_keeps_open():
     """R19：豆包 Q1——同批只有应允语不算兑现，承诺保持 open。"""
-    db = fresh(tmp("rp_restate.db"))
+    db = fresh("/tmp/rp_restate.db")
     mw = RPContextMiddleware(MockFront("沈青梧"), RestateBack(), db)
     for text in SCRIPT[:4]:
         mw.chat(text, PERSONA, "s1", "c1")
@@ -618,7 +605,7 @@ def test_strict_cap_and_resolved_cap():
 
 def test_ledger_corruption_quarantined():
     """R21：Gemini B3——账本 JSON 损坏不永久崩溃，原文隔离，以空账本继续。"""
-    db = fresh(tmp("rp_corrupt.db"))
+    db = fresh("/tmp/rp_corrupt.db")
     with db._c() as c:
         c.execute("INSERT OR REPLACE INTO state_ledger VALUES(?,?,?)", ("s1", "c1", "{not json"))
     assert db.load_ledger("s1", "c1") is None
@@ -649,7 +636,7 @@ class BrokenDB:
 
 def test_chat_degrades_on_db_read_failure():
     """R22：Gemini B2——DB 读失败降级为仅人设，不把前台对话打崩。"""
-    inner = fresh(tmp("rp_degraded.db"))
+    inner = fresh("/tmp/rp_degraded.db")
     mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), BrokenDB(inner))
     reply = mw.chat("伞还在吗", PERSONA, "s1", "c1")
     assert reply and "沈青梧" in reply, reply
@@ -660,7 +647,7 @@ def test_chat_degrades_on_db_read_failure():
 
 def test_strict_injection_bounded_and_quarantined():
     """R23：Gemini A2 + ChatGPT Q1——strict 卡注入 ≤8，可疑摘要隔离不注入。"""
-    db = fresh(tmp("rp_strictcap.db"))
+    db = fresh("/tmp/rp_strictcap.db")
     for i in range(16):
         db.insert_card(_card(event_id=f"E-{i}", turn_start=2 * i + 1, turn_end=2 * i + 2,
                              summary=f"沈青梧答应替客人保守第{i}个秘密", precision="strict",
@@ -691,7 +678,7 @@ def test_summary_rejects_meaningless_text():
 def test_cross_session_strict_recall():
     """R25：跨会话只召回 strict ∧ 可核验，正常卡与 player 边界卡不跨界。"""
     import promise
-    db = fresh(tmp("rp_cross.db"))
+    db = fresh("/tmp/rp_cross.db")
     db.set_continuity("s1", "c1", "cont-1")
     db.insert_card(_card(event_id="E-p", turn_start=1, turn_end=2,
                          summary="沈青梧答应替客人保守伞铺的秘密",
@@ -724,7 +711,7 @@ def test_cross_session_strict_recall():
 
 def test_cross_session_requires_continuity():
     """R26：未声明 continuity 时零跨会话注入（不按 character_id 裸连接）。"""
-    db = fresh(tmp("rp_cross_none.db"))
+    db = fresh("/tmp/rp_cross_none.db")
     db.insert_card(_card(event_id="E-p", turn_start=1, turn_end=2,
                          state_changes={"pending_promises": ["答应带伞"]},
                          idempotency_key="k1"))
@@ -741,7 +728,7 @@ def test_cross_session_requires_continuity():
 
 def test_pin_promotes_non_strict_card():
     """R27：显式「记住这件事」可把普通卡提升为跨会话可见，且需唯一命中。"""
-    db = fresh(tmp("rp_pin.db"))
+    db = fresh("/tmp/rp_pin.db")
     db.set_continuity("s1", "c1", "cont-1")
     db.insert_card(_card(event_id="E-old", turn_start=1, turn_end=2,
                          summary="沈青梧把旧伞收进柜台", state_changes={}, precision="normal",
@@ -762,7 +749,7 @@ def test_pin_promotes_non_strict_card():
 
 def test_cross_session_injection_bounded():
     """R28：跨会话卡注入上限 8 张（token 预算之外的硬上限）。"""
-    db = fresh(tmp("rp_cross_cap.db"))
+    db = fresh("/tmp/rp_cross_cap.db")
     db.set_continuity("s1", "c1", "cont-1")
     for i in range(12):
         db.insert_card(_card(event_id=f"E-{i}", turn_start=2 * i + 1, turn_end=2 * i + 2,
@@ -791,7 +778,7 @@ def _cross_card(db, eid, summary, value, turn_end, key="旧伞", slot="归属"):
 def test_cross_session_conflicting_claims():
     """R29：跨会话 claims 矛盾——较晚者胜；取值相同不矛盾；无法定序则两者都丢。"""
     # (a) 取值冲突：s1 较早 → 只留较晚
-    db = fresh(tmp("rp_conflict_a.db"))
+    db = fresh("/tmp/rp_conflict_a.db")
     db.set_continuity("s1", "c1", "cont-1")
     _cross_card(db, "E-old", "沈青梧把旧伞交给了掌柜", "掌柜", 2)
     _cross_card(db, "E-new", "沈青梧把旧伞交给了客人", "客人", 4)
@@ -803,7 +790,7 @@ def test_cross_session_conflicting_claims():
     assert "交给了客人" in blob and "交给了掌柜" not in blob, blob
 
     # (b) 取值一致：不是矛盾，两张都留
-    db = fresh(tmp("rp_conflict_b.db"))
+    db = fresh("/tmp/rp_conflict_b.db")
     db.set_continuity("s1", "c1", "cont-1")
     _cross_card(db, "E-1", "沈青梧把旧伞交给了客人", "客人", 2)
     _cross_card(db, "E-2", "旧伞一直在客人手里", "客人", 4)
@@ -815,7 +802,7 @@ def test_cross_session_conflicting_claims():
     assert "交给了客人" in blob and "一直在客人手里" in blob, blob
 
     # (c) 无法定序（同会话同 turn_end 且取值不同）→ 两张都不注入
-    db = fresh(tmp("rp_conflict_c.db"))
+    db = fresh("/tmp/rp_conflict_c.db")
     db.set_continuity("s1", "c1", "cont-1")
     _cross_card(db, "E-a", "沈青梧把旧伞交给了掌柜", "掌柜", 2)
     _cross_card(db, "E-b", "沈青梧把旧伞交给了客人", "客人", 2)
@@ -831,7 +818,7 @@ def test_cross_session_conflicting_claims():
 def test_evolving_slots_never_conflict():
     """R31：立场/位置/关系不回消解——同一 subject 取值不同也两张共存。"""
     for slot in ("立场", "位置", "关系"):
-        db = fresh(tmp(f"rp_evolve_{slot}.db"))
+        db = fresh(f"/tmp/rp_evolve_{slot}.db")
         db.set_continuity("s1", "c1", "cont-1")
         _cross_card(db, "E-1", "沈青梧起初对掌柜很防备", "防备", 2, slot=slot)
         _cross_card(db, "E-2", "沈青梧后来对掌柜渐渐信任", "信任", 4, slot=slot)
@@ -847,7 +834,7 @@ def test_evolving_slots_never_conflict():
 def test_closed_slot_values():
     """R32/R33/R34：值集外的写法不参与消解；集合内冲突丢较早；单卡自相矛盾单独标记。"""
     # R32 值集外（客官不在集合）→ 不参与消解，两张都保留
-    db = fresh(tmp("rp_value_a.db"))
+    db = fresh("/tmp/rp_value_a.db")
     db.set_continuity("s1", "c1", "cont-1")
     _cross_card(db, "E-1", "旧伞归客人保管", "客人", 2)
     _cross_card(db, "E-2", "旧伞被客官取走", "客官", 4)
@@ -859,7 +846,7 @@ def test_closed_slot_values():
     assert "归客人保管" in blob and "被客官取走" in blob, blob
 
     # R33 值集内冲突（客人 vs 掌柜）→ 保留较晚的客人，丢弃较早的掌柜
-    db = fresh(tmp("rp_value_b.db"))
+    db = fresh("/tmp/rp_value_b.db")
     db.set_continuity("s1", "c1", "cont-1")
     _cross_card(db, "E-old", "旧伞归掌柜保管", "掌柜", 2)
     _cross_card(db, "E-new", "旧伞归客人保管", "客人", 4)
@@ -905,7 +892,7 @@ def test_watermark_levels_and_surgery():
     # 估算：锚 20 + 两段 76 + 热对话 52 = 148 tokens
     cases = {"warn": 228, "pre": 197, "hard": 174, "fuse": 123}
     for level, budget in cases.items():
-        mw = RPContextMiddleware(MockFront("x"), MockBack(), fresh(tmp(f"rp_wm_{level}.db")),
+        mw = RPContextMiddleware(MockFront("x"), MockBack(), fresh(f"/tmp/rp_wm_{level}.db"),
                                  max_tokens=budget, output_reserve=0, profile="qwen")
         mw.budget = budget
         out, _, _ = mw._fit(anchors, list(sections), list(recent), "s1", "c1")
@@ -922,7 +909,7 @@ def test_watermark_levels_and_surgery():
             assert "忆" not in text and "历" in text, text            # 先丢低优先级（回忆）
             assert mw.watermarks["sections_dropped"] == 1, mw.watermarks
     # 真实调用路径也要触发：预算压到 200 后连续 4 轮必然越过 80%
-    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), fresh(tmp("rp_wm_chat.db")),
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), fresh("/tmp/rp_wm_chat.db"),
                              max_tokens=200, output_reserve=0, profile="qwen", archive_batch=99)
     for line in SCRIPT[:4]:
         mw.chat(line, PERSONA, "s1", "c1")
@@ -934,7 +921,7 @@ def test_watermark_levels_and_surgery():
 def test_forced_archive_on_hard():
     """R37：HARD 触发强制归档 + floor 持久止住重演 + 冷却绑定 archive_batch。"""
     # 1) 冷却：floor 前进不足一个 batch 不投递
-    mw = RPContextMiddleware(MockFront("x"), MockBack(), fresh(tmp("rp_force_cool.db")),
+    mw = RPContextMiddleware(MockFront("x"), MockBack(), fresh("/tmp/rp_force_cool.db"),
                              archive_batch=3)
     assert mw._force_archive("s1", "c1", 10) is True
     assert mw._force_archive("s1", "c1", 11) is False       # 冷却中
@@ -942,7 +929,7 @@ def test_forced_archive_on_hard():
     assert mw._force_archive("s1", "c1", 13) is True        # 满一个 batch
     assert mw._last_hi[("s1", "c1")] == 13                  # 关停冲刷不会漏掉这段
     # 2) 真实路径：小预算连续对话 → HARD → floor 生效，被挤出轮次不再回到 prompt
-    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), fresh(tmp("rp_force_chat.db")),
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), fresh("/tmp/rp_force_chat.db"),
                              max_tokens=150, output_reserve=0, profile="qwen",
                              keep_recent=1, archive_batch=2)
     for line in SCRIPT[:6]:
@@ -955,7 +942,7 @@ def test_forced_archive_on_hard():
     first = SCRIPT[0]
     assert first not in shown or floor < 1, (floor, shown)   # 手术挤出的一轮不回填
     # 3) 病态预算：尾部锚保底，任何情况下都不出现「空热对话」
-    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), fresh(tmp("rp_force_tiny.db")),
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), fresh("/tmp/rp_force_tiny.db"),
                              max_tokens=60, output_reserve=0, profile="qwen",
                              keep_recent=1, archive_batch=2)
     for line in SCRIPT[:5]:
@@ -992,7 +979,7 @@ def test_claims_validated_and_capped():
 def test_idle_epoch_rotation():
     """R39：闲置超阈值轮换 epoch；旧会话尾部归档并关闭，strict 记忆跨 epoch 继承。"""
     import promise
-    db = fresh(tmp("rp_epoch.db"))
+    db = fresh("/tmp/rp_epoch.db")
     mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db)
     sid0 = mw.session_identity("qq-g1", "c1", 3600, now=1000)
     assert sid0 == "qq-g1", sid0                       # epoch 0 沿用原 sid，兼容老库
@@ -1047,7 +1034,7 @@ def test_idle_epoch_rotation():
     assert mw2.session_identity("qq-u2", "c1", 0, now=10 ** 9) == "qq-u2"
     assert mw2.session_identity("qq-u2", "c1", 0, now=10 ** 9 + 10) == "qq-u2"
     # /new：force=True 不看闲置，立刻开下一段
-    db3 = fresh(tmp("rp_epoch_force.db"))
+    db3 = fresh("/tmp/rp_epoch_force.db")
     mw3 = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db3)
     assert mw3.session_identity("qq-g3", "c1", 3600, now=1000) == "qq-g3"
     assert mw3.session_identity("qq-g3", "c1", 3600, now=1000,
@@ -1069,9 +1056,46 @@ def test_retry_backoff_bounds():
     print("R40 重试退避: OK 指数有界 / Retry-After 优先 / 非法值回落")
 
 
+def test_time_awareness():
+    """R41：时间感知——账本锚带「当前时间」与久别间隔；热窗用户消息在长间隔处带时间戳，
+    assistant 消息不加戳（防模型模仿前缀）。"""
+    from datetime import datetime, timedelta, timezone
+    path = "/tmp/rp_time.db"
+    for suffix in ("", "-wal", "-shm"):
+        Path(path + suffix).unlink(missing_ok=True)
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), DB(path))
+    sid, cid = "s1", "c1"
+    now = datetime.now().astimezone()
+    utc = lambda d: d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def put(idx, role, content, when):
+        mw.db.add_turn(sid, cid, idx, role, content)
+        with mw.db._c() as c:
+            c.execute("UPDATE turns SET created_at=? WHERE session_id=? AND turn_idx=? AND role=?",
+                      (when, sid, idx, role))
+
+    put(1, "user", "早上好", utc(now - timedelta(days=2)))
+    put(2, "assistant", "早呀", utc(now - timedelta(days=2) + timedelta(minutes=1)))
+    put(3, "user", "现在聊", utc(now - timedelta(minutes=45)))
+    msgs = mw._build_messages(PERSONA, sid, cid, upto=3, query="现在聊")
+    ledger = next(m["content"] for m in msgs if "账本" in m["content"])
+    assert "当前时间：" in ledger and "周" in ledger, ledger
+    assert "距最近一条消息已约 45 分钟" in ledger, ledger
+    by_content = {m["content"]: m["role"] for m in msgs if m["role"] != "system"}
+    stamped = [c for c in by_content if c.startswith("[")]
+    assert len(stamped) == 2, stamped                        # 两条 user 都带戳
+    assert stamped[0].endswith("早上好") and stamped[1].endswith("现在聊"), stamped
+    assert by_content["早呀"] == "assistant"                 # assistant 不带戳
+    # 间隔不足 30 分钟：不加重间隔说明，时间行保持纯净
+    ledger2 = next(m["content"] for m in msgs if "账本" in m["content"])
+    assert ledger2.count("距最近一条消息") == 1
+    mw.shutdown()
+    print("R41 时间感知: OK 当前时间锚 / 长间隔加戳 / assistant 不加戳")
+
+
 def test_migrate_stage1_db():
     """老库（无阶段二列）打开后自动 ALTER 补列，并可读出默认值。"""
-    path = tmp("rp_old.db")
+    path = "/tmp/rp_old.db"
     for suffix in ("", "-wal", "-shm"):
         Path(path + suffix).unlink(missing_ok=True)
     conn = sqlite3.connect(path)
@@ -1121,7 +1145,6 @@ if __name__ == "__main__":
                test_closed_slot_values, test_unmapped_values_observed,
                test_watermark_levels_and_surgery, test_forced_archive_on_hard,
                test_claims_validated_and_capped, test_idle_epoch_rotation,
-               test_retry_backoff_bounds, test_migrate_stage1_db):
+               test_retry_backoff_bounds, test_time_awareness, test_migrate_stage1_db):
         fn()
     print("\nall regression tests passed")
-
