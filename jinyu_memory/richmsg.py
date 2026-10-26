@@ -281,22 +281,35 @@ def _related_tag(want: str, have: str) -> bool:
     return any(want in g and have in g for g in _SYNONYM_GROUPS)
 
 
+def pick_stickers(tag: str, n: int = 1,
+                  allow_empty_random: bool = False) -> List[Path]:
+    """按标签随机挑 n 张互不相同、通过安全判读的贴纸；没命中返回空列表。
+
+    候选是「任一标签算同类」的并集（同义词组 + 互相包含），所以库里
+    「可爱 / 卖萌 / 撒娇」这类重叠标签都会进池，每次随机取，不会总发同一张。
+    """
+    files = usable_stickers()
+    if not files:
+        return []
+    tag = (tag or "").strip().lower()
+    if not tag:
+        hits = list(files) if allow_empty_random else []
+    else:
+        store = _load_tags()
+        hits = [p for p in files
+                if any(_related_tag(tag, t.lower()) for t in store.get(p.name, []))]
+    random.shuffle(hits)
+    return hits[:max(1, int(n))]
+
+
 def pick_sticker(tag: str, allow_empty_random: bool = False) -> Optional[Path]:
     """按标签挑一张通过安全判读的贴纸；没有命中的标签返回 None（绝不乱发）。
 
     空标签只有管理员显式请求（/sticker 不带参数）时才随机；模型输出的空标记
     一律视为无匹配，避免「标签对不上就随便塞一张」。
     """
-    files = usable_stickers()
-    if not files:
-        return None
-    tag = (tag or "").strip().lower()
-    if not tag:
-        return random.choice(files) if allow_empty_random else None
-    store = _load_tags()
-    hits = [p for p in files
-            if any(_related_tag(tag, t.lower()) for t in store.get(p.name, []))]
-    return random.choice(hits) if hits else None
+    got = pick_stickers(tag, 1, allow_empty_random)
+    return got[0] if got else None
 
 
 def list_stickers(tag: str = "") -> List[Tuple[str, List[str]]]:
@@ -356,6 +369,57 @@ def remove_tag(name: str, tag: str) -> bool:
     return True
 
 
+def fix_sticker(name: str, character=None, desc=None, tags=None):
+    """纠正一张贴纸的判读结果：角色 / 描述 / 标签，并同步内存缓存。
+
+    character 传空串表示「不确定是谁」，会把旧角色名从标签里一并删掉。
+    返回 (文件名, 最终标签) 或 None（文件不存在）。
+    """
+    name = os.path.basename((name or "").strip())
+    with _STORE_LOCK:
+        store = _load_tags()
+        meta_store = _load_meta()
+        if name not in store and not (sticker_dir() / name).is_file():
+            return None
+        meta = meta_store.setdefault(name, {})
+        tag_list = list(store.get(name) or meta.get("tags") or [])
+        new = None
+        if character is not None:
+            new = CTRL.sub("", str(character)).strip()[:30]
+            old = str(meta.get("character") or "").strip()
+            meta["character"] = new
+            if old and old in tag_list:
+                tag_list.remove(old)
+            if desc is None:
+                # 描述里的旧角色名一并抹掉，否则下次引用又把它说回来。
+                # 判读常写简称（character=初音未来，desc=初音），所以从长到短试前缀。
+                body = str(meta.get("desc") or "")
+                for n in range(len(old), max(1, len(old) - 3), -1):
+                    cand = old[:n]
+                    if cand and cand in body:
+                        body = re.sub(r"\s{2,}", " ", body.replace(cand, "")).strip()
+                        meta["desc"] = body
+                        break
+        if desc is not None:
+            meta["desc"] = CTRL.sub("", str(desc)).strip()[:60]
+        if tags is not None:
+            tag_list = [CTRL.sub("", str(t)).strip()[:8] for t in tags
+                        if str(t).strip()]
+        if new and new not in tag_list:
+            tag_list.append(new)
+        meta["tags"] = tag_list[:12]
+        _save_meta(meta_store)
+        store[name] = tag_list[:12]
+        _save_tags(store)
+    hit = VISION_CACHE.get(name.split(".")[0])
+    if hit is not None:                   # 同一张图再发时直接用纠正后的结果
+        hit["character"] = str(meta.get("character") or "")
+        if meta.get("desc"):
+            hit["desc"] = meta["desc"]
+        hit["tags"] = list(meta["tags"])
+    return name, meta["tags"]
+
+
 # ---------------------------------------------------------------- 视觉判读
 
 # 图中文字命中即判为不可用贴纸：辱骂、人身攻击、性暗示。
@@ -410,9 +474,11 @@ _VISION_PROMPT = """这是QQ聊天里收到的一张图。仔细看，只输出�
 kind 也可以是 "图片"：照片、截图、聊天记录等需要认真回应的实拍内容，此时 tags 给 []。
 硬性要求：
 1. desc 必须写具体内容，禁止「一张图片」「一个表情包」「某个人物」这类空话；
-2. character 填图中角色的名字：动漫/游戏/影视/知名IP角色（如 初音未来、柴郡、玛奇玛）
-   或现实公众人物。只写最出名的名字，多个角色只写最主要的一个；普通真人随手拍、
-   纯风景/物件/截图认不出角色的填空字符串；
+2. character 填图中主要角色的名字：官方立绘、动画/游戏截图，以及同人图、换装、cosplay、
+   梗图都算，只要认得出是哪个角色就填（这些不影响认人）。只写最出名的名字，多个角色
+   只填最主要的一个；普通真人、纯风景/物件/截图填 ""；
+   实在认不清是谁、或只是配色发型相似时，必须填 "" 并在 desc 末尾写明「认不清是谁」，
+   不要硬猜一个名字；
 3. text 必须把图中所有文字抄全，包括语气词、脏话，不要因为不雅而省略或打码；
 4. suitable 仅对表情包有意义：图中文字含辱骂、人身攻击、性暗示、脏话，或者画面模糊、
    属于一次性截图/私人隐私的，填 false；
@@ -899,14 +965,16 @@ def rich_hint() -> str:
 
 【动作标记——默认不用，读清下面的使用条件】
 大多数回复应该只有文字。你能用的标记只有这些：
-- [[sticker:标签]] 从贴纸库发一个贴纸，可用标签：{tag_line}
+- [[sticker:标签]] 从贴纸库随机发一张贴纸（[[sticker:开心*2]] 随机发两张，最多 *3），可用标签：{tag_line}
 - [[search:两三个关键词 动漫表情包]] 搜一张贴合语境的图发出来
 - [[voice:要说的话]] 用语音说
 - [[img:https://图片直链]] 只发确定真实存在的直链（不确定就用 search）
 只在以下时机使用，其余时候一律纯文字：
 ①主人明确要求（"来张表情包""发张图看看""用语音说"）；
 ②主人只发来一个表情包时，可以回敬一个贴纸；
-③情绪确实强烈到文字撑不住时，一条回复最多一个 [[sticker:标签]]，且不许连续几条回复都带。
+③情绪确实强烈到文字撑不住时，一条回复最多一个 [[sticker:标签]]，且不许连续几条回复都带；
+  只有主人明确要「多来几张」时才写 [[sticker:标签*2]] 或 *3，同一条回复里不重复同一张。
+  库里同类标签很多，每次都是随机抽，不要以为总发的是同一张。
 【黄豆小表情 [[face:id]] 默认禁用】主人不喜欢，尤其是争议大的那几款
 （滑稽、斜眼笑、doge、吃瓜、微笑这类）。只有主人自己先发黄豆斗图时才跟着用；
 日常回复一个黄豆都不要加。
@@ -922,6 +990,7 @@ async def build_messages(reply: str, chunk: int = 1000) -> List[Message]:
     loop = asyncio.get_running_loop()
     messages: List[Message] = []
     buf = ""
+    used: set = set()             # 同一条回复里不重复发同一张图
 
     def flush() -> None:
         nonlocal buf
@@ -954,9 +1023,19 @@ async def build_messages(reply: str, chunk: int = 1000) -> List[Message]:
             if payload.isdigit():
                 seg = MessageSegment.face(int(payload))
         elif kind == "sticker":
-            path = pick_sticker(payload)
-            if path:
-                seg = image_segment(path)
+            tag, _, num = payload.partition("*")
+            try:
+                want = max(1, min(3, int(num.strip())))
+            except (TypeError, ValueError):
+                want = 1
+            hits = [p for p in pick_stickers(tag.strip(), want + len(used))
+                    if p not in used][:want]
+            for path in hits:
+                used.add(path)
+                one = image_segment(path)
+                if one is not None:
+                    messages.append(Message(one))
+            continue
         elif kind == "voice":
             if payload.startswith("http"):
                 if await loop.run_in_executor(None, url_is_public, payload):
