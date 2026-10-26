@@ -1,0 +1,11 @@
+# NoneBot2 + OneBot v11
+nonebot2[fastapi]>=2.3,<3
+nonebot-adapter-onebot>=2.4,<3
+
+# 图片下载 / 搜图 / 视觉判读（插件内按需 import，缺失时相关功能自动降级）
+httpx>=0.27,<1
+# 视觉前预处理：动图取首帧、大图缩小转 JPEG；不装也能跑，但大 GIF 可能被判读失败
+pillow>=10.0
+
+# 语音合成（可选：不装则 [[voice:...]] 标记会被跳过）
+edge-tts>=6.1
