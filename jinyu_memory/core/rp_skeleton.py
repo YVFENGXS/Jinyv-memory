@@ -28,6 +28,94 @@ logger = logging.getLogger("rp_memory")
 
 CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]")
 
+
+def _fact_terms(text):
+    """从一句话里取匹配长期事实的词：双字组合优先，单字兜底（去停用字）。"""
+    runs = re.findall(r"[\u4e00-\u9fff]{2,}", text or "")
+    two = {run[i:i + 2] for run in runs for i in range(len(run) - 1)}
+    stop = retriever.STOP_CHARS | set("吗嘛呀哦嗯啦呐哟哈")
+    one = {ch for run in runs for ch in run if ch not in stop}
+    return two, one
+
+
+_FACT_SETTING = re.compile(
+    r"(叫|名字|名叫|住在|养了|喜欢|讨厌|生日|家人|宠物|职业|工作|爱吃|不吃)")
+_FACT_TEMP = re.compile(
+    r"(刚才|这次|今天|暂时|正在|目前|一会儿|待会|反复尝试|刚刚|现在在)")
+# 「还不知道 / 名字未知」这类陈述会被后来的事实覆盖，别让它压过同名的最新设定
+_FACT_STALE = re.compile(
+    r"(尚不(知道|清楚|了解)|还不知道|尚未(知道|确认)|名字未知|暂时不知道)")
+
+
+def _fact_tags(raw):
+    """事实的标签列 → 字符串列表（老库空值/坏 JSON 都当没有标签）。"""
+    if isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        try:
+            items = json.loads(raw or "[]")
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(items, list):
+            return []
+    return [str(t).strip()[:12] for t in items if str(t).strip()][:6]
+
+
+def _fact_labels(fact, category="", importance=None):
+    """返回 (类别, 热力)。新事实用后台模型给的标签；老库按措辞规则推断。"""
+    cat = str(category or "")
+    try:
+        imp = float(importance)
+    except (TypeError, ValueError):
+        imp = 0.5
+    imp = max(0.0, min(1.0, imp))
+    text = str(fact or "")
+    if _FACT_STALE.search(text):        # 已被后续事实覆盖的「尚不知道」类陈述：排到最后
+        return "临时", min(imp, 0.35)
+    cat = str(category or "")
+    if cat == "临时":                    # 临时状态永远排后，别压过稳定设定
+        return cat, min(imp, 0.35)
+    if cat in ("设定", "事件"):
+        return cat, imp
+    if _FACT_TEMP.search(text):
+        return "临时", 0.3
+    if _FACT_SETTING.search(text):
+        return "设定", 0.85
+    return "事件", 0.55
+
+
+def _fact_item(raw):
+    """后台输出的事实条目 → 落库字段（老格式是纯字符串，保持兼容）。"""
+    if isinstance(raw, str):
+        text, tags, cat, imp, ttl = raw.strip(), [], "", None, None
+    elif isinstance(raw, dict):
+        text = str(raw.get("fact") or "").strip()
+        tags = _fact_tags(raw.get("tags"))
+        cat = str(raw.get("category") or "").strip()
+        imp, ttl = raw.get("importance"), raw.get("ttl_hours")
+    else:
+        return None
+    if not text:
+        return None
+    if cat not in ("设定", "事件", "临时"):
+        cat = ""
+    try:
+        imp = float(imp)
+    except (TypeError, ValueError):
+        imp = 0.5
+    expires = None
+    try:
+        hours = float(ttl) if ttl is not None else 0.0
+    except (TypeError, ValueError):
+        hours = 0.0
+    if hours > 0:                        # 只有临时事实才带 TTL
+        expires = datetime.fromtimestamp(
+            time.time() + hours * 3600, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return {"fact": text[:40], "tags": json.dumps(tags, ensure_ascii=False),
+            "importance": max(0.0, min(1.0, imp)),
+            "category": cat, "expires_at": expires}
+
+
 # 实测 token/汉字（详见 token_estimate.py）：cl100k 1.31–1.43、o200k 0.97、Qwen2.5 0.81。
 # 短句密度更高（单行最高测到 1.67），故系数取长文上沿 + 每段 8 token 固定开销。
 CJK_RATIO = {"cl100k": 1.55, "o200k": 1.15, "qwen": 1.00, "zhipu": 1.00}
@@ -142,6 +230,8 @@ CREATE TABLE IF NOT EXISTS cross_session_pin(
 CREATE TABLE IF NOT EXISTS durable_facts(
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, character_id TEXT NOT NULL,
   turn_end INTEGER NOT NULL, fact TEXT NOT NULL,
+  tags TEXT NOT NULL DEFAULT '[]', importance REAL NOT NULL DEFAULT 0.5,
+  category TEXT NOT NULL DEFAULT '', expires_at TEXT DEFAULT NULL,
   created_at TEXT DEFAULT (datetime('now')),
   UNIQUE(session_id, character_id, fact));
 CREATE TABLE IF NOT EXISTS session_epoch(
@@ -172,6 +262,15 @@ CARD_EXTRA_COLS = {
     "importance": "REAL NOT NULL DEFAULT 0.5",
     "conflict_flags": "TEXT NOT NULL DEFAULT '[]'",
     "precision": "TEXT NOT NULL DEFAULT 'normal'",
+}
+
+# 长期事实的标签/热力/时效列：tags 供检索先筛，importance 做热力排序，
+# expires_at 让临时事实自动退场（NULL=永久）。
+FACT_EXTRA_COLS = {
+    "tags": "TEXT NOT NULL DEFAULT '[]'",
+    "importance": "REAL NOT NULL DEFAULT 0.5",
+    "category": "TEXT NOT NULL DEFAULT ''",
+    "expires_at": "TEXT DEFAULT NULL",
 }
 
 
@@ -223,6 +322,11 @@ class DB:
         for name, decl in CARD_EXTRA_COLS.items():
             if name not in cols:
                 conn.execute(f"ALTER TABLE event_cards ADD COLUMN {name} {decl}")
+        # 长期事实补标签/热力/时效列：老行 category 留空，读取时按规则推断
+        fcols = {r["name"] for r in conn.execute("PRAGMA table_info(durable_facts)")}
+        for name, decl in FACT_EXTRA_COLS.items():
+            if name not in fcols:
+                conn.execute(f"ALTER TABLE durable_facts ADD COLUMN {name} {decl}")
 
     @contextmanager
     def _c(self):
@@ -299,22 +403,73 @@ class DB:
             if inserted:
                 c.execute("INSERT OR REPLACE INTO state_ledger VALUES(?,?,?)",
                           (sid, cid, json.dumps(ledger, ensure_ascii=False)))
-            for f in facts or ():
+            for raw in facts or ():
+                f = _fact_item(raw)
+                if not f:
+                    continue
                 c.execute("INSERT OR IGNORE INTO durable_facts"
-                          "(session_id,character_id,turn_end,fact) VALUES(?,?,?,?)",
-                          (sid, cid, hi, f))
+                          "(session_id,character_id,turn_end,fact,tags,importance,"
+                          " category,expires_at) VALUES(?,?,?,?,?,?,?,?)",
+                          (sid, cid, hi, f["fact"], f["tags"], f["importance"],
+                           f["category"], f["expires_at"]))
             c.execute("INSERT OR REPLACE INTO archive_cursor VALUES(?,?,?)", (sid, cid, hi))
             c.execute("DELETE FROM archive_failures WHERE session_id=? AND character_id=?"
                       " AND turn_start>=? AND turn_end<=?", (sid, cid, lo, hi))
         return inserted
 
-    def list_facts(self, sid, cid, limit=12):
-        """最近写入的长期事实（新→旧），注入账本锚点用。"""
+    def list_facts(self, sid, cid, limit=12, query="", budget=1200):
+        """长期事实召回：标签优先 → 正文核验 → 热力排序，命中不足按热力兜底。
+
+        - 标签命中权重最高：后台给事实打的性质词（宠物/名字/偏好…）
+        - 正文核验：标签没命中时再用问题里的双字/单字去正文里找
+        - 热力：设定 > 事件 > 临时，临时事实还受 expires_at 限制自动退场
+        - 兜底：一条都没命中时按热力补到 limit 条，避免「完全不检索」
+        """
         with self._c() as c:
-            rows = c.execute("SELECT fact FROM durable_facts"
+            rows = c.execute("SELECT id, fact, tags, importance, category, expires_at"
+                             " FROM durable_facts"
                              " WHERE session_id=? AND character_id=?"
-                             " ORDER BY id DESC LIMIT ?", (sid, cid, limit)).fetchall()
-        return [r["fact"] for r in rows]
+                             " ORDER BY id DESC", (sid, cid)).fetchall()
+        now = datetime.fromtimestamp(time.time(), timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        two, one = _fact_terms(query) if query else (set(), set())
+        scored = []
+        for r in rows:
+            if r["expires_at"] and str(r["expires_at"]) <= now:
+                continue                                  # 临时事实过期即退场
+            cat, heat = _fact_labels(r["fact"], r["category"], r["importance"])
+            tags = _fact_tags(r["tags"])
+            tag_hit = bool(query) and any(
+                t in query or any(k in t or t in k for k in two) for t in tags)
+            text_hit = 0
+            if query:
+                if any(k in r["fact"] for k in two):
+                    text_hit = 2
+                elif any(k in r["fact"] for k in one):
+                    text_hit = 1
+            hit = (3.0 if tag_hit else 0.0) + text_hit
+            scored.append((hit * (0.5 + heat) if hit else 0.0, heat, r["id"], r["fact"]))
+        scored.sort(reverse=True)
+        picked, used = [], 0
+        for score, _, _, fact in scored:
+            if len(picked) >= limit:
+                break
+            if score <= 0:
+                break                                      # 已按分数降序，后面全是 0
+            if used + len(fact) + 1 > budget:
+                break
+            picked.append(fact)
+            used += len(fact) + 1
+        if len(picked) < limit:            # 兜底：命中不足时按热力补齐，旧设定不会完全想不起
+            have = set(picked)
+            for _, _, _, fact in sorted(scored, key=lambda x: (x[1], x[2]), reverse=True):
+                if len(picked) >= limit or used + len(fact) + 1 > budget:
+                    break
+                if fact in have:
+                    continue
+                picked.append(fact)
+                have.add(fact)
+                used += len(fact) + 1
+        return picked
 
     def inherit_facts(self, old_sid, sid, cid, limit=30):
         """跨 epoch 继承长期事实：复制旧会话最近 limit 条，UNIQUE 自动去重。
@@ -322,13 +477,16 @@ class DB:
         turn_end 记 0，让继承来的事实排在本 epoch 新事实之后（新→旧展示）。
         """
         with self._c() as c:
-            rows = c.execute("SELECT fact FROM durable_facts"
+            rows = c.execute("SELECT fact, tags, importance, category, expires_at"
+                             " FROM durable_facts"
                              " WHERE session_id=? AND character_id=?"
                              " ORDER BY id DESC LIMIT ?", (old_sid, cid, limit)).fetchall()
             for r in reversed(rows):
                 c.execute("INSERT OR IGNORE INTO durable_facts"
-                          "(session_id,character_id,turn_end,fact) VALUES(?,?,0,?)",
-                          (sid, cid, r["fact"]))
+                          "(session_id,character_id,turn_end,fact,tags,importance,"
+                          " category,expires_at) VALUES(?,?,0,?,?,?,?,?)",
+                          (sid, cid, r["fact"], r["tags"], r["importance"],
+                           r["category"], r["expires_at"]))
 
     def recent_cards(self, sid, cid, limit=6):
         with self._c() as c:
@@ -657,7 +815,7 @@ class RPContextMiddleware:
             ledger_txt += "\n未兑现承诺：" + "；".join(open_promises)
         anchors = [{"role": "system", "content": persona["core"]},   # 头锚：宪法层，永不截断
                    {"role": "system", "content": "【当前状态账本】\n" + ledger_txt + "\n" + MEMORY_LABEL}]
-        facts = self.db.list_facts(sid, cid)      # 长期事实随锚点每轮注入（间接问法也能想起）
+        facts = self.db.list_facts(sid, cid, query=query)   # 长期事实随锚点每轮注入（间接问法也能想起）
         if facts:
             anchors[1]["content"] += "\n已记录事实（长期有效）：" + "；".join(facts)
         sections = []          # (priority, msg)：priority 越小越先被丢

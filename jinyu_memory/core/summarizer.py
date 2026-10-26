@@ -41,17 +41,24 @@ PROMPT = """你是角色扮演记忆整理员。只输出一个 JSON 对象，�
    其他写法（如"客官"）请归一到最近的合法值，或改写为立场/关系；落不进集合的
    只作为记录，不参与矛盾判定。用世界视角称呼：AI 角色写"角色"、玩家写"主人"，
    不要写"我/他/她"。同 subject+slot 出现不同取值时只留较晚的一条。
-9. durable_facts：值得长期记住的稳定事实，0-3 条，每条 ≤30 字的陈述句。
-   算"值得记住"：宠物/重要物品的名字与归属、主人的稳定偏好与设定、
-   明确说了「记住」的内容——三天后还应该记得的才算。
-   不算：情绪、剧情进展、临时状态、本次对话才出现的临时指代。
+9. durable_facts：值得长期记住的稳定事实，0-3 条，每条是一个对象：
+   {"fact":"≤30 字的陈述句","tags":["2-4 个检索标签"],
+    "category":"设定|事件|临时","importance":0~1,"ttl_hours":数字或 null}
+   - 设定：宠物/重要物品的名字与归属、主人的稳定偏好与设定、明确说「记住」的内容；
+     importance ≥0.8，ttl_hours 填 null（永久有效）
+   - 事件：三天后仍值得记得的经历；importance 0.4~0.7，ttl_hours 填 null
+   - 临时：只在当下成立的临时状态（反复发送失败、正在忙之类）；
+     importance ≤0.3，ttl_hours 填预计有效小时数（1~48）
+   - tags 写以后会用来找它的名词（如 ["猫","团子","宠物"]），不要写情绪词
+   不算：情绪、一次性的口气、本次对话才出现的临时指代。
 
 输出格式：
 {"summary":"一句话：谁因为什么做了什么",
  "state_changes":{"mood":"...","location":"...","relationship":{"trust":0.2},
                   "pending_promises":["..."],"resolved_promises":["P-003"],
                   "claims":[{"subject":"旧伞","slot":"归属","value":"主人"}]},
- "durable_facts":["主人养了一只猫，叫团子"],
+ "durable_facts":[{"fact":"主人养了一只猫，叫团子","tags":["猫","团子","宠物"],
+                   "category":"设定","importance":0.9,"ttl_hours":null}],
  "entity_hooks":["..."],"rel_hooks":["..."],"knowledge_boundary":"both",
  "importance":0.5,"precision":"normal","confidence":0.8}
 
@@ -184,18 +191,36 @@ def validate(data):
         sc["claims"] = clean_claims[:3]
     else:
         sc.pop("claims", None)
-    # durable_facts：后台判定的长期事实（用户 2026-10-25 需求：间接问法也要能想起）。
-    # 只在非空时保留字段，避免改变既有字段形状（回归用例断言兼容）。
+    # durable_facts：后台判定并打标签（用户 2026-10-26：事实要带标签/热力/时效）。
+    # 老格式的纯字符串仍然接受，统一归一成对象，下游只处理一种形状。
     facts = data.get("durable_facts")
     if facts is not None and not isinstance(facts, list):
         return None, "durable_facts_not_list"
     clean_facts = []
     for f in facts or []:
-        if not isinstance(f, str):
+        item = f if isinstance(f, dict) else {"fact": f}
+        t = CTRL.sub("", str(item.get("fact") or "")).strip()[:40]
+        if not (2 <= len(t) <= 40 and WORD.search(t)):
             continue
-        t = CTRL.sub("", f).strip()[:40]
-        if 2 <= len(t) <= 40 and WORD.search(t) and t not in clean_facts:
-            clean_facts.append(t)
+        if any(t == x["fact"] for x in clean_facts):
+            continue
+        tags = []
+        for raw in item.get("tags") or []:
+            tag = CTRL.sub("", str(raw)).strip()[:12]
+            if tag and tag not in tags:
+                tags.append(tag)
+        cat = CTRL.sub("", str(item.get("category") or "")).strip()
+        ttl = item.get("ttl_hours")
+        try:
+            hours = float(ttl) if ttl is not None else 0.0
+        except (TypeError, ValueError):
+            hours = 0.0
+        clean_facts.append({
+            "fact": t,
+            "tags": tags[:4],
+            "category": cat if cat in ("设定", "事件", "临时") else "",
+            "importance": _clamp(item.get("importance", 0.5)),
+            "ttl_hours": round(max(0.0, min(72.0, hours)), 2) or None})
     if clean_facts:
         data["durable_facts"] = clean_facts[:3]
     # ChatGPT Q1：所有会进账本/前台的字符串先清控制符并截断
