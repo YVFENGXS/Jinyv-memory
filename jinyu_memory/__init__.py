@@ -22,6 +22,9 @@
   RP_PROFILE                        选填，cl100k / o200k / qwen / zhipu
   RP_COOLDOWN                       选填，同一会话最小间隔秒数，默认 2
   RP_RICH                           选填，1/0 开关富消息，默认 1
+  RP_BUBBLES                        选填，1/0 回复按句子拆成多条气泡依次发，默认 1
+  RP_BUBBLE_MAX                     选填，单条回复最多拆几个气泡，默认 6
+  RP_BUBBLE_DELAY                   选填，相邻气泡的平均间隔秒数，默认 0.9
   RP_STICKER_DIR                    选填，贴纸库目录，默认 /opt/qqbot/stickers
   RP_TTS_DIR / RP_TTS_VOICE         选填，语音缓存目录 / edge-tts 音色
   RP_AUTOSTICKER                    选填，1/0 自动收藏贴纸，默认 1
@@ -39,11 +42,12 @@
   RP_LINK                           选填，1/0 链接抓取，默认 1
   RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
   RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
-  RP_ADMIN_QQ                       选填，允许 /persona /save /tags /find /img /sticker /voice /testrich 的 QQ
+  RP_ADMIN_QQ                       选填，允许 /persona /memory /save /tags /find /img /sticker /voice /testrich 的 QQ
   RP_SESSION_EPOCH_HOURS            选填，闲置多少小时后开启新会话 epoch，默认 48，0=不轮换
   RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
 """
 import asyncio
+import json
 import logging
 import os
 import random
@@ -120,6 +124,11 @@ from rp_skeleton import DB, RPContextMiddleware             # noqa: E402
 CID = "jinyu"
 COOLDOWN = float(os.environ.get("RP_COOLDOWN") or 2)
 REPLY_CHUNK = 1000
+BUBBLES_ON = (os.environ.get("RP_BUBBLES") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+BUBBLE_MAX = max(1, int(float(os.environ.get("RP_BUBBLE_MAX") or 6)))
+_BUBBLE_GAP = max(0.0, float(os.environ.get("RP_BUBBLE_DELAY") or 0.9))
+BUBBLE_DELAY = (_BUBBLE_GAP * 0.6, _BUBBLE_GAP * 1.4)   # 相邻气泡的随机间隔（秒）
 ADMIN = {x.strip() for x in (os.environ.get("RP_ADMIN_QQ") or "").split(",") if x.strip()}
 IDLE_NUDGE_MIN = float(os.environ.get("RP_IDLE_NUDGE_MINUTES") or 60)
 PROACTIVE_ON = (os.environ.get("RP_PROACTIVE") or "1").strip().lower() not in {
@@ -768,20 +777,59 @@ def _is_silent(reply: str) -> bool:
     return not (reply or "").strip() or bool(_PASS_RE.search(reply))
 
 
+_RICH_TOKEN = re.compile(r"\[\[[^\[\]]*\]\]|https?://[^\s\[\]（）]+")
+
+
+def _bubbles(reply: str, limit: Optional[int] = None) -> list:
+    """把一条回复按句子拆成多条气泡，富消息标记和链接整体保留。
+
+    先按换行切，再按句末标点切；太短的碎片并到前一条，超过上限的并到最后
+    一条——一次刷十几条会被 QQ 风控，也不像真人。
+    """
+    limit = limit or BUBBLE_MAX
+    marks = []
+
+    def _keep(m):
+        marks.append(m.group(0))
+        return f"\x00{len(marks) - 1}\x00"
+
+    text = _RICH_TOKEN.sub(_keep, reply)
+    parts = [p.strip(" \t") for p in re.split(r"\n+|(?<=[。！？!?…])", text)]
+    parts = [p for p in parts if p]
+    merged = []
+    for p in parts:
+        if merged and (len(p) < 2 or len(merged[-1]) < 2):
+            merged[-1] += p
+        else:
+            merged.append(p)
+    if len(merged) > limit:
+        merged = merged[:limit - 1] + ["\n".join(merged[limit - 1:])]
+    return [re.sub(r"\x00(\d+)\x00", lambda m: marks[int(m.group(1))], p)
+            for p in merged]
+
+
 async def _send_rich(reply: str) -> None:
-    """按标记把回复渲染成文本/图片/表情/语音分段发送。"""
+    """按标记把回复渲染成文本/图片/表情/语音分段发送。
+
+    默认按句子拆成多条气泡依次发（RP_BUBBLES=0 则合并成一条），像真人聊天
+    而不是甩一整段。富消息标记 [[img:..]] 在拆分前先占位保护，不会被切断。
+    """
     reply = _split_poke(reply)
     if not reply.strip():
         return
-    if not rich_enabled():
-        for i in range(0, len(reply), REPLY_CHUNK):
-            await matcher.send(reply[i:i + REPLY_CHUNK])
-        return
-    for msg in await build_messages(reply, REPLY_CHUNK):
-        try:
-            await matcher.send(msg)
-        except Exception as exc:              # 单个媒体段失败不影响后续文本
-            logger.opt(exception=exc).warning(f"[jinyu] 媒体段发送失败: {exc}")
+    bubbles = _bubbles(reply) if BUBBLES_ON else [reply]
+    for i, chunk in enumerate(bubbles):
+        if i:
+            await asyncio.sleep(random.uniform(*BUBBLE_DELAY))
+        if not rich_enabled():
+            for j in range(0, len(chunk), REPLY_CHUNK):
+                await matcher.send(chunk[j:j + REPLY_CHUNK])
+            continue
+        for msg in await build_messages(chunk, REPLY_CHUNK):
+            try:
+                await matcher.send(msg)
+            except Exception as exc:          # 单个媒体段失败不影响后续文本
+                logger.opt(exception=exc).warning(f"[jinyu] 媒体段发送失败: {exc}")
 
 
 async def _send_to(reply: str, user_id: int = 0, group_id: int = 0) -> bool:
@@ -931,6 +979,98 @@ def _persona_report(event: MessageEvent) -> str:
     return "\n".join(parts)
 
 
+def _owner_label(base: str) -> str:
+    """qq-u123456 -> 私聊 123456；qq-g789 -> 群 789。"""
+    b = str(base or "")
+    if b.startswith("qq-g"):
+        return f"群 {b[4:]}"
+    if b.startswith("qq-u"):
+        return f"私聊 {b[4:]}"
+    return b or "未知会话"
+
+
+def _fact_line(row, with_owner=False) -> str:
+    try:
+        tag_list = json.loads(row["tags"] or "[]")
+    except (TypeError, ValueError):
+        tag_list = []
+    owner = ""
+    if with_owner:
+        owner = f"[{_owner_label(str(row['session_id']).split('#')[0])}] "
+    line = (f"#{row['id']} {owner}[{row['category'] or '未分类'} "
+            f"{float(row['importance'] or 0):.2f}]")
+    if tag_list:
+        line += " " + "/".join(map(str, tag_list))
+    return line + " → " + str(row["fact"])
+
+
+def _memory_page(cid: str, base: str, page: int, keyword: str, nav: str) -> str:
+    """第二层：某个会话的词条分页；nav 为空表示全局搜索。"""
+    size = 10
+    rows, total = mw.db.dump_facts(cid, base, keyword, (page - 1) * size, size)
+    pages = max(1, (total + size - 1) // size)
+    title = _owner_label(base) if nav else f"全局搜索「{keyword}」"
+    head = f"【记忆词条】{title}｜{total} 条｜第 {min(page, pages)}/{pages} 页"
+    if not rows:
+        return head + "\n没有匹配的词条。"
+    out = head + "\n" + "\n".join(_fact_line(r, with_owner=not nav) for r in rows)
+    if nav and page < pages:
+        out += f"\n下一页：{nav} {page + 1}"
+    return out + "\n删除：/memory del 编号（行首 #号）"
+
+
+def _memory_report(arg: str) -> str:
+    """管理员 /memory：先选人，再看词条，可按编号删除。
+
+    /memory            全局会话列表（第一层）
+    /memory 1          第 1 个会话的词条（第二层）
+    /memory 1 2        第 1 个会话的第 2 页
+    /memory 1 猫       在第 1 个会话里搜「猫」
+    /memory 猫         全局搜「猫」
+    /memory del 142    删除 #142（连同跨 epoch 副本）
+    """
+    cid = CID
+    parts = arg.split()
+    if parts and parts[0] in ("del", "删除", "删"):
+        return _memory_delete(parts[1:])
+    if not parts:
+        owners = mw.db.fact_owners(cid)
+        if not owners:
+            return "【记忆词条】还没有保存过任何长期事实。"
+        total = sum(int(o["n"]) for o in owners)
+        lines = [f"{i}. {_owner_label(o['base'])} · {o['n']} 条"
+                 for i, o in enumerate(owners, 1)]
+        return (f"【记忆词条】全局 {total} 条｜{len(owners)} 个会话\n"
+                + "\n".join(lines)
+                + "\n查看：/memory 1｜翻页：/memory 1 2｜全局搜索：/memory 猫"
+                + "\n删除：/memory del 142（编号见词条行首 #）")
+    if parts[0].isdigit():
+        idx = int(parts[0])
+        owners = mw.db.fact_owners(cid)
+        if not 1 <= idx <= len(owners):
+            return f"没有第 {idx} 个会话，先发 /memory 看列表。"
+        rest = parts[1:]
+        page = int(rest[0]) if rest and rest[0].isdigit() else 1
+        keyword = "" if rest and rest[0].isdigit() else " ".join(rest)
+        return _memory_page(cid, owners[idx - 1]["base"], max(1, page),
+                            keyword, f"/memory {idx}")
+    return _memory_page(cid, "", 1, " ".join(parts), "")
+
+
+def _memory_delete(parts: list) -> str:
+    """按编号删词条；同一句话跨 epoch 的副本一起删，避免轮换后又冒出来。"""
+    if not parts:
+        return "用法：/memory del 142（编号见词条行首 #）"
+    raw = parts[0].lstrip("#")
+    if not raw.isdigit():
+        return f"「{parts[0]}」不是编号，例如 /memory del 142"
+    fact, n, base = mw.db.del_fact(int(raw))
+    if not n:
+        return f"没找到 #{raw}，可能已经删过了。"
+    return (f"已删除 #{raw}「{str(fact)[:40]}」\n"
+            f"所属 {_owner_label(base)}｜共清理 {n} 条（含 epoch 副本）")
+
+
 async def _admin(event: MessageEvent, text: str) -> bool:
     """管理员自测/管理命令，绕过模型。"""
     if not ADMIN or str(event.user_id) not in ADMIN:
@@ -950,6 +1090,9 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         return True
     if cmd in ("persona", "人设"):
         await matcher.finish(_persona_report(event))
+        return True
+    if cmd in ("memory", "词条", "记忆"):
+        await matcher.finish(_memory_report(arg))
         return True
     if cmd == "voice" and arg:
         audio = await tts_audio(arg)
