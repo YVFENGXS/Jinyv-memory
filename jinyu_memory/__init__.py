@@ -42,7 +42,8 @@
   RP_LINK                           选填，1/0 链接抓取，默认 1
   RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
   RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
-  RP_ADMIN_QQ                       选填，允许 /persona /memory /save /tags /find /img /sticker /voice /testrich 的 QQ
+  RP_ADMIN_QQ                       选填，允许 /persona /memory /save /tags /find /img /sticker
+                                    /fix /voice /testrich 的 QQ
   RP_SESSION_EPOCH_HOURS            选填，闲置多少小时后开启新会话 epoch，默认 48，0=不轮换
   RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
 """
@@ -105,6 +106,7 @@ from richmsg import (                                       # noqa: E402
     delete_sticker,
     download_image,
     download_image_ex,
+    fix_sticker,
     image_segment,
     image_search,
     list_stickers,
@@ -669,7 +671,7 @@ async def _capture(event: MessageEvent):
         _media_tasks.add(task)
         task.add_done_callback(_media_tasks.discard)
         tasks.append(task)
-    if _target(event):                    # 只给会回复的消息挂结果，message_id 唯一不串图
+    if await _target(event):              # 只给会回复的消息挂结果，message_id 唯一不串图
         _media_futs[str(event.message_id)] = tasks
 
 
@@ -1040,7 +1042,7 @@ def _memory_report(arg: str) -> str:
         total = sum(int(o["n"]) for o in owners)
         lines = [f"{i}. {_owner_label(o['base'])} · {o['n']} 条"
                  for i, o in enumerate(owners, 1)]
-        return (f"【记忆词条】全局 {total} 条｜{len(owners)} 个会话\n"
+        return (f"【记忆词条】{len(owners)} 个会话｜合计 {total} 条\n"
                 + "\n".join(lines)
                 + "\n查看：/memory 1｜翻页：/memory 1 2｜全局搜索：/memory 猫"
                 + "\n删除：/memory del 142（编号见词条行首 #）")
@@ -1144,14 +1146,29 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         await matcher.finish("贴纸标签：" + "、".join(f"{t}({n})" for t, n in items))
         return True
     if cmd == "list":
-        items = list_stickers(arg)
+        parts = arg.split()
+        page = 1
+        if parts and parts[-1].isdigit():     # /list 开心 2 → 第 2 页
+            page = max(1, int(parts.pop()))
+        kw = " ".join(parts)
+        items = list_stickers(kw)
         if not items:
             await matcher.finish("没有匹配的贴纸（可加标签过滤，如 /list 开心）。")
-        head = f"共 {len(items)} 张" + (f"，按“{arg}”过滤" if arg else "")
-        lines = [f"{n}  [{'、'.join(t) or '无标签'}]" for n, t in items[:30]]
-        extra = "\n……" if len(items) > 30 else ""
-        await matcher.finish(head + "（显示前 30）\n" + "\n".join(lines) + extra
-                             + "\n删除用 /del 文件名；预览用 /show 文件名")
+        per = 30
+        pages = (len(items) + per - 1) // per
+        page = min(page, pages)
+        chunk = items[(page - 1) * per:page * per]
+        head = (f"共 {len(items)} 张" + (f"，按“{kw}”过滤" if kw else "")
+                + f"｜第 {page}/{pages} 页")
+        lines = [f"{n}  [{'、'.join(t) or '无标签'}]" for n, t in chunk]
+        nav = []
+        if page > 1:
+            nav.append(f"/list {kw} {page - 1}".replace("  ", " "))
+        if page < pages:
+            nav.append(f"/list {kw} {page + 1}".replace("  ", " "))
+        tail = ("\n翻页：" + "｜".join(nav)) if nav else ""
+        await matcher.finish(head + "\n" + "\n".join(lines) + tail
+                             + "\n删除 /del 文件名；预览 /show 文件名；改判读 /fix 文件名 角色=…")
         return True
     if cmd == "show":
         items = list_stickers(arg)
@@ -1198,6 +1215,57 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         if not remove_tag(parts[0], parts[1]):
             await matcher.finish("失败：文件名或标签不存在（用 /list 查）。")
         await matcher.finish(f"已从 {parts[0]} 移除标签“{parts[1]}”")
+        return True
+    if cmd in ("fix", "改tag", "纠错"):
+        # 纠正视觉误判：/fix 文件名或标签 角色=xxx / 标签=a,b / 描述=xxx
+        # 这些词会进贴纸的 tags.json 和 meta.json，后台以后挑贴纸/描述都用新值。
+        fields = {"角色": "character", "character": "character",
+                  "描述": "desc", "desc": "desc",
+                  "标签": "tags", "tags": "tags"}
+        opts, target = {}, ""
+        for part in arg.split():
+            if "=" in part:
+                k, v = part.split("=", 1)
+                opts[k.strip()] = v.strip()
+            elif not target:
+                target = part
+        bad = [k for k in opts if k not in fields]
+        if not target or not opts or bad:
+            await matcher.finish(
+                "用法：/fix 文件名或标签 角色=正确角色｜角色=（表示认不出是谁）\n"
+                "　　　/fix 文件名 标签=开心,无语 描述=画面内容\n"
+                "先用 /list 初音 查文件名，/show 文件名 看图和现有标签。")
+        name = os.path.basename(target)
+        if (sticker_dir() / name).is_file():
+            items = [(name, [])]
+        else:
+            items = list_stickers(target)
+        if not items:
+            await matcher.finish(f"没找到“{target}”，先用 /list 查确切文件名。")
+        if len(items) > 1:
+            await matcher.finish(f"“{target}”匹配到 {len(items)} 张，请用文件名精确指定：\n"
+                                 + "\n".join(n for n, _ in items[:10]))
+        name = items[0][0]
+        kw = {}
+        for k, v in opts.items():
+            field = fields[k]
+            if field == "tags":
+                kw["tags"] = [t for t in re.split(r"[,，、\s]+", v) if t]
+            else:
+                kw[field] = v
+        res = fix_sticker(name, **kw)
+        if not res:
+            await matcher.finish("修正失败：文件不存在。")
+        done = []
+        if "character" in kw:
+            done.append("角色=" + (kw["character"] or "（空）"))
+        if "desc" in kw:
+            done.append("描述已更新")
+        if "tags" in kw:
+            done.append("标签已重设")
+        await matcher.finish(f"已修正 {name}：{'、'.join(done)}\n"
+                             f"当前标签：{'、'.join(res[1]) or '无'}\n"
+                             "同一张图再发会直接用新结果；已写进长期记忆的旧说法用 /memory del 清。")
         return True
     if cmd == "testrich":
         await matcher.send("【自测】文本 OK")
