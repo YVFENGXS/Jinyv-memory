@@ -10,6 +10,7 @@
   标记渲染成 QQ 表情 / 图片 / 搜图 / 贴纸 / 语音（RP_RICH=0 可整体关闭）
 - 贴纸自学习：收到的图片/商城表情自动入库并打标签（RP_AUTOSTICKER，带每日配额）
 - 定时提醒：识别「X 分钟后提醒我…」或 /remind 命令，落 SQLite，到点由人设口吻发出
+- 可主动沉默：模型输出 [[pass]] 时这一轮一条都不发（仍写记忆），连续两次后强制开口
 - 进程退出时冲刷归档（shutdown 内部等待后台批次）
 
 环境变量：
@@ -26,8 +27,8 @@
   RP_AUTOSTICKER                    选填，1/0 自动收藏贴纸，默认 1
   RP_AUTOSTICKER_DAILY              选填，自动收藏每日上限，默认 5（管理员不受限）
   RP_IDLE_NUDGE_MINUTES             选填，私聊闲置提醒阈值（分钟），默认 60，0=关闭
-  RP_IDLE_NUDGE_TEXT                选填，兜底提醒语（模型生成失败时用，默认随机三选一）
-  RP_PROACTIVE                      选填，1/0 闲置时由模型按记忆生成主动开场白，默认 1
+  RP_IDLE_NUDGE_TEXT                选填，仅 RP_PROACTIVE=0 时使用的固定文案（默认随机二选一）
+  RP_PROACTIVE                      选填，1/0 闲置时由模型按上下文决定说什么或不说，默认 1
   RP_PROACTIVE_DAILY                选填，每个会话每天最多主动开口几次，默认 3
   RP_POKE_BACK                      选填，1/0 被戳时回戳，默认 1
   RP_POKE_COOLDOWN                  选填，同一人两次戳的最小间隔秒数，默认 30
@@ -43,6 +44,7 @@
   RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
 """
 import asyncio
+import logging
 import os
 import random
 import re
@@ -125,12 +127,12 @@ PROACTIVE_DAILY = max(1, int(float(os.environ.get("RP_PROACTIVE_DAILY") or 3)))
 POKE_BACK = (os.environ.get("RP_POKE_BACK") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 POKE_COOLDOWN = max(0.0, float(os.environ.get("RP_POKE_COOLDOWN") or 30))
+MAX_SILENT = 2            # 允许连续沉默的轮数；超过后强制开口，避免对话彻底断死
 EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48) * 3600))
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
 NUDGE_LINES = ([
     os.environ["RP_IDLE_NUDGE_TEXT"]] if os.environ.get("RP_IDLE_NUDGE_TEXT") else [
     "你怎么这么长时间没找我说话了......",
-    "……主人？",
     "主人......是不是把瑾瑜忘了......",
 ])
 
@@ -140,6 +142,7 @@ _last_seen = {}
 _nudged_at = {}           # sid -> 上次闲置提醒时间（同一轮沉默只提醒一次）
 _nudge_count = {}         # "日期:sid" -> 当天主动开口次数（按天限额，防骚扰）
 _poke_at = {}             # "sid:uid" -> 上次回戳时间（冷却，防两个机器人来回戳）
+_silent_count = {}        # sid -> 连续选择不回话的轮数（超限强制开口）
 _last_media = {}          # sid -> 最近一张图片的 URL/bytes 摘要，供 /save 使用
 _media_tasks = set()
 _media_futs = {}           # message_id -> [该条消息每张图的判读 task]（_handle 等它拿描述）
@@ -147,9 +150,33 @@ _media_futs = {}           # message_id -> [该条消息每张图的判读 task]
 driver = get_driver()
 
 
+class _StdLogBridge(logging.Handler):
+    """把标准 logging 接到 NoneBot 的 loguru。
+
+    core/rp_skeleton.py 用的是 logging.getLogger("rp_memory")，没人配 handler，
+    INFO 会被直接吞掉——后台归纳只能看到告警。接过来之后「后台归纳完成」才可见。
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            logger.opt(depth=6, exception=record.exc_info).log(
+                record.levelname, record.getMessage())
+        except Exception:                       # noqa: BLE001  日志失败不能影响业务
+            pass
+
+
+def _bind_core_log() -> None:
+    lg = logging.getLogger("rp_memory")
+    if not any(isinstance(h, _StdLogBridge) for h in lg.handlers):
+        lg.addHandler(_StdLogBridge())
+    lg.setLevel(logging.INFO)
+    lg.propagate = False                        # 避免再被 root 的 handler 重复打印
+
+
 @driver.on_startup
 async def _startup():
     global mw
+    _bind_core_log()
     db_path = Path(os.environ.get("RP_DB") or "data/rp_memory.db").expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     mw = RPContextMiddleware(
@@ -181,10 +208,11 @@ async def _startup():
 
 
 async def _idle_nudge_loop():
-    """私聊闲置主动消息：超过阈值时让模型按记忆和人设开口（同一轮沉默只发一次）。
+    """私聊闲置主动消息：超过阈值时让模型按上下文和人设开口（同一轮沉默只尝试一次）。
 
-    生成失败或关闭 RP_PROACTIVE 时退回固定文案；每个会话每天有次数上限，
-    避免主人一直不回时被反复打扰。
+    模型可以判断「现在没必要说话」而输出 [[pass]]，或生成失败——两种情况都不发送，
+    也不占每日主动额度。只有 RP_PROACTIVE=0 的旧模式才用固定文案。
+    每个会话每天有次数上限，避免主人一直不回时被反复打扰。
     """
     while True:
         try:
@@ -209,11 +237,16 @@ async def _idle_nudge_loop():
                 if PROACTIVE_ON:
                     try:
                         line = await _proactive_line(sid, int(idle_min))
-                    except Exception as exc:            # noqa: BLE001  生成失败退回固定文案
+                    except Exception as exc:            # noqa: BLE001  生成失败就当你不想说话
                         logger.warning(f"[jinyu] 主动话题生成失败 sid={sid}: {exc}")
+                    if _is_silent(line):                # 模型判断没必要开口，或生成失败
+                        _nudged_at[sid] = now           # 这轮沉默不再打扰，也不占主动额度
+                        logger.info(f"[jinyu] 主动话题选择沉默 sid={sid} "
+                                    f"idle={int(idle_min)}min")
+                        continue
+                else:
+                    line = random.choice(NUDGE_LINES)   # 仅 RP_PROACTIVE=0 的旧模式才用固定文案
                 generated = bool(line)
-                if not line:
-                    line = random.choice(NUDGE_LINES)
                 try:
                     await _send_to(line, user_id=uid)
                     _nudged_at[sid] = now
@@ -228,10 +261,10 @@ async def _idle_nudge_loop():
 
 
 async def _reminder_loop():
-    """每 20 秒检查到期提醒；与正常对话共用会话锁，避免轮号交错。"""
+    """每 10 秒检查到期提醒；与正常对话共用会话锁，避免轮号交错。"""
     while True:
         try:
-            await asyncio.sleep(20)
+            await asyncio.sleep(10)
             if mw is None or not reminder.ready():
                 continue
             for row in await asyncio.to_thread(reminder.due):
@@ -300,8 +333,10 @@ async def _proactive_line(sid: str, idle_min: int) -> str:
             mw.session_identity, sid, CID, EPOCH_SECONDS, flush_timeout=EPOCH_FLUSH)
         text = (f"（系统事件：现在是 {time.strftime('%H:%M')}，"
                 f"主人已经 {idle_min} 分钟没说话了。"
-                f"你可以主动发一条消息，像平时聊天那样口语、短一点；"
-                f"不要问「在吗」，不要提系统、时间或沉默时长。）")
+                f"你可以结合你们最近聊的内容，主动说一小段符合当下情境的话"
+                f"（一两句就好，别复述、别总结、别问「在吗」，不要提系统、时间或沉默时长）；"
+                f"如果你判断现在没必要开口（比如主人可能已经睡了、刚道过晚安、话题已经收尾），"
+                f"就只输出 [[pass]]，什么字都别加。）")
         reply = await asyncio.to_thread(mw.chat, text, persona, session_sid, CID)
     return (reply or "").strip()
 
@@ -666,6 +701,11 @@ def _split_poke(reply: str) -> str:
     return POKE_MARK.sub("", reply).strip() if POKE_MARK.search(reply) else reply
 
 
+def _is_silent(reply: str) -> bool:
+    """模型选择不回话：整条只给了 [[pass]]，或干脆是空白。"""
+    return not (reply or "").strip() or bool(_PASS_RE.search(reply))
+
+
 async def _send_rich(reply: str) -> None:
     """按标记把回复渲染成文本/图片/表情/语音分段发送。"""
     reply = _split_poke(reply)
@@ -980,6 +1020,18 @@ GROUP_HINT = """
 - 群友的昵称和说话风格可以慢慢记住
 - 你的回复只写自己的台词，绝对不要在开头加「昵称：」或「瑾瑜：」这种前缀"""
 
+SILENCE_HINT = """
+
+【沉默规则】你可以选择这一轮真的不回话：
+- 什么时候沉默：被陌生人或客人挑衅、羞辱、说下流话，被要求「你闭嘴」「有本事别回」，
+  或者对方只是在无意义刷屏、自言自语、根本不需要你接话
+- 怎么沉默：整条回复只输出 [[pass]] 这一个标记，什么字都别加
+- 绝对不要用「（尾巴一动不动，没出声）」这种括号里的动作或神态来表达沉默——那照样会被发出去
+- 其余情况正常开口；一直不回话会显得像坏了，所以最多连续沉默两轮，之后必须说话"""
+
+
+_PASS_RE = re.compile(r"\[\[\s*pass\s*\]\]", re.I)
+
 
 _PREFIX_RE = re.compile(r"^\s*@?([^\s：:]{1,24})\s*[：:]\s*(.+)$", re.S)
 
@@ -1090,6 +1142,10 @@ async def _handle(event: MessageEvent):
         text += link_note
     if remind_note:
         text += remind_note
+    if _silent_count.get(sid, 0) >= MAX_SILENT:
+        # 已经连续沉默到上限：这一轮把规则说在前面，逼它开口，避免真的变成哑巴
+        text += ("（系统提示：你已经连续两轮没回话了，这一轮必须开口回应，"
+                 "不要再输出 [[pass]]。）")
     if is_group:
         text = _group_text(event, text)   # 群消息加说话人前缀 → 共享上下文分得清谁说的
     lock = _locks.setdefault(sid, asyncio.Lock())
@@ -1100,6 +1156,7 @@ async def _handle(event: MessageEvent):
         persona["core"] = persona["core"] + rich_hint()
     if is_group:
         persona["core"] = persona["core"] + GROUP_HINT
+    persona["core"] = persona["core"] + SILENCE_HINT   # 允许沉默（[[pass]]），QQ 侧才生效
     async with lock:
         try:
             # 闲置轮换：超过阈值先把旧 epoch 尾部归档并标 closed，再开新会话；
@@ -1119,4 +1176,14 @@ async def _handle(event: MessageEvent):
         except Exception as exc:                    # 生成失败不能让事件循环崩
             logger.exception(f"[jinyu] 生成失败 sid={sid}: {exc}")
             await matcher.finish("……主人，瑾瑜刚刚走神了，再说一遍好不好。")
+    if _is_silent(reply):
+        # 这一轮真的一句话都不发；本轮已由中间件写进记忆，所以「知道发生过什么」
+        _silent_count[sid] = _silent_count.get(sid, 0) + 1
+        logger.info(f"[jinyu] 前台选择沉默 sid={session_sid} "
+                    f"用户={event.user_id} 连续={_silent_count[sid]} 问={text[:40]!r}")
+        if _silent_count[sid] > MAX_SILENT:       # 硬兜底：说了必须开口还是沉默，就发一句
+            _silent_count[sid] = 0
+            await _send_rich("……嗯。")
+        return
+    _silent_count[sid] = 0
     await _send_rich(reply)
