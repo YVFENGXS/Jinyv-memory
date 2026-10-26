@@ -1,0 +1,34 @@
+# 密钥与本地配置
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行时数据（对话、贴纸、缓存、二维码）
+data/
+*.db
+*.db-wal
+*.db-shm
+chat_memory.db*
+demo_memory.db*
+stickers/
+tts_cache/
+login_qrcode.png
+*.log
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,684 @@
+# -*- coding: utf-8 -*-
+"""瑾瑜 × QQ：把 RP 记忆中间件接到 OneBot v11（NapCat）
+
+行为：
+- 私聊全收；群聊只在被 @ 时回复
+- 群聊整群共享一条上下文：消息前缀「说话人昵称：」让模型分清谁在说话（2026-10-25 起）
+- 每个（群/私聊）会话一把 asyncio.Lock，同一会话严格串行，避免轮号交错
+- 一轮一次前台调用，放线程池执行，不阻塞事件循环
+- 富消息：回复里的 [[face:..]]/[[img:..]]/[[search:..]]/[[sticker:..]]/[[voice:..]]
+  标记渲染成 QQ 表情 / 图片 / 搜图 / 贴纸 / 语音（RP_RICH=0 可整体关闭）
+- 贴纸自学习：收到的图片/商城表情自动入库并打标签（RP_AUTOSTICKER，带每日配额）
+- 进程退出时冲刷归档（shutdown 内部等待后台批次）
+
+环境变量：
+  RP_FRONT_KEY / RP_BACK_KEY        必填，DeepSeek 密钥
+  RP_FRONT_MODEL / RP_BACK_MODEL    选填
+  RP_LLM_BASE                       选填
+  RP_DB                             选填，默认 data/rp_memory.db
+  RP_MAX_TOKENS / RP_OUTPUT_RESERVE 选填，默认 64000 / 4096
+  RP_PROFILE                        选填，cl100k / o200k / qwen / zhipu
+  RP_COOLDOWN                       选填，同一会话最小间隔秒数，默认 2
+  RP_RICH                           选填，1/0 开关富消息，默认 1
+  RP_STICKER_DIR                    选填，贴纸库目录，默认 /opt/qqbot/stickers
+  RP_TTS_DIR / RP_TTS_VOICE         选填，语音缓存目录 / edge-tts 音色
+  RP_AUTOSTICKER                    选填，1/0 自动收藏贴纸，默认 1
+  RP_AUTOSTICKER_DAILY              选填，自动收藏每日上限，默认 5（管理员不受限）
+  RP_IDLE_NUDGE_MINUTES             选填，私聊闲置提醒阈值（分钟），默认 60，0=关闭
+  RP_IDLE_NUDGE_TEXT                选填，自定义提醒语（默认随机三选一）
+  RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
+  RP_ADMIN_QQ                       选填，允许 /save /tags /find /img /sticker /voice /testrich 的 QQ
+  RP_SESSION_EPOCH_HOURS            选填，闲置多少小时后开启新会话 epoch，默认 48，0=不轮换
+  RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
+"""
+import asyncio
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+from nonebot import get_bot, get_driver, logger, on_message
+from nonebot.adapters.onebot.v11 import (
+    GroupMessageEvent,
+    Message,
+    MessageEvent,
+    MessageSegment,
+    PrivateMessageEvent,
+)
+from nonebot.rule import Rule
+
+CORE = Path(__file__).resolve().parent / "core"
+if str(CORE) not in sys.path:
+    sys.path.insert(0, str(CORE))
+PLUGIN = Path(__file__).resolve().parent
+if str(PLUGIN) not in sys.path:
+    sys.path.insert(0, str(PLUGIN))
+
+from llm import from_env                                    # noqa: E402
+from persona import PERSONA                                 # noqa: E402
+from richmsg import (                                       # noqa: E402
+    DOWNLOAD_LIMIT,
+    add_tags,
+    autosave_enabled,
+    build_messages,
+    classify_image_bytes,
+    delete_sticker,
+    download_image,
+    download_image_ex,
+    image_segment,
+    image_search,
+    list_stickers,
+    list_tags,
+    pick_sticker,
+    remove_tag,
+    rich_enabled,
+    rich_hint,
+    save_and_tag,
+    sticker_dir,
+    sweep_tts_cache,
+    tts_audio,
+    url_is_public,
+)
+from rp_skeleton import DB, RPContextMiddleware             # noqa: E402
+
+CID = "jinyu"
+COOLDOWN = float(os.environ.get("RP_COOLDOWN") or 2)
+REPLY_CHUNK = 1000
+ADMIN = {x.strip() for x in (os.environ.get("RP_ADMIN_QQ") or "").split(",") if x.strip()}
+IDLE_NUDGE_MIN = float(os.environ.get("RP_IDLE_NUDGE_MINUTES") or 60)
+EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48) * 3600))
+EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
+NUDGE_LINES = ([
+    os.environ["RP_IDLE_NUDGE_TEXT"]] if os.environ.get("RP_IDLE_NUDGE_TEXT") else [
+    "你怎么这么长时间没找我说话了......",
+    "……主人？",
+    "主人......是不是把瑾瑜忘了......",
+])
+
+mw = None
+_locks = {}
+_last_seen = {}
+_nudged_at = {}           # sid -> 上次闲置提醒时间（同一轮沉默只提醒一次）
+_last_media = {}          # sid -> 最近一张图片的 URL/bytes 摘要，供 /save 使用
+_media_tasks = set()
+_media_futs = {}           # message_id -> [该条消息每张图的判读 task]（_handle 等它拿描述）
+
+driver = get_driver()
+
+
+@driver.on_startup
+async def _startup():
+    global mw
+    db_path = Path(os.environ.get("RP_DB") or "data/rp_memory.db").expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    mw = RPContextMiddleware(
+        from_env("front"), from_env("back"), DB(str(db_path)),
+        max_tokens=int(os.environ.get("RP_MAX_TOKENS") or 64000),
+        output_reserve=int(os.environ.get("RP_OUTPUT_RESERVE") or 4096),
+        profile=os.environ.get("RP_PROFILE") or "cl100k",
+    )
+    logger.info(f"[jinyu] 记忆体就绪 db={db_path} profile={mw.profile} "
+                f"budget={mw.budget}")
+    logger.info(
+        f"[jinyu] 前台模型 {mw.front.model}"
+        f"（thinking={getattr(mw.front, 'thinking', '') or '默认'}）｜"
+        f"后台模型 {mw.back.model}"
+        f"（thinking={getattr(mw.back, 'thinking', '') or '默认'}）")
+    if IDLE_NUDGE_MIN > 0:
+        asyncio.create_task(_idle_nudge_loop())
+    asyncio.create_task(asyncio.to_thread(sweep_tts_cache, True))   # 启动时清一次 TTS 缓存
+
+
+async def _idle_nudge_loop():
+    """私聊闲置提醒：主人超过阈值没说话时主动发一句（同一轮沉默只发一次）。"""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            if mw is None or IDLE_NUDGE_MIN <= 0:
+                continue
+            now = time.monotonic()          # 与 _last_seen 同一种时钟，否则闲置时长全是错数
+            bot = get_bot()
+            for sid, seen in list(_last_seen.items()):
+                if not sid.startswith("qq-u"):          # 只提醒私聊
+                    continue
+                idle_min = (now - seen) / 60
+                if idle_min <= IDLE_NUDGE_MIN:
+                    continue
+                if _nudged_at.get(sid, 0.0) > seen:     # 这轮沉默已经提醒过
+                    continue
+                uid = int(sid[4:])
+                try:
+                    await bot.send_private_msg(user_id=uid,
+                                               message=random.choice(NUDGE_LINES))
+                    _nudged_at[sid] = now
+                    logger.info(f"[jinyu] 闲置提醒已发送 sid={sid} idle={int(idle_min)}min")
+                except Exception as exc:                # noqa: BLE001
+                    logger.warning(f"[jinyu] 闲置提醒发送失败 sid={sid}: {exc}")
+        except Exception as exc:                        # noqa: BLE001
+            logger.warning(f"[jinyu] 闲置提醒循环异常: {exc}")
+
+
+@driver.on_shutdown
+async def _shutdown():
+    if mw is None:
+        return
+    await asyncio.to_thread(mw.shutdown)      # 分段冲刷归档，总超时 60s
+    logger.info(f"[jinyu] 已停止｜归档失败区间 {len(mw.db.list_failures())} 个")
+
+
+def _sid(event: MessageEvent) -> str:
+    if isinstance(event, GroupMessageEvent):
+        return f"qq-g{event.group_id}"     # 整群共享一条上下文（2026-10-25 用户需求）
+    return f"qq-u{event.user_id}"
+
+
+_group_names: dict = {}      # (群号:qq) -> 群内显示名缓存（群名片优先，运行中学习）
+
+
+def _name_key(group_id, qq) -> str:
+    """名字缓存必须按群隔离：同一个人在不同群可能有不同群名片。"""
+    return f"{group_id}:{qq}"
+
+
+CTRL_CHARS = re.compile(r"[\u0000-\u001f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufe0f]")
+
+
+def _clean_name(name: str) -> str:
+    """名片里常混进 bidi 控制符/零宽字符/多余空格（如「祁梓鹤 \\u2067~喵」）。"""
+    name = CTRL_CHARS.sub("", name or "")
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _speaker(event: GroupMessageEvent) -> str:
+    """群消息的说话人显示名：群名片 > 昵称 > 曾用名缓存 > 群友+尾号。"""
+    sender = event.sender
+    name = ""
+    for field in ("card", "nickname"):
+        v = _clean_name(getattr(sender, field, ""))
+        if v and not v.startswith("别 艾 特"):        # 防个性签名/嘲讽语混进名字
+            name = v
+            break
+    key = _name_key(event.group_id, event.user_id)
+    if not name:
+        name = _group_names.get(key, "")
+    if not name:
+        name = f"群友{str(event.user_id)[-4:]}"
+    _group_names[key] = name                          # 学到的名字存缓存
+    return name
+
+
+async def _mention_name_async(bot, group_id: int, qq: str) -> str:
+    """@提及还原成人名：缓存 > 群成员信息接口 > 群友+尾号。"""
+    key = _name_key(group_id, qq)
+    if key in _group_names:
+        return _group_names[key]
+    try:
+        info = await bot.get_group_member_info(group_id=group_id, user_id=int(qq))
+        name = _clean_name(info.get("card") or info.get("nickname") or "")
+        if name and len(name) <= 20 and not name.startswith("别"):
+            _group_names[key] = name
+            return name
+    except Exception:                     # noqa: BLE001  接口失败就走兜底
+        pass
+    return f"群友{str(qq)[-4:]}"
+
+
+async def _plain_with_mentions(event: MessageEvent) -> str:
+    """纯文本 + @提及还原成「@名字」，保证指代不丢。"""
+    bot = get_bot()
+    self_id = str(getattr(event, "self_id", "") or "")
+    parts = []
+    for seg in event.message:
+        if seg.type == "text":
+            parts.append(str(seg.data.get("text") or ""))
+        elif seg.type == "at":
+            qq = str(seg.data.get("qq") or "")
+            if qq and qq != self_id:                  # @机器人本身不需要还原
+                gid = event.group_id if isinstance(event, GroupMessageEvent) else 0
+                name = (await _mention_name_async(bot, gid, qq)) if gid \
+                    else _group_names.get(_name_key(0, qq), f"群友{qq[-4:]}")
+                parts.append(f"@{name} ")
+    return "".join(parts).strip()
+
+
+async def _expand_reply(event: MessageEvent) -> str:
+    """把「引用」展开成人话：引用了谁、原文是什么、引用的图里有什么。
+
+    以前引用只留下 [CQ:reply,id=xxx]，前台模型不知道用户在回应哪句话/哪张图。
+    文字直接取原消息；图片下载后走视觉判读（按 md5 缓存，引用刚发过的图基本
+    零成本）。任何一步失败都降级为「引用了一条消息」，绝不影响正常回复。
+    """
+    notes = []
+    for seg in event.message:
+        if seg.type != "reply":
+            continue
+        try:
+            mid = int((seg.data or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            mid = 0
+        if not mid:
+            continue
+        try:
+            bot = get_bot()
+            src = await bot.call_api("get_msg", message_id=mid)
+        except Exception:                     # noqa: BLE001   消息太旧/已撤回等
+            notes.append("（引用了一条已查不到的消息）")
+            continue
+        sender = src.get("sender") or {}
+        who = sender.get("nickname") or str(sender.get("user_id") or "某人")
+        bits = []
+        for s in src.get("message") or []:
+            stype, sdata = s.get("type"), (s.get("data") or {})
+            if stype == "text" and str(sdata.get("text") or "").strip():
+                bits.append(f"「{str(sdata['text']).strip()[:120]}」")
+            elif stype in ("image", "mface"):
+                url = sdata.get("url") or sdata.get("file") or ""
+                data = None
+                if url.startswith("http"):
+                    data = await asyncio.get_running_loop().run_in_executor(
+                        None, download_image, url)
+                if not data:
+                    bits.append("（引用的图片没拉到）")
+                    continue
+                try:
+                    info = await asyncio.wait_for(classify_image_bytes(data), timeout=20)
+                    d = _img_note([info]).strip("（）")
+                    bits.append(d or "一张图片")
+                except Exception:         # noqa: BLE001
+                    bits.append("（引用的图片没看清）")
+        notes.append(f"（引用 {who} 的消息：{'；'.join(bits)}）" if bits
+                     else f"（引用了 {who} 的一条消息）")
+    return "".join(notes)
+
+
+def _group_text(event: GroupMessageEvent, text: str) -> str:
+    """群消息加说话人前缀，让共享上下文能分清谁在说话。"""
+    return f"{_speaker(event)}：{text}"
+
+
+# ------------------------------------------------- 贴纸自学习（不回复，只收集）
+
+capture = on_message(priority=1, block=False)
+
+
+def _extract_image_urls(event: MessageEvent) -> list:
+    """消息里所有图片/商城表情的直链（可能为空列表）。"""
+    urls = []
+    for seg in event.message:
+        if seg.type == "image":
+            u = seg.data.get("url") or seg.data.get("file") or ""
+            if u.startswith("http"):
+                urls.append(u)
+        elif seg.type == "mface":
+            u = seg.data.get("url") or ""
+            if u.startswith("http"):
+                urls.append(u)
+    return urls
+
+
+@capture.handle()
+async def _capture(event: MessageEvent):
+    urls = _extract_image_urls(event)
+    if not urls:
+        return
+    sid = _sid(event)
+    _last_media[sid] = urls[-1]
+    is_admin = str(event.user_id) in ADMIN
+    tasks = []
+    for u in urls:                        # 一条消息里所有图都处理
+        task = asyncio.create_task(_process_image(u, sid, is_admin))
+        _media_tasks.add(task)
+        task.add_done_callback(_media_tasks.discard)
+        tasks.append(task)
+    if _target(event):                    # 只给会回复的消息挂结果，message_id 唯一不串图
+        _media_futs[str(event.message_id)] = tasks
+
+
+async def _process_image(url: str, sid: str, is_admin: bool) -> Optional[dict]:
+    """下载 → 视觉判读 → 可用表情包入库 / 其余只留描述。失败只记日志。"""
+    try:
+        loop = asyncio.get_running_loop()
+        data, why = await loop.run_in_executor(None, download_image_ex, url)
+        if data is None:
+            logger.info(f"[jinyu] 图片下载失败 sid={sid}：{why}")
+            return None
+        info = await classify_image_bytes(data)
+        if info.get("err"):
+            logger.warning(f"[jinyu] 视觉判读失败 sid={sid}: {info['err']}")
+        if info.get("kind") == "表情包":
+            if info.get("blocked"):
+                logger.info(f"[jinyu] 图中文字违禁，不入库 sid={sid}：{info.get('text')}")
+            elif info.get("suitable") is False:
+                logger.info(f"[jinyu] 后台判定不适合作为表情包，不入库 sid={sid}："
+                            f"{info.get('desc')}")
+            elif autosave_enabled():
+                path = await loop.run_in_executor(
+                    None, lambda: save_and_tag(data, [], is_admin, info))
+                if path is not None:
+                    logger.info(f"[jinyu] 贴纸入库 {path.name} (sid={sid}) "
+                                f"tags={info.get('tags')} text={info.get('text')!r}")
+        else:
+            logger.info(f"[jinyu] 图片（非表情包）不入库 sid={sid}：{info.get('desc')}")
+        return info
+    except Exception as exc:              # noqa: BLE001
+        logger.warning(f"[jinyu] 图片处理失败: {exc}")
+        return None
+
+
+def _img_note(infos: list) -> str:
+    """后台视觉结果 → 给前台模型看的事实说明：是什么图、图上写了什么。
+
+    图片和表情包都要说清楚——以前表情包的描述被丢掉，前台只能说"看不到图"。
+    """
+    parts = []
+    for info in infos:
+        if not info:
+            continue
+        label = "一个表情包" if info.get("kind") == "表情包" else "一张图片"
+        bits = []
+        if info.get("desc"):
+            bits.append(str(info["desc"]))
+        if info.get("character"):
+            bits.append(f"角色是「{info['character']}」")
+        if info.get("text"):
+            bits.append(f"图上的字是「{info['text']}」")
+        parts.append(f"（发来{label}：{'；'.join(bits)}）" if bits
+                     else f"（发来{label}，但没看清内容）")
+        if info.get("blocked") or info.get("suitable") is False:
+            parts.append("（这张图不适合当表情包，别学它）")
+    return "".join(parts)
+
+
+async def _wait_media(event: MessageEvent) -> list:
+    """等本条消息的视觉任务；超时/失败都只当"没看见"，绝不卡住回复。"""
+    tasks = _media_futs.pop(str(event.message_id), None) or []
+    out = []
+    for task in tasks:
+        try:
+            info = await asyncio.wait_for(asyncio.shield(task), timeout=35)
+        except Exception:                 # noqa: BLE001
+            info = None
+        if info:
+            out.append(info)
+    return out
+
+
+# ------------------------------------------------- 主回复
+
+async def _target(event: MessageEvent) -> bool:
+    if isinstance(event, PrivateMessageEvent):
+        return True
+    if isinstance(event, GroupMessageEvent):
+        return event.is_tome()                # 群聊只回 @
+    return False
+
+
+matcher = on_message(rule=Rule(_target), priority=10, block=True)
+
+
+def sticker_message(path):
+    if not path:
+        return None
+    seg = image_segment(path)
+    return Message(seg) if seg else None
+
+
+async def _send_rich(reply: str) -> None:
+    """按标记把回复渲染成文本/图片/表情/语音分段发送。"""
+    if not rich_enabled():
+        for i in range(0, len(reply), REPLY_CHUNK):
+            await matcher.send(reply[i:i + REPLY_CHUNK])
+        return
+    for msg in await build_messages(reply, REPLY_CHUNK):
+        try:
+            await matcher.send(msg)
+        except Exception as exc:              # 单个媒体段失败不影响后续文本
+            logger.opt(exception=exc).warning(f"[jinyu] 媒体段发送失败: {exc}")
+
+
+async def _admin(event: MessageEvent, text: str) -> bool:
+    """管理员自测/管理命令，绕过模型。"""
+    if not ADMIN or str(event.user_id) not in ADMIN:
+        return False
+    if not text.startswith("/"):
+        return False
+    cmd, _, arg = text[1:].partition(" ")
+    arg = arg.strip()
+    if cmd == "new":
+        sid = _sid(event)
+        lock = _locks.setdefault(sid, asyncio.Lock())
+        async with lock:                   # 与正常回复串行，避免边聊边轮换
+            new_sid = await asyncio.to_thread(
+                mw.session_identity, sid, CID, EPOCH_SECONDS,
+                force=True, flush_timeout=EPOCH_FLUSH)
+        await matcher.finish(f"已开新会话（{new_sid}），长期事实和 strict 承诺已继承。")
+        return True
+    if cmd == "voice" and arg:
+        audio = await tts_audio(arg)
+        if not audio:
+            await matcher.finish("语音合成失败，看日志。")
+        await matcher.send(Message(MessageSegment.record(audio.resolve().as_uri())))
+        return True
+    if cmd == "img" and arg:
+        if not arg.startswith(("http://", "https://")):
+            await matcher.finish("只支持 http/https 图片直链。")
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, url_is_public, arg):
+            await matcher.finish("这个地址不是公网图片直链。")
+        await matcher.send(Message(MessageSegment.image(arg)))
+        return True
+    if cmd == "find" and arg:
+        url = await asyncio.get_running_loop().run_in_executor(None, image_search, arg)
+        if not url:
+            await matcher.finish("搜图没拿到结果，换个词试试。")
+        await matcher.send(Message(MessageSegment.image(url)))
+        return True
+    if cmd == "sticker":
+        msg = sticker_message(pick_sticker(arg, allow_empty_random=True))
+        if msg is None:
+            await matcher.finish("贴纸库是空的，把 gif/png 放进 RP_STICKER_DIR 再试。")
+        await matcher.send(msg)
+        return True
+    if cmd == "save":
+        url = _last_media.get(_sid(event))
+        if not url:
+            await matcher.finish("这个会话里还没出现过图片，先发一张再 /save 标签1 标签2。")
+        tags = [t for t in arg.replace("，", " ").split() if t]
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, download_image, url)
+        if not data:
+            await matcher.finish("下载原图失败，这张图可能已过期。")
+        # 管理员手动收藏：跳过每日自动配额，也不消耗自动收藏额度
+        path = await loop.run_in_executor(None, save_and_tag, data, tags, True)
+        if path is None:
+            await matcher.finish(
+                f"入库失败（文件格式不支持或超过 {DOWNLOAD_LIMIT // (1024 * 1024)}MB）。")
+        await matcher.finish(f"已收藏 {path.name}，标签：{' '.join(tags) or '（视觉自动打标）'}")
+        return True
+    if cmd == "tags":
+        counts = list_tags()
+        if not counts:
+            await matcher.finish("贴纸库还是空的。")
+        items = sorted(counts.items(), key=lambda kv: -kv[1])[:60]
+        await matcher.finish("贴纸标签：" + "、".join(f"{t}({n})" for t, n in items))
+        return True
+    if cmd == "list":
+        items = list_stickers(arg)
+        if not items:
+            await matcher.finish("没有匹配的贴纸（可加标签过滤，如 /list 开心）。")
+        head = f"共 {len(items)} 张" + (f"，按“{arg}”过滤" if arg else "")
+        lines = [f"{n}  [{'、'.join(t) or '无标签'}]" for n, t in items[:30]]
+        extra = "\n……" if len(items) > 30 else ""
+        await matcher.finish(head + "（显示前 30）\n" + "\n".join(lines) + extra
+                             + "\n删除用 /del 文件名；预览用 /show 文件名")
+        return True
+    if cmd == "show":
+        items = list_stickers(arg)
+        if not items:
+            await matcher.finish("没有匹配的贴纸。")
+        name, tags = items[0]
+        msg = sticker_message(sticker_dir() / name)
+        if msg is None:
+            await matcher.finish("文件读不出来，可能太大或已损坏。")
+        await matcher.send(msg)
+        await matcher.finish(f"{name}  [{'、'.join(tags) or '无标签'}]"
+                             + (f"（共 {len(items)} 个匹配）" if len(items) > 1 else ""))
+        return True
+    if cmd == "del":
+        if not arg:
+            await matcher.finish("用法：/del 文件名（文件名用 /list 查）。")
+        exact = delete_sticker(arg)
+        if exact:
+            await matcher.finish(f"已删除 {arg}")
+        items = list_stickers(arg)
+        if not items:
+            await matcher.finish("没找到这个文件，用 /list 查确切文件名。")
+        if len(items) == 1:
+            name, tags = items[0]
+            delete_sticker(name)
+            await matcher.finish(f"已删除 {name}  [{'、'.join(tags) or '无标签'}]")
+        lines = [n for n, _ in items[:10]]
+        await matcher.finish(f"“{arg}”匹配到 {len(items)} 张，请用文件名精确删除：\n"
+                             + "\n".join(lines))
+        return True
+    if cmd == "tag":
+        parts = arg.split()
+        if len(parts) < 2:
+            await matcher.finish("用法：/tag 文件名 标签1 标签2（给贴纸加标签）")
+        name, tags = parts[0], parts[1:]
+        if not add_tags(name, tags):
+            await matcher.finish("失败：文件不存在（用 /list 查）或没给标签。")
+        await matcher.finish(f"已给 {name} 加标签：{'、'.join(tags)}")
+        return True
+    if cmd == "untag":
+        parts = arg.split()
+        if len(parts) != 2:
+            await matcher.finish("用法：/untag 文件名 标签（删掉一个标签，文件保留）")
+        if not remove_tag(parts[0], parts[1]):
+            await matcher.finish("失败：文件名或标签不存在（用 /list 查）。")
+        await matcher.finish(f"已从 {parts[0]} 移除标签“{parts[1]}”")
+        return True
+    if cmd == "testrich":
+        await matcher.send("【自测】文本 OK")
+        await matcher.send(Message(MessageSegment.face(14)))
+        msg = sticker_message(pick_sticker(arg, allow_empty_random=True))
+        if msg is not None:
+            await matcher.send(msg)
+        else:
+            await matcher.send("（贴纸库为空，跳过贴纸）")
+        audio = await tts_audio(arg or "瑾瑜的自测语音，主人在吗")
+        if audio:
+            await matcher.send(Message(MessageSegment.record(audio.resolve().as_uri())))
+        else:
+            await matcher.send("（语音合成失败）")
+        return True
+    return False
+
+
+GROUP_HINT = """
+
+【群聊模式】这条消息来自QQ群聊，每条用户消息开头标了「说话人昵称：」。
+- 按开头的昵称区分不同的说话人，千万别把大家当成同一个人
+- 在群里不要用"主人"称呼群友，自然地按昵称互动
+- 回复贴合群聊节奏：短、口语、一两句话就够，别写作文
+- 群友的昵称和说话风格可以慢慢记住
+- 你的回复只写自己的台词，绝对不要在开头加「昵称：」或「瑾瑜：」这种前缀"""
+
+
+_PREFIX_RE = re.compile(r"^\s*@?([^\s：:]{1,24})\s*[：:]\s*(.+)$", re.S)
+
+
+def _want_cmp(s: str) -> str:
+    """比较说话人姓名用：去控制符/全部空白，全角波浪号归一。"""
+    return (re.sub(r"\s+", "", _clean_name(s))
+            .replace("～", "~").replace("＠", "").strip("@").lower())
+
+
+def _strip_speaker_prefix(reply: str, name: str) -> str:
+    """模型偶尔会照抄群聊的「昵称：内容」格式，把说话人名字写进自己回复里。"""
+    m = _PREFIX_RE.match(reply or "")
+    if not m or not m.group(2).strip():
+        return reply
+    who = m.group(1).strip().strip("[]【】")
+    known = {_want_cmp(name), _want_cmp(str(PERSONA.get("name") or ""))}
+    if _want_cmp(who) in known:
+        return m.group(2).strip()
+    # 昵称里带空格/符号时正则可能只截到前半段，再做一次前缀包含判断
+    head = _want_cmp(who)
+    if head and any(k.startswith(head) and len(head) >= 2 for k in known):
+        return m.group(2).strip()
+    return reply
+
+
+@matcher.handle()
+async def _handle(event: MessageEvent):
+    text = await _plain_with_mentions(event)
+    has_img = any(seg.type in ("image", "mface") for seg in event.message)
+    is_group = isinstance(event, GroupMessageEvent)
+    if not text and not has_img:
+        return
+    if mw is None:
+        _media_futs.pop(str(event.message_id), None)
+        await matcher.finish("……瑾瑜还没睡醒，主人稍等一下。")
+    if await _admin(event, text):
+        _media_futs.pop(str(event.message_id), None)
+        return
+    sid = _sid(event)
+    cd_key = f"{sid}:{event.user_id}" if is_group else sid   # 群聊冷却按说话人分
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    if now - _last_seen.get(cd_key, 0.0) < COOLDOWN:   # 连发保护，静默丢弃
+        _media_futs.pop(str(event.message_id), None)    # 丢弃的消息不能把视觉任务挂在全局表里
+        return
+    _last_seen[cd_key] = now
+
+    async def _media() -> list:
+        return await _wait_media(event) if has_img else []
+
+    async def _qnote() -> str:
+        try:
+            return await _expand_reply(event)
+        except Exception:                     # noqa: BLE001   引用展开失败不影响回复
+            logger.info(f"[jinyu] 引用展开失败 user={event.user_id}")
+            return ""
+    infos, quote_note = await asyncio.gather(_media(), _qnote())
+    if not text:
+        text = (_img_note(infos) if has_img else "") or quote_note \
+            or "（发来一张图片，但没看清内容）"
+    elif has_img:
+        text += _img_note(infos)
+    if quote_note and quote_note not in text:
+        text += quote_note
+    if is_group:
+        text = _group_text(event, text)   # 群消息加说话人前缀 → 共享上下文分得清谁说的
+    lock = _locks.setdefault(sid, asyncio.Lock())
+    # PERSONA 是宪法层字典（core 字段才是系统提示词）。传副本并只在副本上追加
+    # 富消息说明与群聊说明，不改 core/persona.py，也不污染共享字典。
+    persona = dict(PERSONA)
+    if rich_enabled():
+        persona["core"] = persona["core"] + rich_hint()
+    if is_group:
+        persona["core"] = persona["core"] + GROUP_HINT
+    async with lock:
+        try:
+            # 闲置轮换：超过阈值先把旧 epoch 尾部归档并标 closed，再开新会话；
+            # continuity 固定为 sid（群/私聊本体），strict 承诺与保密卡跨 epoch 继承。
+            session_sid = await asyncio.to_thread(
+                mw.session_identity, sid, CID, EPOCH_SECONDS,
+                flush_timeout=EPOCH_FLUSH)
+            t0 = loop.time()
+            speaker = _speaker(event) if is_group else ""
+            reply = await asyncio.to_thread(
+                mw.chat, text, persona, session_sid, CID,
+                (lambda r: _strip_speaker_prefix(r, speaker)) if speaker else None)
+            logger.info(f"[jinyu] 前台生成 sid={session_sid} "
+                        f"群={getattr(event, 'group_id', None) or '私聊'} "
+                        f"用户={event.user_id} "
+                        f"耗时={loop.time() - t0:.1f}s 问={text[:60]!r} 答={reply[:80]!r}")
+        except Exception as exc:                    # 生成失败不能让事件循环崩
+            logger.exception(f"[jinyu] 生成失败 sid={sid}: {exc}")
+            await matcher.finish("……主人，瑾瑜刚刚走神了，再说一遍好不好。")
+    await _send_rich(reply)
