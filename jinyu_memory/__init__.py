@@ -25,7 +25,17 @@
   RP_AUTOSTICKER                    选填，1/0 自动收藏贴纸，默认 1
   RP_AUTOSTICKER_DAILY              选填，自动收藏每日上限，默认 5（管理员不受限）
   RP_IDLE_NUDGE_MINUTES             选填，私聊闲置提醒阈值（分钟），默认 60，0=关闭
-  RP_IDLE_NUDGE_TEXT                选填，自定义提醒语（默认随机三选一）
+  RP_IDLE_NUDGE_TEXT                选填，兜底提醒语（模型生成失败时用，默认随机三选一）
+  RP_PROACTIVE                      选填，1/0 闲置时由模型按记忆生成主动开场白，默认 1
+  RP_PROACTIVE_DAILY                选填，每个会话每天最多主动开口几次，默认 3
+  RP_POKE_BACK                      选填，1/0 被戳时回戳，默认 1
+  RP_POKE_COOLDOWN                  选填，同一人两次戳的最小间隔秒数，默认 30
+  RP_ASR                            选填，1/0 语音转文字，默认 1（没配 RP_ASR_KEY 时不生效）
+  RP_ASR_KEY                        选填，SiliconFlow 密钥；配置后 QQ 语音自动转文字
+  RP_ASR_MODEL                      选填，转写模型，默认 FunAudioLLM/SenseVoiceSmall
+  RP_ASR_BASE                       选填，接口地址，默认 https://api.siliconflow.cn/v1
+  RP_LINK                           选填，1/0 链接抓取，默认 1
+  RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
   RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
   RP_ADMIN_QQ                       选填，允许 /save /tags /find /img /sticker /voice /testrich 的 QQ
   RP_SESSION_EPOCH_HOURS            选填，闲置多少小时后开启新会话 epoch，默认 48，0=不轮换
@@ -37,10 +47,12 @@ import random
 import re
 import sys
 import time
+from datetime import date
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
-from nonebot import get_bot, get_driver, logger, on_message
+from nonebot import get_bot, get_driver, logger, on_message, on_notice
 from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     Message,
@@ -57,7 +69,22 @@ PLUGIN = Path(__file__).resolve().parent
 if str(PLUGIN) not in sys.path:
     sys.path.insert(0, str(PLUGIN))
 
+from asr import (                                            # noqa: E402
+    enabled as asr_enabled,
+    fetch_voice,
+    model_name as asr_model,
+    transcribe as asr_transcribe,
+)
 from llm import from_env                                    # noqa: E402
+from linkmeta import (                                      # noqa: E402
+    card_info,
+    enabled as link_enabled,
+    extract_urls,
+    frames_available,
+    is_video_url,
+    note_for as link_note_for,
+    video_frames_note,
+)
 from persona import PERSONA                                 # noqa: E402
 from richmsg import (                                       # noqa: E402
     DOWNLOAD_LIMIT,
@@ -89,6 +116,12 @@ COOLDOWN = float(os.environ.get("RP_COOLDOWN") or 2)
 REPLY_CHUNK = 1000
 ADMIN = {x.strip() for x in (os.environ.get("RP_ADMIN_QQ") or "").split(",") if x.strip()}
 IDLE_NUDGE_MIN = float(os.environ.get("RP_IDLE_NUDGE_MINUTES") or 60)
+PROACTIVE_ON = (os.environ.get("RP_PROACTIVE") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+PROACTIVE_DAILY = max(1, int(float(os.environ.get("RP_PROACTIVE_DAILY") or 3)))
+POKE_BACK = (os.environ.get("RP_POKE_BACK") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+POKE_COOLDOWN = max(0.0, float(os.environ.get("RP_POKE_COOLDOWN") or 30))
 EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48) * 3600))
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
 NUDGE_LINES = ([
@@ -102,6 +135,8 @@ mw = None
 _locks = {}
 _last_seen = {}
 _nudged_at = {}           # sid -> 上次闲置提醒时间（同一轮沉默只提醒一次）
+_nudge_count = {}         # "日期:sid" -> 当天主动开口次数（按天限额，防骚扰）
+_poke_at = {}             # "sid:uid" -> 上次回戳时间（冷却，防两个机器人来回戳）
 _last_media = {}          # sid -> 最近一张图片的 URL/bytes 摘要，供 /save 使用
 _media_tasks = set()
 _media_futs = {}           # message_id -> [该条消息每张图的判读 task]（_handle 等它拿描述）
@@ -127,20 +162,26 @@ async def _startup():
         f"（thinking={getattr(mw.front, 'thinking', '') or '默认'}）｜"
         f"后台模型 {mw.back.model}"
         f"（thinking={getattr(mw.back, 'thinking', '') or '默认'}）")
+    logger.info("[jinyu] 语音转写 "
+                + (f"启用 model={asr_model()}" if asr_enabled()
+                   else "未启用（未配置 RP_ASR_KEY）"))
     if IDLE_NUDGE_MIN > 0:
         asyncio.create_task(_idle_nudge_loop())
     asyncio.create_task(asyncio.to_thread(sweep_tts_cache, True))   # 启动时清一次 TTS 缓存
 
 
 async def _idle_nudge_loop():
-    """私聊闲置提醒：主人超过阈值没说话时主动发一句（同一轮沉默只发一次）。"""
+    """私聊闲置主动消息：超过阈值时让模型按记忆和人设开口（同一轮沉默只发一次）。
+
+    生成失败或关闭 RP_PROACTIVE 时退回固定文案；每个会话每天有次数上限，
+    避免主人一直不回时被反复打扰。
+    """
     while True:
         try:
             await asyncio.sleep(60)
             if mw is None or IDLE_NUDGE_MIN <= 0:
                 continue
             now = time.monotonic()          # 与 _last_seen 同一种时钟，否则闲置时长全是错数
-            bot = get_bot()
             for sid, seen in list(_last_seen.items()):
                 if not sid.startswith("qq-u"):          # 只提醒私聊
                     continue
@@ -149,16 +190,50 @@ async def _idle_nudge_loop():
                     continue
                 if _nudged_at.get(sid, 0.0) > seen:     # 这轮沉默已经提醒过
                     continue
+                day_key = f"{date.today().isoformat()}:{sid}"
+                if PROACTIVE_ON and _nudge_count.get(day_key, 0) >= PROACTIVE_DAILY:
+                    _nudged_at[sid] = now               # 今日额度用完：这轮沉默不再尝试
+                    continue
                 uid = int(sid[4:])
+                line = ""
+                if PROACTIVE_ON:
+                    try:
+                        line = await _proactive_line(sid, int(idle_min))
+                    except Exception as exc:            # noqa: BLE001  生成失败退回固定文案
+                        logger.warning(f"[jinyu] 主动话题生成失败 sid={sid}: {exc}")
+                generated = bool(line)
+                if not line:
+                    line = random.choice(NUDGE_LINES)
                 try:
-                    await bot.send_private_msg(user_id=uid,
-                                               message=random.choice(NUDGE_LINES))
+                    await _send_to(line, user_id=uid)
                     _nudged_at[sid] = now
-                    logger.info(f"[jinyu] 闲置提醒已发送 sid={sid} idle={int(idle_min)}min")
+                    if PROACTIVE_ON:
+                        _nudge_count[day_key] = _nudge_count.get(day_key, 0) + 1
+                    logger.info(f"[jinyu] 主动消息已发送 sid={sid} idle={int(idle_min)}min "
+                                f"生成={'是' if generated else '否'} 文={line[:40]!r}")
                 except Exception as exc:                # noqa: BLE001
-                    logger.warning(f"[jinyu] 闲置提醒发送失败 sid={sid}: {exc}")
+                    logger.warning(f"[jinyu] 主动消息发送失败 sid={sid}: {exc}")
         except Exception as exc:                        # noqa: BLE001
             logger.warning(f"[jinyu] 闲置提醒循环异常: {exc}")
+
+
+async def _proactive_line(sid: str, idle_min: int) -> str:
+    """让前台模型带着记忆主动开口；和正常对话共用会话锁，避免轮号交错。"""
+    if mw is None:
+        return ""
+    persona = dict(PERSONA)
+    if rich_enabled():
+        persona["core"] = persona["core"] + rich_hint()
+    lock = _locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        session_sid = await asyncio.to_thread(
+            mw.session_identity, sid, CID, EPOCH_SECONDS, flush_timeout=EPOCH_FLUSH)
+        text = (f"（系统事件：现在是 {time.strftime('%H:%M')}，"
+                f"主人已经 {idle_min} 分钟没说话了。"
+                f"你可以主动发一条消息，像平时聊天那样口语、短一点；"
+                f"不要问「在吗」，不要提系统、时间或沉默时长。）")
+        reply = await asyncio.to_thread(mw.chat, text, persona, session_sid, CID)
+    return (reply or "").strip()
 
 
 @driver.on_shutdown
@@ -289,6 +364,17 @@ async def _expand_reply(event: MessageEvent) -> str:
                     bits.append(d or "一张图片")
                 except Exception:         # noqa: BLE001
                     bits.append("（引用的图片没看清）")
+            elif stype == "record":
+                text = ""
+                try:
+                    raw = await fetch_voice(bot, sdata)
+                    if raw:
+                        text = await asyncio.wait_for(
+                            asyncio.to_thread(asr_transcribe, raw), timeout=60)
+                except Exception:         # noqa: BLE001  语音转写失败只降级
+                    text = ""
+                bits.append(f"「语音：{text[:120]}」" if text
+                            else "（一条语音，没听清）")
         notes.append(f"（引用 {who} 的消息：{'；'.join(bits)}）" if bits
                      else f"（引用了 {who} 的一条消息）")
     return "".join(notes)
@@ -297,6 +383,80 @@ async def _expand_reply(event: MessageEvent) -> str:
 def _group_text(event: GroupMessageEvent, text: str) -> str:
     """群消息加说话人前缀，让共享上下文能分清谁在说话。"""
     return f"{_speaker(event)}：{text}"
+
+
+def _has_voice(event: MessageEvent) -> bool:
+    return any(seg.type == "record" for seg in event.message)
+
+
+async def _voice_notes(event: MessageEvent) -> str:
+    """把消息里的语音转成文字注记；未启用或失败时降级成「没听清」。"""
+    if not asr_enabled():
+        return ""
+    notes = []
+    for seg in event.message:
+        if seg.type != "record":
+            continue
+        try:
+            raw = await fetch_voice(get_bot(), seg.data or {})
+            text = await asyncio.to_thread(asr_transcribe, raw) if raw else ""
+            if text:
+                logger.info(f"[jinyu] 语音转写 {len(text)} 字 user={event.user_id}")
+            else:
+                logger.info(f"[jinyu] 语音未转写 user={event.user_id} audio={len(raw)}B")
+        except Exception as exc:                  # noqa: BLE001  转写失败不影响回复
+            logger.info(f"[jinyu] 语音转写失败 user={event.user_id}: {exc}")
+            text = ""
+        notes.append(f"（语音说：{text[:300]}）" if text
+                     else "（发来一条语音，没听清）")
+    return "".join(notes)
+
+
+_VIDEO_INTENT = re.compile(
+    r"(看看|看一下|看下|瞅瞅|瞧瞧|讲什么|讲了什么|说了什么|内容是什么|视频里)")
+
+
+async def _link_notes(text: str, event: MessageEvent) -> str:
+    """消息里带链接才抓；分享卡片当兜底；明确说要看视频才抽帧（超过 3 分钟不抽）。"""
+    if not link_enabled():
+        return ""
+    cards = []
+    for seg in event.message:
+        if seg.type == "json":
+            info = card_info((seg.data or {}).get("data"))
+            if info:
+                cards.append(info)
+    urls = extract_urls(text)
+    for card in cards:
+        if card["url"] not in urls:
+            urls.append(card["url"])
+    if not urls:
+        return ""
+    urls = urls[:3]
+    card_by_url = {c["url"]: c for c in cards}
+    want_frames = bool(_VIDEO_INTENT.search(text))
+    notes = []
+    for url in urls:
+        host = urlparse(url).hostname or ""
+        try:
+            note = await asyncio.wait_for(
+                asyncio.to_thread(link_note_for, url, card_by_url.get(url)),
+                timeout=15)
+        except Exception as exc:              # noqa: BLE001  抓取失败静默降级
+            logger.info(f"[jinyu] 链接抓取失败 host={host}: {exc}")
+            note = ""
+        if note:
+            notes.append(note)
+            logger.info(f"[jinyu] 链接已注入 host={host} chars={len(note)}")
+        if want_frames and is_video_url(url) and frames_available():
+            try:
+                extra = await asyncio.wait_for(
+                    asyncio.to_thread(video_frames_note, url), timeout=180)
+            except Exception:                 # noqa: BLE001  抽帧失败不影响回复
+                extra = ""
+            if extra:
+                notes.append(extra)
+    return "".join(notes)
 
 
 # ------------------------------------------------- 贴纸自学习（不回复，只收集）
@@ -426,8 +586,21 @@ def sticker_message(path):
     return Message(seg) if seg else None
 
 
+POKE_MARK = re.compile(r"\[\[\s*poke\s*\]\]", re.I)
+
+
+def _split_poke(reply: str) -> str:
+    """剥掉 [[poke]] 标记：回戳由事件决定，不靠回复文本里的标记。"""
+    if not reply:
+        return ""
+    return POKE_MARK.sub("", reply).strip() if POKE_MARK.search(reply) else reply
+
+
 async def _send_rich(reply: str) -> None:
     """按标记把回复渲染成文本/图片/表情/语音分段发送。"""
+    reply = _split_poke(reply)
+    if not reply.strip():
+        return
     if not rich_enabled():
         for i in range(0, len(reply), REPLY_CHUNK):
             await matcher.send(reply[i:i + REPLY_CHUNK])
@@ -437,6 +610,119 @@ async def _send_rich(reply: str) -> None:
             await matcher.send(msg)
         except Exception as exc:              # 单个媒体段失败不影响后续文本
             logger.opt(exception=exc).warning(f"[jinyu] 媒体段发送失败: {exc}")
+
+
+async def _send_to(reply: str, user_id: int = 0, group_id: int = 0) -> None:
+    """往指定私聊/群发送（主动消息、戳一戳回复用），同样支持富消息标记。"""
+    reply = _split_poke(reply)
+    if not reply.strip():
+        return
+    bot = get_bot()
+    if not rich_enabled():
+        msgs = [Message(MessageSegment.text(reply[i:i + REPLY_CHUNK]))
+                for i in range(0, len(reply), REPLY_CHUNK)]
+    else:
+        msgs = await build_messages(reply, REPLY_CHUNK)
+    for msg in msgs:
+        try:
+            if group_id:
+                await bot.send_group_msg(group_id=int(group_id), message=msg)
+            else:
+                await bot.send_private_msg(user_id=int(user_id), message=msg)
+        except Exception as exc:              # noqa: BLE001
+            logger.opt(exception=exc).warning(
+                f"[jinyu] 消息发送失败 uid={user_id} gid={group_id}: {exc}")
+
+
+async def _send_poke(event) -> bool:
+    """回戳：先发 poke 消息段（NapCat 数组格式通用），失败再退回专用 API。"""
+    bot = get_bot()
+    uid = int(getattr(event, "user_id", 0) or 0)
+    gid = getattr(event, "group_id", None)
+    self_id = str(getattr(event, "self_id", "") or "")
+    if not uid or str(uid) == self_id:
+        return False
+    seg = [{"type": "poke", "data": {"type": "126", "id": str(uid)}}]
+    try:
+        if gid:
+            await bot.call_api("send_group_msg", group_id=int(gid), message=seg)
+        else:
+            await bot.call_api("send_private_msg", user_id=uid, message=seg)
+        return True
+    except Exception as exc:                  # noqa: BLE001  协议端能力有差异
+        logger.info(f"[jinyu] poke 段发送失败，改用 API 回戳 uid={uid}: {exc}")
+    try:
+        if gid:
+            await bot.call_api("group_poke", group_id=int(gid), user_id=uid)
+        else:
+            await bot.call_api("friend_poke", user_id=uid)
+        return True
+    except Exception as exc:                  # noqa: BLE001
+        logger.warning(f"[jinyu] 回戳失败 uid={uid}: {exc}")
+        return False
+
+
+poke_notice = on_notice(priority=5, block=False)
+
+
+@poke_notice.handle()
+async def _on_poke(event) -> None:
+    """被戳：把「谁戳了你」注入上下文回一句话，并戳回去。
+
+    只处理戳机器人本人的通知；戳别人、自己戳自己、冷却期内的重复戳都忽略。
+    """
+    if getattr(event, "notice_type", "") != "notify" \
+            or getattr(event, "sub_type", "") != "poke":
+        return
+    uid = str(getattr(event, "user_id", "") or "")
+    self_id = str(getattr(event, "self_id", "") or "")
+    target = str(getattr(event, "target_id", "") or "")
+    if not uid or uid == self_id or (target and target != self_id):
+        return
+    if mw is None:
+        return
+    gid = getattr(event, "group_id", None)
+    sid = f"qq-g{gid}" if gid else f"qq-u{uid}"
+    key = f"{sid}:{uid}"
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    if now - _poke_at.get(key, 0.0) < POKE_COOLDOWN:   # 冷却：防连戳和机器人对戳
+        return
+    _poke_at[key] = now
+    is_group = bool(gid)
+    if not is_group:
+        _last_seen[sid] = now                        # 戳一下也算互动，重置闲置计时
+    if is_group:
+        name = await _mention_name_async(get_bot(), int(gid), uid)
+    else:
+        name = "主人"
+    text = (f"（系统事件：{name}戳了戳你。回一句符合人设的话，短一点；"
+            f"别问「在吗」，别解释这是系统事件。）")
+    if is_group:
+        text = f"{name}：{text}"
+    persona = dict(PERSONA)
+    if rich_enabled():
+        persona["core"] = persona["core"] + rich_hint()
+    if is_group:
+        persona["core"] = persona["core"] + GROUP_HINT
+    lock = _locks.setdefault(sid, asyncio.Lock())
+    session_sid = sid
+    reply = ""
+    async with lock:
+        try:
+            session_sid = await asyncio.to_thread(
+                mw.session_identity, sid, CID, EPOCH_SECONDS, flush_timeout=EPOCH_FLUSH)
+            reply = await asyncio.to_thread(
+                mw.chat, text, persona, session_sid, CID,
+                (lambda r: _strip_speaker_prefix(r, name)) if is_group else None)
+        except Exception as exc:                     # noqa: BLE001
+            logger.exception(f"[jinyu] 戳一戳回复失败 sid={sid}: {exc}")
+    if reply:
+        logger.info(f"[jinyu] 戳一戳回复 sid={session_sid} 群={gid or '私聊'} "
+                    f"用户={uid} 答={reply[:80]!r}")
+        await _send_to(reply, user_id=int(uid), group_id=int(gid) if gid else 0)
+    if POKE_BACK:
+        await _send_poke(event)
 
 
 async def _admin(event: MessageEvent, text: str) -> bool:
@@ -617,8 +903,9 @@ def _strip_speaker_prefix(reply: str, name: str) -> str:
 async def _handle(event: MessageEvent):
     text = await _plain_with_mentions(event)
     has_img = any(seg.type in ("image", "mface") for seg in event.message)
+    has_voice = _has_voice(event)
     is_group = isinstance(event, GroupMessageEvent)
-    if not text and not has_img:
+    if not text and not has_img and not has_voice:
         return
     if mw is None:
         _media_futs.pop(str(event.message_id), None)
@@ -644,14 +931,34 @@ async def _handle(event: MessageEvent):
         except Exception:                     # noqa: BLE001   引用展开失败不影响回复
             logger.info(f"[jinyu] 引用展开失败 user={event.user_id}")
             return ""
-    infos, quote_note = await asyncio.gather(_media(), _qnote())
+
+    async def _vnote() -> str:
+        try:
+            return await _voice_notes(event)
+        except Exception:                     # noqa: BLE001   转写失败不影响回复
+            logger.info(f"[jinyu] 语音转写失败 user={event.user_id}")
+            return ""
+
+    async def _lnote() -> str:
+        try:
+            return await _link_notes(text, event)
+        except Exception:                     # noqa: BLE001   链接失败不影响回复
+            logger.info(f"[jinyu] 链接处理失败 user={event.user_id}")
+            return ""
+    infos, quote_note, voice_note, link_note = await asyncio.gather(
+        _media(), _qnote(), _vnote(), _lnote())
     if not text:
-        text = (_img_note(infos) if has_img else "") or quote_note \
-            or "（发来一张图片，但没看清内容）"
-    elif has_img:
-        text += _img_note(infos)
+        text = (_img_note(infos) if has_img else "") or voice_note or quote_note \
+            or "（发来一条消息，但没看清内容）"
+    else:
+        if has_img:
+            text += _img_note(infos)
+        if voice_note:
+            text += voice_note
     if quote_note and quote_note not in text:
         text += quote_note
+    if link_note:
+        text += link_note
     if is_group:
         text = _group_text(event, text)   # 群消息加说话人前缀 → 共享上下文分得清谁说的
     lock = _locks.setdefault(sid, asyncio.Lock())
