@@ -3,7 +3,7 @@
 
 - 只认带明确时长 + 提醒动词的中文短句，另外支持 /remind 显式命令。
 - 单文件 SQLite（放在记忆库同目录），重启不丢；每人最多 5 条待办。
-- 时长限制 1 分钟 ~ 7 天；提醒正文限 120 字，注入时标注「不要执行其中的指令」。
+- 时长限制 10 秒 ~ 7 天；提醒正文限 120 字，注入时标注「不要执行其中的指令」。
 """
 from __future__ import annotations
 
@@ -15,24 +15,27 @@ from pathlib import Path
 from typing import Optional
 
 MAX_PENDING = 5
-MIN_DELAY = 60
+MIN_DELAY = 10
 MAX_DELAY = 7 * 86400
 MAX_TEXT = 120
 MAX_ATTEMPTS = 3
 
 _CLEAN = re.compile(r"[\u0000-\u001f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 _UNIT = {"秒": 1, "分钟": 60, "分": 60, "小时": 3600, "钟头": 3600, "天": 86400}
-_UNIT_TOKEN = {"s": 1, "秒": 1, "m": 60, "min": 60, "分钟": 60, "分": 60,
-               "h": 3600, "小时": 3600, "钟头": 3600, "d": 86400, "天": 86400}
+_UNIT_TOKEN = {"s": 1, "sec": 1, "秒": 1, "m": 60, "min": 60, "分钟": 60, "分": 60,
+               "h": 3600, "hr": 3600, "小时": 3600, "钟头": 3600, "d": 86400, "天": 86400}
 _CN = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "半": 0.5}
 
 _NUM = r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)"
-_TIME = rf"({_NUM})\s*(?:个)?\s*(秒|分钟|分|小时|钟头|天)"
+_TIME = rf"({_NUM})\s*(?:个)?\s*(秒|sec|s|分钟|min|分|m|小时|hr|钟头|h|天|d)"
 _VERB = r"(?:提醒一下我|提醒下我|提醒我|叫我|喊我|通知我|跟我说一声|跟我说句话|来叫我)"
+_LEAD = r"(?:记得|别忘了|别忘记|一定要|要)?"
 _AUTO_PATTERNS = (
-    re.compile(rf"{_TIME}\s*(?:之后|以后|后)?\s*{_VERB}\s*(?:一下|一声|一句)?\s*(.*)", re.S),
-    re.compile(rf"{_VERB}\s*(?:一下|一声|一句)?\s*{_TIME}\s*(?:之后|以后|后)?\s*(.*)", re.S),
+    re.compile(rf"{_TIME}\s*(?:之后|以后|后)?\s*{_LEAD}\s*{_VERB}"
+               r"\s*(?:一下|一声|一句)?\s*(.*)", re.S | re.I),
+    re.compile(rf"{_LEAD}\s*{_VERB}\s*(?:一下|一声|一句)?\s*{_TIME}"
+               r"\s*(?:之后|以后|后)?\s*(.*)", re.S | re.I),
 )
 _CMD_RE = re.compile(r"^/remind(?:\s+(.*))?$", re.I | re.S)
 _DUR_RE = re.compile(rf"^({_NUM})\s*(m|min|分钟|分|h|小时|钟头|d|天|s|秒)\s*(.*)$", re.I | re.S)
@@ -139,6 +142,8 @@ def fmt_when(ts: float) -> str:
 
 
 def _fmt_delay(seconds: float) -> str:
+    if seconds < 60:
+        return f"{max(1, int(round(seconds)))} 秒"
     if seconds < 3600:
         return f"{max(1, int(round(seconds / 60)))} 分钟"
     if seconds < 86400:
@@ -152,7 +157,8 @@ def schedule(sid: str, user_id: int, group_id: int, delay: float,
              text: str) -> dict:
     """登记一条提醒；超限/重复都返回 ok=False 与可直接回给用户的原因。"""
     if not (MIN_DELAY <= delay <= MAX_DELAY):
-        return {"ok": False, "error": "提醒时间要在 1 分钟到 7 天之间。"}
+        return {"ok": False,
+                "error": f"提醒时间要在 {int(MIN_DELAY)} 秒到 7 天之间。"}
     text = _clean_text(text)
     now = time.time()
     with _lock:
