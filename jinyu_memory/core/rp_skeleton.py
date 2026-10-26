@@ -488,6 +488,64 @@ class DB:
                           (sid, cid, r["fact"], r["tags"], r["importance"],
                            r["category"], r["expires_at"]))
 
+    def fact_owners(self, cid):
+        """管理员视图：按 base_sid 聚合事实数，epoch 副本只算一次。
+
+        返回 [{base, n, last_id}]，按最近一条事实倒序。base 去掉 #n 后缀，
+        这样轮换过 epoch 的同一个会话不会在菜单里出现两次。
+        """
+        with self._c() as c:
+            return c.execute(
+                "SELECT CASE WHEN instr(session_id,'#')>0"
+                " THEN substr(session_id,1,instr(session_id,'#')-1)"
+                " ELSE session_id END AS base,"
+                " COUNT(DISTINCT fact) AS n, MAX(id) AS last_id"
+                " FROM durable_facts WHERE character_id=?"
+                " GROUP BY base ORDER BY last_id DESC", (cid,)).fetchall()
+
+    def dump_facts(self, cid, base_sid="", keyword="", offset=0, limit=10):
+        """管理员查看：按 id 倒序分页列长期事实（不参与召回排序）。
+
+        base_sid 为空表示看全部会话；同一事实在多个 epoch 的副本只显示最近一条。
+        keyword 同时匹配正文与标签，方便按「猫」这种词查库。返回 (rows, 总数)。
+        """
+        where, args = "character_id=?", [cid]
+        if base_sid:
+            where += " AND (session_id=? OR session_id LIKE ?)"
+            args += [base_sid, base_sid + "#%"]
+        if keyword:
+            where += " AND (fact LIKE ? OR tags LIKE ?)"
+            args += [f"%{keyword}%"] * 2
+        with self._c() as c:
+            total = c.execute(
+                f"SELECT COUNT(DISTINCT fact) FROM durable_facts WHERE {where}",
+                args).fetchone()[0]
+            rows = c.execute(
+                "SELECT id, session_id, fact, tags, importance, category, expires_at"
+                " FROM durable_facts WHERE id IN (SELECT MAX(id) FROM durable_facts"
+                f" WHERE {where} GROUP BY fact) ORDER BY id DESC LIMIT ? OFFSET ?",
+                args + [max(1, int(limit)), max(0, int(offset))]).fetchall()
+        return rows, total
+
+    def del_fact(self, fact_id):
+        """删除一条事实，连同它跨 epoch 的副本。返回 (正文, 删除条数, base_sid)。"""
+        with self._c() as c:
+            row = c.execute("SELECT session_id, character_id, fact FROM durable_facts"
+                            " WHERE id=?", (fact_id,)).fetchone()
+            if not row:
+                return "", 0, ""
+            base = str(row["session_id"]).split("#")[0]
+            cur = c.execute("DELETE FROM durable_facts WHERE character_id=? AND fact=?"
+                            " AND (session_id=? OR session_id LIKE ?)",
+                            (row["character_id"], row["fact"], base, base + "#%"))
+        return row["fact"], max(0, cur.rowcount), base
+
+    def count_cards(self, sid, cid) -> int:
+        with self._c() as c:
+            return c.execute("SELECT COUNT(*) FROM event_cards"
+                             " WHERE session_id=? AND character_id=?",
+                             (sid, cid)).fetchone()[0]
+
     def recent_cards(self, sid, cid, limit=6):
         with self._c() as c:
             rows = c.execute("SELECT * FROM event_cards WHERE session_id=? AND character_id=?"
