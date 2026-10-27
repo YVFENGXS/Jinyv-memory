@@ -54,28 +54,59 @@ def _fact_core(text):
     return _FACT_PUNCT.sub("", str(text or "")).lower()
 
 
+def _mmdd(ts):
+    """库里 UTC 时间 → 本地「月-日」；坏值给空串，提示词里显示「—」。"""
+    try:
+        return datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S") \
+            .replace(tzinfo=timezone.utc).astimezone().strftime("%m-%d")
+    except (TypeError, ValueError):
+        return ""
+
+
 # 定期合并用的提示词：只判「指同一件事」，不判语义相近，宁可漏并不可错并
 MERGE_PROMPT = """你在整理同一会话的长期记忆词条，目标是去掉重复、保留信息最全的那条。
 
-编号事实（编号｜轮次｜正文｜标签｜类别｜说话人）：
+编号事实（编号｜轮次｜日期｜正文｜标签｜类别｜说话人）：
 {rows}
 
 规则：
 1. 只有「指的是同一件事、同一条设定」才合并。只是提到同一个对象但说的不是一回事
    （例如「养了猫」和「猫爱吃鱼」）不要合并。
    不同说话人的事实绝对不能合并，哪怕正文一模一样。
-2. 说法不同但能看出是同一件事的，可以合并；明显矛盾、无法判断谁对的不要合并。
-3. 轮次是归档时的对话轮号；轮次为 0 表示从旧会话继承、来源未知，不要按轮次猜。
+2. 说法不同但能看出是同一件事的，可以合并；无法判断谁对、也没有时间先后的矛盾不要合并。
+3. 同一件事随时间发生变化（后来补充、修复、改口）时，不要只留旧说法：合并成一条
+   时间线陈述，把变化写清楚，例如
+   「（10-25）本来只能读文字，看不到图片；（10-27）视觉已修好，现在能看图」。
+   新状态放最后，keep 选较新的那条。这样新事实覆盖旧事实，又保留变化过程。
+4. 轮次是归档时的对话轮号；轮次为 0 表示从旧会话继承、来源未知，不要按轮次猜。
    轮次相同（或只差 1-2 轮）的事实常常来自同一场景：
    如果它们只是对同一件事的重复或补充（例如「claude 是橙发少女」与
    「角色蓝发带鲸鱼尾巴，claude 姐姐是橙发」），应当合并；
    但同一场景里各自独立的事（例如「猫叫团子」与「主人明天没课」）不要合并。
-4. 每组给出 ids（至少 2 个编号）、keep（保留哪条编号，优先信息最全的）、
-   fact（合并后的一句话，保留组内所有已知信息，≤40 字）、
+5. 每组给出 ids（至少 2 个编号）、keep（保留哪条编号，优先信息最全或时间最新的）、
+   fact（合并后的陈述，保留组内所有已知信息，≤120 字）、
    tags（2-5 个检索标签，合并组内所有有用标签）。
-5. 没有重复就返回 {"groups": []}。
+6. 没有重复就返回 {"groups": []}。
 
 只输出 JSON：{"groups":[{"ids":[1,2],"keep":1,"fact":"...","tags":["..."]}]}"""
+
+
+CARD_MERGE_PROMPT = """你在整理同一会话的事件卡，目标是去掉同一件事被反复记成的多张卡。
+
+编号卡片（编号｜轮次范围｜日期｜正文｜实体钩子）：
+{rows}
+
+规则：
+1. 只有描述同一件事、同一场景的卡才合并；只是同一个主题、不同时间发生的两次
+   （两次吃饭、两次表白、两次吵架）不要合并。
+2. 时间线相邻、正文互相重复或补充的卡可以合并；合并后 summary 用信息最全的那条，
+   可补齐细节，≤120 字。
+3. 知识边界（self/player/both）不同的卡不要合并。
+4. 每组给出 ids（至少 2 个编号）、keep（保留哪张，优先信息最全）、
+   summary（合并后的正文）。
+5. 没有重复就返回 {"groups": []}。
+
+只输出 JSON：{"groups":[{"ids":[1,2],"keep":1,"summary":"..."}]}"""
 
 
 def _fact_tags(raw):
@@ -539,7 +570,12 @@ class DB:
         return True
 
     def list_facts(self, sid, cid, limit=12, query="", budget=1200):
-        """长期事实召回：标签优先 → 正文核验 → 热力排序，命中不足按热力兜底。
+        """长期事实召回：标签优先 → 正文核验 → 热力排序，命中不足按热力兜底。"""
+        return [r["label"] for r in
+                self.list_facts_detail(sid, cid, limit, query, budget)]
+
+    def list_facts_detail(self, sid, cid, limit=12, query="", budget=1200):
+        """同 list_facts，但返回 [{id,label,tags}]，供按标签展开相关事件卡。
 
         - 标签命中权重最高：后台给事实打的性质词（宠物/名字/偏好…）
         - 正文核验：标签没命中时再用问题里的双字/单字去正文里找
@@ -570,33 +606,35 @@ class DB:
             hit = (3.0 if tag_hit else 0.0) + text_hit
             spk = str(r["speaker"] or "")
             label = f"[{spk}] {r['fact']}" if spk else r["fact"]
-            scored.append((hit * (0.5 + heat) if hit else 0.0, heat, r["id"], label))
+            item = {"id": r["id"], "label": label, "tags": tags}
+            scored.append((hit * (0.5 + heat) if hit else 0.0, heat, r["id"], item))
         scored.sort(reverse=True)
         picked, used = [], 0
-        for score, _, _, fact in scored:
+        for score, _, _, item in scored:
             if len(picked) >= limit:
                 break
             if score <= 0:
                 break                                      # 已按分数降序，后面全是 0
-            if used + len(fact) + 1 > budget:
+            if used + len(item["label"]) + 1 > budget:
                 break
-            picked.append(fact)
-            used += len(fact) + 1
+            picked.append(item)
+            used += len(item["label"]) + 1
         if len(picked) < limit:            # 兜底：命中不足时按热力补齐，旧设定不会完全想不起
-            have = set(picked)
-            for _, _, _, fact in sorted(scored, key=lambda x: (x[1], x[2]), reverse=True):
-                if len(picked) >= limit or used + len(fact) + 1 > budget:
+            have = {x["id"] for x in picked}
+            for _, _, _, item in sorted(scored, key=lambda x: (x[1], x[2]), reverse=True):
+                if len(picked) >= limit or used + len(item["label"]) + 1 > budget:
                     break
-                if fact in have:
+                if item["id"] in have:
                     continue
-                picked.append(fact)
-                have.add(fact)
-                used += len(fact) + 1
+                picked.append(item)
+                have.add(item["id"])
+                used += len(item["label"]) + 1
         return picked
 
-    def inherit_facts(self, old_sid, sid, cid, limit=30):
-        """跨 epoch 继承长期事实：复制旧会话最近 limit 条，UNIQUE 自动去重。
+    def inherit_facts(self, old_sid, sid, cid, limit=500):
+        """跨 epoch 继承长期事实：复制旧会话最多 limit 条，UNIQUE 自动去重。
 
+        默认 500，等于整库继承——轮换不能把老设定丢掉，否则「永久不忘」就是假的。
         turn_end 记 0，让继承来的事实排在本 epoch 新事实之后（新→旧展示）。
         """
         with self._c() as c:
@@ -671,7 +709,7 @@ class DB:
         with self._c() as c:
             rows = c.execute(
                 "SELECT id, session_id, fact, tags, importance, category,"
-                " expires_at, turn_end, speaker FROM durable_facts WHERE character_id=?"
+                " expires_at, turn_end, speaker, created_at FROM durable_facts WHERE character_id=?"
                 " AND (session_id=? OR session_id LIKE ?) ORDER BY id",
                 (cid, base_sid, base_sid + "#%")).fetchall()
         return [dict(r) for r in rows]
@@ -712,6 +750,68 @@ class DB:
             return c.execute("SELECT COUNT(*) FROM event_cards"
                              " WHERE session_id=? AND character_id=?",
                              (sid, cid)).fetchone()[0]
+
+    def card_rows(self, sid, cid, limit=500):
+        """事件卡合并用：本会话全部卡，按时间线升序（旧→新）。"""
+        with self._c() as c:
+            rows = c.execute("SELECT * FROM event_cards WHERE session_id=? AND character_id=?"
+                             " ORDER BY turn_start, turn_end LIMIT ?",
+                             (sid, cid, max(2, int(limit)))).fetchall()
+        return [_card(r) for r in rows]
+
+    def card_owners(self, cid):
+        """事件卡合并用：按 base_sid 聚合卡片数（epoch 分开算，合并落在最新 epoch）。"""
+        with self._c() as c:
+            return c.execute(
+                "SELECT CASE WHEN instr(session_id,'#')>0"
+                " THEN substr(session_id,1,instr(session_id,'#')-1)"
+                " ELSE session_id END AS base,"
+                " COUNT(*) AS n FROM event_cards WHERE character_id=?"
+                " GROUP BY base ORDER BY MAX(created_at) DESC", (cid,)).fetchall()
+
+    def apply_card_merge(self, cid, keep_id, drop_ids, summary, turn_start, turn_end,
+                         importance=None):
+        """把一组重复事件卡并到 keep_id：改正文/轮次范围，删掉其余（置顶卡跳过）。"""
+        with self._c() as c:
+            keep = c.execute("SELECT event_id, importance FROM event_cards"
+                             " WHERE event_id=? AND character_id=?",
+                             (keep_id, cid)).fetchone()
+            if not keep:
+                return 0
+            drop = []
+            for eid in drop_ids:
+                if eid == keep_id:
+                    continue
+                if c.execute("SELECT 1 FROM cross_session_pin WHERE event_id=?",
+                             (eid,)).fetchone():
+                    continue                     # 被人工置顶的卡不删
+                drop.append(eid)
+            if not drop:
+                return 0
+            imp = float(keep["importance"] or 0.5) if importance is None else float(importance)
+            c.execute("UPDATE event_cards SET summary=?, turn_start=?, turn_end=?,"
+                      " importance=? WHERE event_id=? AND character_id=?",
+                      (summary, int(turn_start), int(turn_end), imp, keep_id, cid))
+            marks = ",".join("?" * len(drop))
+            cur = c.execute(f"DELETE FROM event_cards WHERE character_id=?"
+                            f" AND event_id IN ({marks})", [cid] + drop)
+            return max(0, cur.rowcount)
+
+    def latest_sid(self, base_sid, cid):
+        """某会话最新 epoch 的 sid；事件卡按 session_id 存，合并要落在当前 epoch。"""
+        with self._c() as c:
+            row = c.execute("SELECT session_id FROM session_meta WHERE character_id=?"
+                            " AND (session_id=? OR session_id LIKE ?)"
+                            " ORDER BY seq DESC LIMIT 1",
+                            (cid, base_sid, base_sid + "#%")).fetchone()
+        return str(row[0]) if row else base_sid
+
+    def count_facts(self, sid, cid) -> int:
+        """当前会话的长期词条数（epoch 副本只算一次）。"""
+        with self._c() as c:
+            return c.execute(
+                "SELECT COUNT(DISTINCT fact || char(1) || speaker) FROM durable_facts"
+                " WHERE session_id=? AND character_id=?", (sid, cid)).fetchone()[0]
 
     def recent_cards(self, sid, cid, limit=6):
         with self._c() as c:
@@ -1042,18 +1142,33 @@ class RPContextMiddleware:
             ledger_txt += "\n未兑现承诺：" + "；".join(open_promises)
         anchors = [{"role": "system", "content": persona["core"]},   # 头锚：宪法层，永不截断
                    {"role": "system", "content": "【当前状态账本】\n" + ledger_txt + "\n" + MEMORY_LABEL}]
-        facts = self.db.list_facts(sid, cid, query=query)   # 长期事实随锚点每轮注入（间接问法也能想起）
+        facts_detail = self.db.list_facts_detail(sid, cid, limit=16, budget=1600, query=query)
+        facts = [d["label"] for d in facts_detail]
+        # 词条标签 → 回库展开相关事件卡：用户提到的人/事，对应旧事必须一起看见
+        tag_text = " ".join(t for d in facts_detail for t in d["tags"])
+        if tag_text:
+            extra = retriever.retrieve(
+                all_cards, tag_text, limit=self.recall_limit,
+                exclude_ids=shown | {c["event_id"] for c in strict}
+                | {c["event_id"] for _, c in hits})
+            hits += [(s, c) for s, c in extra
+                     if not retriever.suspicious(c["summary"])]
         if facts:
             anchors[1]["content"] += "\n已记录事实（长期有效）：" + "；".join(facts)
+        # 让前台明确知道自己有一整套记忆库：相关的必须先查，查不到才说不记得
+        if facts or all_cards:
+            anchors[1]["content"] += (
+                f"\n【记忆库】本会话已存 {self.db.count_facts(sid, cid)} 条长期词条、"
+                f"{len(all_cards)} 张事件卡，覆盖过去所有对话。凡是涉及认识的人、发生过的事、"
+                "答应过的事，先对照下列记忆回答，不许说「不记得」；"
+                "只有确实查不到相关记录时，才可以说不记得。")
         sections = []          # (priority, msg)：priority 越小越先被丢
         if cards:
-            sections.append((2, {"role": "system", "content": "【历史事件】\n" + MEMORY_LABEL + "\n" + "\n".join(
-                f"- [t{c['turn_start']}-{c['turn_end']}] "
-                f"{retriever.clean_text(c['summary'], 200)}" for c in cards)}))
+            sections.append((2, {"role": "system", "content": "【历史事件】\n" + MEMORY_LABEL
+                                 + "\n" + retriever.format_cards(cards)}))
         if strict:
-            sections.append((4, {"role": "system", "content": "【硬记忆·承诺与约定】\n" + MEMORY_LABEL + "\n" + "\n".join(
-                f"- [t{c['turn_start']}-{c['turn_end']}] "
-                f"{retriever.clean_text(c['summary'], 200)}" for c in strict)}))
+            sections.append((4, {"role": "system", "content": "【硬记忆·承诺与约定】\n" + MEMORY_LABEL
+                                 + "\n" + retriever.format_cards(strict)}))
         if cross:
             sections.append((3, {"role": "system", "content": "【跨会话记忆】\n" + MEMORY_LABEL + "\n" + "\n".join(
                 f"- [前次 t{c['turn_start']}-{c['turn_end']}] "
@@ -1197,36 +1312,51 @@ class RPContextMiddleware:
         self.db.set_continuity(sid, cid, base_sid)   # 重开时同步 closed=0
         return sid
 
-    def merge_facts(self, base_sid, cid, apply=False, limit=160):
-        """后台模型判重并合并同一会话的长期事实。
+    def merge_facts(self, base_sid, cid, apply=False, limit=None,
+                    batch=400, overlap=40):
+        """后台模型判重并合并同一会话的长期事实（覆盖整库，不再只看最近 160 条）。
 
-        先用数据库里的事实正文/标签喂给后台模型，让它只在「指同一件事」时分组；
-        apply=False 只返回拟合并结果（干跑），True 才真正写库。返回每组的报告：
-        {"ids": [...], "fact": "...", "removed": n}，出错抛异常交给调用方记日志。
+        默认一屏装下 400 条：绝大多数会话一次就能看完整库，跨窗口的重复也能一并判掉。
+        超过 400 条才滑窗，块间重叠 40 条兜住边界；apply=False 只返回拟合并结果。
         """
         rows = self.db.merge_rows(cid, base_sid)
+        if limit:
+            rows = rows[-max(2, int(limit)):]
         if len(rows) < 2:
             return []
-        if limit and len(rows) > limit:
-            rows = rows[-limit:]                 # 只处理最近的一批，避免 prompt 过长
+        size = max(2, int(batch))
+        step = max(1, size - max(0, int(overlap)))
+        reports, used, start = [], set(), 0
+        while start < len(rows):
+            chunk = rows[start:start + size]
+            if len(chunk) >= 2:
+                reports += self._merge_fact_chunk(chunk, cid, apply, used)
+            if start + size >= len(rows):
+                break
+            start += step
+        return reports
+
+    def _merge_fact_chunk(self, rows, cid, apply, used):
+        """滑窗里的一批事实：模型判组 → 校验 → 落地。used 防止跨批重复合并。"""
         index = {i + 1: r for i, r in enumerate(rows)}
         lines = "\n".join(
-            f"{i}｜{r.get('turn_end') or 0}｜{r['fact']}"
+            f"{i}｜{r.get('turn_end') or 0}｜{_mmdd(r.get('created_at')) or '—'}｜{r['fact']}"
             f"｜{'、'.join(_fact_tags(r['tags'])) or '无'}"
             f"｜{r['category'] or '未分类'}｜{r.get('speaker') or '通用'}"
             for i, r in index.items())
         reply = self.back.chat(
             [{"role": "user", "content": MERGE_PROMPT.replace("{rows}", lines)}],
-            temperature=0.2, max_tokens=1500, json_mode=True)
+            temperature=0.2, max_tokens=2000, json_mode=True)
         data = parse_json(reply) or {}
         groups = data.get("groups") if isinstance(data, dict) else None
-        used, reports = set(), []
+        reports = []
         for g in groups or []:
             try:
                 ids = [int(x) for x in (g.get("ids") or [])]
             except (TypeError, ValueError):
                 continue
-            ids = [x for x in dict.fromkeys(ids) if x in index and x not in used]
+            ids = [x for x in dict.fromkeys(ids)
+                   if x in index and index[x]["id"] not in used]
             if len(ids) < 2:
                 continue
             if len({str(index[i].get("speaker") or "") for i in ids}) > 1:
@@ -1235,7 +1365,7 @@ class RPContextMiddleware:
             if keep not in ids:
                 keep = max(ids, key=lambda i: (len(index[i]["fact"]),
                                                len(_fact_tags(index[i]["tags"]))))
-            fact = str(g.get("fact") or "").strip()[:60]
+            fact = str(g.get("fact") or "").strip()[:160]
             rich = max(ids, key=lambda i: (len(index[i]["fact"]),
                                            len(_fact_tags(index[i]["tags"]))))
             fact = fact or index[rich]["fact"]
@@ -1259,9 +1389,75 @@ class RPContextMiddleware:
                     cid, index[keep]["id"],
                     [index[i]["fact"] for i in ids if i != keep],
                     fact, tags, imp, cat, exp)
-            used.update(ids)
+            used.update(index[i]["id"] for i in ids)
             reports.append({"ids": ids, "fact": fact, "tags": tags,
                             "removed": removed})
+        return reports
+
+    def merge_cards(self, sid, cid, apply=False, batch=80, overlap=20):
+        """后台模型判重并合并同一会话的重复事件卡（按时间线滑窗）。
+
+        窗口 80 张、重叠 20 张：实测一屏塞 200 张时模型会漏判（169 张检出 0 组），
+        80 张能把同一件事的多张卡稳定挑出来，同时滑窗覆盖整库、不再只看最近一段。
+        只合并「同一件事/同一场景」的卡，同主题不同时间的两次事件保留。
+        """
+        rows = self.db.card_rows(sid, cid)
+        if len(rows) < 2:
+            return []
+        size = max(2, int(batch))
+        step = max(1, size - max(0, int(overlap)))
+        reports, used, start = [], set(), 0
+        while start < len(rows):
+            chunk = rows[start:start + size]
+            if len(chunk) >= 2:
+                reports += self._merge_card_chunk(chunk, sid, cid, apply, used)
+            if start + size >= len(rows):
+                break
+            start += step
+        return reports
+
+    def _merge_card_chunk(self, rows, sid, cid, apply, used):
+        index = {i + 1: r for i, r in enumerate(rows)}
+        lines = "\n".join(
+            f"{i}｜t{r['turn_start']}-{r['turn_end']}｜{_mmdd(r.get('created_at')) or '—'}"
+            f"｜{retriever.clean_text(r['summary'], 160)}"
+            f"｜{'、'.join(str(h) for h in (r.get('entity_hooks') or [])) or '无'}"
+            for i, r in index.items())
+        reply = self.back.chat(
+            [{"role": "user", "content": CARD_MERGE_PROMPT.replace("{rows}", lines)}],
+            temperature=0.2, max_tokens=1500, json_mode=True)
+        data = parse_json(reply) or {}
+        groups = data.get("groups") if isinstance(data, dict) else None
+        reports = []
+        for g in groups or []:
+            try:
+                ids = [int(x) for x in (g.get("ids") or [])]
+            except (TypeError, ValueError):
+                continue
+            ids = [x for x in dict.fromkeys(ids)
+                   if x in index and index[x]["event_id"] not in used]
+            if len(ids) < 2:
+                continue
+            bounds = {str(index[i].get("knowledge_boundary") or "both") for i in ids}
+            if len(bounds) > 1:
+                continue                         # 知识边界不同不并
+            keep = g.get("keep")
+            if keep not in ids:
+                keep = max(ids, key=lambda i: len(str(index[i]["summary"])))
+            summary = str(g.get("summary") or "").strip()[:160]
+            rich = max(ids, key=lambda i: len(str(index[i]["summary"])))
+            summary = summary or retriever.clean_text(index[rich]["summary"], 160)
+            lo = min(int(index[i]["turn_start"]) for i in ids)
+            hi = max(int(index[i]["turn_end"]) for i in ids)
+            imp = max(float(index[i]["importance"] or 0.5) for i in ids)
+            removed = 0
+            if apply:
+                removed = self.db.apply_card_merge(
+                    cid, index[keep]["event_id"],
+                    [index[i]["event_id"] for i in ids if i != keep],
+                    summary, lo, hi, imp)
+            used.update(index[i]["event_id"] for i in ids)
+            reports.append({"ids": ids, "summary": summary, "removed": removed})
         return reports
 
     def _inherit_longterm(self, old_sid, sid, cid):

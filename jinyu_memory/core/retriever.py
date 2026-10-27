@@ -10,6 +10,7 @@
 """
 import json
 import re
+from datetime import datetime, timezone
 
 STOP_CHARS = set("人的了是个这那我你他她它一不有在上下来说时里面地得着过又很就都也还只把被给和与住吧呢啊"
                  "子儿头们么之其此某每另点数化")
@@ -212,10 +213,28 @@ def retrieve(cards, text, limit=2, exclude_ids=()):
     return scored[:limit]
 
 
-def format_recall(hits):
+def card_date(card):
+    """事件卡 created_at（SQLite UTC）→ 本地「月-日」；坏值返回空串。"""
+    try:
+        return datetime.strptime(str(card.get("created_at") or "")[:19], "%Y-%m-%d %H:%M:%S") \
+            .replace(tzinfo=timezone.utc).astimezone().strftime("%m-%d")
+    except (TypeError, ValueError):
+        return ""
+
+
+def format_cards(cards, limit=200):
+    """按时间线升序输出事件卡，带日期前缀——模型能看出哪件事在前、哪件在后。"""
     lines = []
-    for _, c in hits:
-        secret = "（此秘密仅角色自己知道，不得主动说破）" if c.get("knowledge_boundary") == "self" else ""
-        lines.append(f"- [t{c['turn_start']}-{c['turn_end']}] "
-                     f"{clean_text(c['summary'], 200)}{secret}")
+    for c in sorted(cards, key=lambda x: (x.get("turn_start") or 0, x.get("turn_end") or 0)):
+        when = card_date(c)
+        secret = "（此秘密仅角色自己知道，不得主动说破）" \
+            if c.get("knowledge_boundary") == "self" else ""
+        lines.append(f"- {when + ' ' if when else ''}"
+                     f"[t{c['turn_start']}-{c['turn_end']}] "
+                     f"{clean_text(c['summary'], limit)}{secret}")
     return "\n".join(lines)
+
+
+def format_recall(hits):
+    """召回结果同样按时间线升序：记忆是「发生过的事」，不是按分数排的清单。"""
+    return format_cards([c for _, c in hits])

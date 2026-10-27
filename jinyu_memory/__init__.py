@@ -46,6 +46,7 @@
                                     /sticker /fix /voice /testrich /social 的 QQ
   RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
   RP_FACT_MERGE_MIN                 选填，会话事实达到多少条才自动合并，默认 20
+  RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
   RP_SIGN                           选填，1/0 允许模型在情真意切时改自己的QQ签名，默认 1
   RP_SIGN_COOLDOWN_HOURS            选填，两次改签名的最小间隔小时数，默认 24
   RP_QZONE                          选填，1/0 允许模型在遇到有趣的事时发QQ空间说说，默认 1
@@ -157,6 +158,7 @@ EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48)
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
 FACT_MERGE_HOURS = max(0.0, float(os.environ.get("RP_FACT_MERGE_HOURS") or 6))
 FACT_MERGE_MIN = max(2, int(float(os.environ.get("RP_FACT_MERGE_MIN") or 20)))
+CARD_MERGE_MIN = max(2, int(float(os.environ.get("RP_CARD_MERGE_MIN") or 8)))
 SIGN_ON = (os.environ.get("RP_SIGN") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 SIGN_GAP = max(0.0, float(os.environ.get("RP_SIGN_COOLDOWN_HOURS") or 24) * 3600)
@@ -315,15 +317,32 @@ async def _idle_nudge_loop():
 
 
 async def _fact_merge_loop():
-    """定期让后台模型合并重复词条（同一件事被反复说时不再堆成多条）。
+    """定期让后台模型合并重复词条与重复事件卡（同一件事被反复说时不再堆成多条）。
 
-    只在事实数达到 RP_FACT_MERGE_MIN 的会话上跑，一轮最多处理一个会话的一批；
-    模型调用在线程里执行，不阻塞对话。失败只记日志，下轮再试。
+    先并事件卡（同一场景被记成多张），再并长期词条（同一设定被说成多条）；
+    两者都在线程里跑，不阻塞对话。失败只记日志，下轮再试。
     """
     while True:
         await asyncio.sleep(max(600.0, FACT_MERGE_HOURS * 3600))
         if mw is None:
             continue
+        try:
+            card_owners = mw.db.card_owners(CID)
+        except Exception as exc:                    # noqa: BLE001
+            logger.warning(f"[jinyu] 事件卡合并扫描失败: {exc}")
+            card_owners = []
+        for o in card_owners:
+            if int(o["n"] or 0) < CARD_MERGE_MIN:
+                continue
+            try:
+                sid = mw.db.latest_sid(o["base"], CID)
+                groups = await asyncio.to_thread(mw.merge_cards, sid, CID, True)
+            except Exception as exc:                # noqa: BLE001  模型/写库失败不致命
+                logger.warning(f"[jinyu] 事件卡合并失败 base={o['base']}: {exc}")
+                continue
+            if groups:
+                logger.info(f"[jinyu] 事件卡合并 base={o['base']} 组={len(groups)}：" +
+                            "；".join(f"{len(g['ids'])}→{g['summary'][:16]}" for g in groups[:6]))
         try:
             owners = mw.db.fact_owners(CID)
         except Exception as exc:                    # noqa: BLE001
@@ -1750,11 +1769,43 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         await matcher.finish(await asyncio.to_thread(_social_report))
         return True
     if cmd in ("merge", "合并"):
-        words = arg.split()
-        do_all = any(w in ("all", "全部") for w in words)
-        do_go = any(w in ("go", "执行") for w in words)
+        words = {w.lower() for w in arg.split()}
+        do_all = bool(words & {"all", "全部"})
+        do_go = bool(words & {"go", "执行"})
+        do_cards = bool(words & {"cards", "card", "卡片", "事件卡"})
         if mw is None:
             await matcher.finish("记忆体还没就绪，稍后再试。")
+        if do_cards:
+            if do_all:
+                targets = [(str(o["base"]), mw.db.latest_sid(o["base"], CID))
+                           for o in mw.db.card_owners(CID) if int(o["n"] or 0) >= 2]
+            else:
+                base = _sid(event).split("#")[0]
+                targets = [(base, mw.db.latest_sid(base, CID))]
+            if not targets:
+                await matcher.finish("没有可合并的事件卡（至少 2 张）。")
+            await matcher.send(
+                f"开始{'合并' if do_go else '试跑'}事件卡 {len(targets)} 个会话，请稍等…")
+            lines, groups_n, removed_n = [], 0, 0
+            for base, sid in targets[:8]:
+                try:
+                    groups = await asyncio.to_thread(mw.merge_cards, sid, CID, do_go)
+                except Exception as exc:            # noqa: BLE001  单个会话失败不影响其余
+                    lines.append(f"{_owner_label(base)}：失败 {type(exc).__name__}")
+                    continue
+                for g in groups[:6]:
+                    groups_n += 1
+                    removed_n += int(g.get("removed") or 0)
+                    lines.append(f"{_owner_label(base)}：{len(g['ids'])} 张并成"
+                                 f"「{g['summary'][:30]}」")
+            if not lines:
+                await matcher.finish("没发现重复事件卡。")
+            head = (f"事件卡合并完成：{groups_n} 组，删除 {removed_n} 张重复卡"
+                    if do_go else f"试跑：{groups_n} 组可能重复的事件卡，未写库")
+            tail = "" if do_go else "\n确认无误后发 /merge cards go（全部会话：/merge cards all go）"
+            if do_all and len(targets) > 8:
+                tail += f"\n本次只处理前 8 个会话（共 {len(targets)} 个），可再发一次继续。"
+            await matcher.finish(head + "\n" + "\n".join(lines[:20]) + tail)
         if do_all:
             bases = [o["base"] for o in mw.db.fact_owners(CID)
                      if int(o["n"] or 0) >= 2]
@@ -1764,6 +1815,19 @@ async def _admin(event: MessageEvent, text: str) -> bool:
             await matcher.finish("没有可合并的会话（事实不足 2 条）。")
         await matcher.send(f"开始{'合并' if do_go else '试跑'} {len(bases)} 个会话，请稍等…")
         lines, groups_n, removed_n = [], 0, 0
+        card_note = ""
+        if do_all:                               # 全部会话时顺带并掉重复事件卡
+            cards_n = 0
+            for o in mw.db.card_owners(CID):
+                if int(o["n"] or 0) < 2:
+                    continue
+                try:
+                    sid = mw.db.latest_sid(o["base"], CID)
+                    cards_n += len(await asyncio.to_thread(mw.merge_cards, sid, CID, do_go))
+                except Exception as exc:            # noqa: BLE001
+                    logger.warning(f"[jinyu] 事件卡合并失败 base={o['base']}: {exc}")
+            if cards_n:
+                card_note = f"（顺带合并事件卡 {cards_n} 组）"
         for base in bases[:8]:
             try:
                 groups = await asyncio.to_thread(mw.merge_facts, base, CID, do_go)
@@ -1775,13 +1839,13 @@ async def _admin(event: MessageEvent, text: str) -> bool:
                 removed_n += int(g.get("removed") or 0)
                 lines.append(f"{_owner_label(base)}：{len(g['ids'])} 条并成「{g['fact']}」")
         if not lines:
-            await matcher.finish("没发现重复词条。")
+            await matcher.finish(f"没发现重复词条。{card_note}")
         head = (f"合并完成：{groups_n} 组，删除 {removed_n} 条重复（含各 epoch 副本）"
                 if do_go else f"试跑：{groups_n} 组可能重复，未写库")
         tail = "" if do_go else "\n确认无误后发 /merge go（全部会话：/merge all go）"
         if do_all and len(bases) > 8:
             tail += f"\n本次只处理前 8 个会话（共 {len(bases)} 个），可再发一次继续。"
-        await matcher.finish(head + "\n" + "\n".join(lines[:20]) + tail)
+        await matcher.finish(head + card_note + "\n" + "\n".join(lines[:20]) + tail)
         return True
     if cmd == "testrich":
         await matcher.send("【自测】文本 OK")
