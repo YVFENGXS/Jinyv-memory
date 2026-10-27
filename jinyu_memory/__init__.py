@@ -47,6 +47,11 @@
   RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
   RP_FACT_MERGE_MIN                 选填，会话事实达到多少条才自动合并，默认 20
   RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
+  RP_RECALL_CARDS                   选填，每轮最多注入几张召回卡，默认 4
+  RP_EMBED                          选填，1/0 开关语义召回，默认 1
+  RP_EMBED_KEY                      选填，硅基流动密钥，默认回退到 RP_ASR_KEY
+  RP_EMBED_MODEL                    选填，嵌入模型，默认 BAAI/bge-m3（1024 维）
+  RP_EMBED_BASE / RP_EMBED_DIM      选填，接口地址 / 维度，默认硅基官方 / 1024
   RP_SIGN                           选填，1/0 允许模型在情真意切时改自己的QQ签名，默认 1
   RP_SIGN_COOLDOWN_HOURS            选填，两次改签名的最小间隔小时数，默认 24
   RP_QZONE                          选填，1/0 允许模型在遇到有趣的事时发QQ空间说说，默认 1
@@ -68,7 +73,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -97,6 +102,7 @@ from asr import (                                            # noqa: E402
     transcribe as asr_transcribe,
 )
 from llm import from_env                                    # noqa: E402
+import embedding                                             # noqa: E402
 from linkmeta import (                                      # noqa: E402
     card_info,
     card_note,
@@ -231,6 +237,7 @@ async def _startup():
         max_tokens=int(os.environ.get("RP_MAX_TOKENS") or 64000),
         output_reserve=int(os.environ.get("RP_OUTPUT_RESERVE") or 4096),
         profile=os.environ.get("RP_PROFILE") or "cl100k",
+        recall_limit=max(2, int(float(os.environ.get("RP_RECALL_CARDS") or 4))),
     )
     mw = mw_plain
     SOCIAL_DB = db_path.with_name(db_path.stem + "_social" + db_path.suffix)
@@ -247,6 +254,13 @@ async def _startup():
     logger.info("[jinyu] 语音转写 "
                 + (f"启用 model={asr_model()}" if asr_enabled()
                    else "未启用（未配置 RP_ASR_KEY）"))
+    if embedding.enabled():
+        logger.info(f"[jinyu] 语义召回 启用 model={embedding.model_name()} "
+                    f"dim={embedding.dim()}")
+        asyncio.create_task(_vector_loop())
+    else:
+        logger.info("[jinyu] 语义召回 未启用（未配置 RP_EMBED_KEY / RP_ASR_KEY，"
+                    "只用钩子召回）")
     try:
         reminder.init(str(db_path.with_name("reminders.db")))
         logger.info(f"[jinyu] 提醒调度就绪 db={db_path.with_name('reminders.db')}")
@@ -359,6 +373,23 @@ async def _fact_merge_loop():
             if groups:
                 logger.info(f"[jinyu] 词条合并 base={o['base']} 组={len(groups)}：" +
                             "；".join(f"{len(g['ids'])}→{g['fact'][:16]}" for g in groups[:6]))
+
+
+async def _vector_loop():
+    """后台回填事件卡向量（bge-m3）：启动先补一批，之后每 5 分钟补新卡。
+
+    回填只在后台线程跑，前台召回永远拿到「已经算好的那部分」，不会等网络。
+    """
+    while True:
+        try:
+            if mw is not None and embedding.enabled():
+                n = await asyncio.to_thread(mw.warm_vectors, CID)
+                if n:
+                    logger.info(f"[jinyu] 事件卡向量回填 {n} 张")
+                await asyncio.to_thread(mw.db.sweep_vectors, CID)
+        except Exception as exc:                    # noqa: BLE001  回填失败不能拖垮机器人
+            logger.warning(f"[jinyu] 向量回填异常: {exc}")
+        await asyncio.sleep(300)
 
 
 async def _reminder_loop():
@@ -1491,6 +1522,194 @@ def _fact_line(row, with_owner=False) -> str:
     return line + " → " + str(row["fact"])
 
 
+def _card_when(card) -> str:
+    """事件卡 UTC 时间 → 本地「月-日」；坏值给空串。"""
+    try:
+        return datetime.strptime(str(card.get("created_at") or "")[:19],
+                                 "%Y-%m-%d %H:%M:%S") \
+            .replace(tzinfo=timezone.utc).astimezone().strftime("%m-%d")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _short_id(eid) -> str:
+    return str(eid or "")[:8]
+
+
+def _card_line(card, with_owner=False) -> str:
+    owner = (f"[{_owner_label(str(card['session_id']).split('#')[0])}] "
+             if with_owner else "")
+    body = str(card.get("summary") or "").replace("\n", " ")
+    shown = body[:60] + ("…" if len(body) > 60 else "")
+    return (f"#{_short_id(card.get('event_id'))} {owner}"
+            f"({_card_when(card) or '—'} t{card['turn_start']}-{card['turn_end']}) {shown}")
+
+
+def _cards_report(cid: str, sid: str, page: int, keyword: str) -> str:
+    """事件卡列表：只列当前 epoch，合并/编辑都落在这一层。"""
+    size = 8
+    rows, total = mw.db.card_page(sid, cid, (page - 1) * size, size, keyword)
+    pages = max(1, (total + size - 1) // size)
+    title = (f"搜索「{keyword}」" if keyword
+             else _owner_label(str(sid).split("#")[0]))
+    head = f"【事件卡】{title}｜{total} 张｜第 {min(page, pages)}/{pages} 页"
+    if not rows:
+        return head + "\n没有匹配的事件卡。"
+    out = head + "\n" + "\n".join(_card_line(c) for c in rows)
+    if not keyword and page < pages:
+        out += f"\n下一页：/memory cards {page + 1}"
+    return (out + "\n查看：/memory card 编号（行首 # 后 8 位）"
+            "\n改：/memory card edit 编号 新正文｜删：/memory card del 编号"
+            "\n补：/memory card add 正文｜全部会话：/memory cards all")
+
+
+def _card_ref_problem(cards, ref: str) -> str:
+    if not cards:
+        return f"没找到事件卡 {ref}（编号见 /memory cards 行首 #）。"
+    return ("编号前缀不唯一，请多写几位：\n"
+            + "\n".join(f"- {c['event_id']}" for c in cards))
+
+
+def _card_detail(cid: str, ref: str) -> str:
+    cards = mw.db.find_cards(ref, cid)
+    if len(cards) != 1:
+        return _card_ref_problem(cards, ref)
+    c = cards[0]
+    hooks = "、".join(str(h) for h in (c.get("entity_hooks") or [])) or "无"
+    pinned = "是（会跨会话注入）" if mw.db.is_pinned(c["event_id"]) else "否"
+    return (f"【事件卡】{c['event_id']}\n"
+            f"会话：{_owner_label(str(c['session_id']).split('#')[0])}\n"
+            f"时间：{_card_when(c) or '—'}｜轮次 t{c['turn_start']}-{c['turn_end']}｜"
+            f"重要度 {float(c.get('importance') or 0.5):.2f}\n"
+            f"边界：{c.get('knowledge_boundary') or 'both'}｜置顶：{pinned}\n"
+            f"正文：{c['summary']}\n"
+            f"钩子：{hooks}\n"
+            f"改：/memory card edit {_short_id(c['event_id'])} 新正文")
+
+
+def _card_edit(cid: str, ref: str, text: str) -> str:
+    text = text.strip()
+    if not text:
+        return "用法：/memory card edit 编号 新正文"
+    cards = mw.db.find_cards(ref, cid)
+    if len(cards) != 1:
+        return _card_ref_problem(cards, ref)
+    old, ok = mw.db.update_card(cards[0]["event_id"], cid, text[:200])
+    if not ok:
+        return f"没找到事件卡 {ref}，可能已经删过了。"
+    return (f"已修改事件卡 #{_short_id(cards[0]['event_id'])}（向量会按新正文重算）\n"
+            f"原：{str(old)[:60]}\n新：{text[:100]}")
+
+
+def _card_delete(cid: str, ref: str) -> str:
+    cards = mw.db.find_cards(ref, cid)
+    if len(cards) != 1:
+        return _card_ref_problem(cards, ref)
+    body, ok = mw.db.delete_card(cards[0]["event_id"], cid)
+    if not ok:
+        return f"没找到事件卡 {ref}，可能已经删过了。"
+    return (f"已删除事件卡 #{_short_id(cards[0]['event_id'])}「{str(body)[:50]}」\n"
+            "置顶与向量一起清理。")
+
+
+def _card_add(cid: str, sid: str, text: str) -> str:
+    text = text.strip()
+    if not text:
+        return "用法：/memory card add 正文（把一件该记住的事补进事件卡）"
+    turn = mw.db.next_turn(sid, cid)
+    eid = mw.db.add_card(sid, cid, text[:200], turn)
+    return (f"已补一张事件卡 #{_short_id(eid)}（t{turn}，钩子已自动提取）\n"
+            f"正文：{text[:100]}\n查看：/memory card {_short_id(eid)}")
+
+
+def _fact_edit(cid: str, ref: str, text: str) -> str:
+    raw = str(ref or "").lstrip("#")
+    if not raw.isdigit():
+        return f"「{ref}」不是编号，例如 /memory edit 142 新正文"
+    text = text.strip()
+    if not text:
+        return "用法：/memory edit 142 新正文"
+    old, n = mw.db.update_fact(int(raw), cid, text[:160])
+    if not old and not n:
+        return f"没找到 #{raw}，可能已经删过了。"
+    if not n:
+        return (f"#{raw} 改成这句会和另一条词条重复，未修改：\n"
+                f"原句：{old}\n想改的：{text[:100]}")
+    return (f"已修改 #{raw}（含 epoch 副本 {n} 条）\n"
+            f"原：{old[:60]}\n新：{text[:100]}")
+
+
+def _fact_add(cid: str, sid: str, text: str) -> str:
+    text = text.strip()
+    if not text:
+        return "用法：/memory add 正文（补一条长期有效的设定/事实）"
+    turn = mw.db.next_turn(sid, cid)
+    fid = mw.db.add_fact(sid, cid, text[:160], turn)
+    if not fid:
+        return "这条已经存在（同会话同说话人），没有重复添加。"
+    return (f"已新增词条 #{fid}（t{turn}）\n{text[:100]}\n"
+            f"删除：/memory del {fid}｜修改：/memory edit {fid} 新正文")
+
+
+def _log_detail(row) -> str:
+    card = row.get("kind") == "card"
+    kind = "事件卡" if card else "词条"
+    lines = [f"【合并记录 #{row['id']}】{kind}｜"
+             f"{_owner_label(str(row.get('session_id') or '').split('#')[0])}",
+             f"时间：{row.get('created_at') or '—'}",
+             f"合并后：{row.get('merged') or ''}",
+             "来源："]
+    for s in row.get("sources") or []:
+        if card:
+            mark = "（保留）" if s.get("event_id") == row.get("keep_id") else ""
+            body = str(s.get("summary") or "").replace("\n", " ")
+            lines.append(f"- {_short_id(s.get('event_id'))} {s.get('date') or '—'} "
+                         f"t{s.get('turn_start')}-{s.get('turn_end')}{mark} {body[:80]}")
+        else:
+            mark = "（保留）" if str(s.get("id")) == str(row.get("keep_id")) else ""
+            body = str(s.get("fact") or "").replace("\n", " ")
+            lines.append(f"- #{s.get('id')} {s.get('date') or '—'} "
+                         f"t{s.get('turn_end')}{mark} {body[:80]}")
+    if card:
+        lines.append(f"查看保留卡：/memory card {_short_id(row.get('keep_id'))}")
+    else:
+        lines.append(f"查看/修改保留词条：/memory edit {row.get('keep_id')} 新正文")
+    return "\n".join(lines)
+
+
+def _log_report(cid: str, arg: str) -> str:
+    """合并记录：列表 + 单条详情；合并掉的原卡原文都存在这里。"""
+    arg = str(arg or "").strip()
+    if arg:
+        raw = arg.lstrip("#")
+        if not raw.isdigit():
+            return "用法：/memory log（列表）｜/memory log 12（看第 12 条详情）"
+        row = mw.db.get_merge_log(int(raw), cid)
+        if not row:
+            return f"没有合并记录 #{raw}。"
+        return _log_detail(row)
+    rows, total = mw.db.merge_logs(cid, offset=0, limit=10)
+    if not rows:
+        return "【合并记录】还没有合并过任何东西。"
+    lines = []
+    for r in rows:
+        kind = "事件卡" if r.get("kind") == "card" else "词条"
+        n = len(r.get("sources") or []) if isinstance(r.get("sources"), list) else 0
+        if isinstance(r.get("sources"), str):
+            try:
+                n = len(json.loads(r["sources"] or "[]"))
+            except (TypeError, ValueError):
+                n = 0
+        merged = str(r.get("merged") or "").replace("\n", " ")
+        shown = merged[:40] + ("…" if len(merged) > 40 else "")
+        lines.append(f"#{r['id']} {kind}｜"
+                     f"{_owner_label(str(r.get('session_id') or '').split('#')[0])}｜"
+                     f"{str(r.get('created_at') or '')[5:16]}｜{n} 条并成「{shown}」")
+    return (f"【合并记录】共 {total} 条｜最近 {len(rows)} 条\n"
+            + "\n".join(lines)
+            + "\n详情：/memory log 编号（看被合并的原文）")
+
+
 def _memory_page(cid: str, base: str, page: int, keyword: str, nav: str) -> str:
     """第二层：某个会话的词条分页；nav 为空表示全局搜索。"""
     size = 10
@@ -1503,34 +1722,84 @@ def _memory_page(cid: str, base: str, page: int, keyword: str, nav: str) -> str:
     out = head + "\n" + "\n".join(_fact_line(r, with_owner=not nav) for r in rows)
     if nav and page < pages:
         out += f"\n下一页：{nav} {page + 1}"
-    return out + "\n删除：/memory del 编号（行首 #号）"
+    return out + ("\n删除：/memory del 编号｜修改：/memory edit 编号 新正文"
+                  "（编号见行首 #）")
 
 
-def _memory_report(arg: str) -> str:
-    """管理员 /memory：先选人，再看词条，可按编号删除。
+def _memory_report(arg: str, sid: str) -> str:
+    """管理员 /memory：词条与事件卡的查看、搜索、增删改，以及合并记录。
 
-    /memory            全局会话列表（第一层）
-    /memory 1          第 1 个会话的词条（第二层）
-    /memory 1 2        第 1 个会话的第 2 页
-    /memory 1 猫       在第 1 个会话里搜「猫」
-    /memory 猫         全局搜「猫」
-    /memory del 142    删除 #142（连同跨 epoch 副本）
+    /memory                    全局会话列表
+    /memory 1                  第 1 个会话的词条
+    /memory 1 2                第 1 个会话的第 2 页
+    /memory 1 猫               在第 1 个会话里搜「猫」
+    /memory 猫                 全局搜「猫」
+    /memory del 142            删除词条 #142（连同跨 epoch 副本）
+    /memory edit 142 新正文    修改词条 #142
+    /memory add 正文           新增一条长期词条
+    /memory cards [页|词]      当前会话的事件卡
+    /memory cards all          所有会话的事件卡数量
+    /memory card <编号>        查看某张事件卡（编号可只写前缀）
+    /memory card edit <编号> 新正文
+    /memory card del <编号>
+    /memory card add 正文
+    /memory log [编号]         合并记录列表 / 详情
     """
-    cid = CID
-    parts = arg.split()
-    if parts and parts[0] in ("del", "删除", "删"):
+    cid, parts = CID, arg.split()
+    head = parts[0].lower() if parts else ""
+    if head in ("del", "删除", "删"):
         return _memory_delete(parts[1:])
+    if head in ("edit", "改", "修改"):
+        if len(parts) < 3:
+            return "用法：/memory edit 142 新正文"
+        return _fact_edit(cid, parts[1], " ".join(parts[2:]))
+    if head in ("add", "新增", "补"):
+        return _fact_add(cid, sid, " ".join(parts[1:]))
+    if head in ("log", "记录", "合并记录"):
+        return _log_report(cid, " ".join(parts[1:]))
+    if head in ("cards", "卡片", "事件卡"):
+        rest = parts[1:]
+        if rest and rest[0].lower() in ("all", "全部", "会话"):
+            owners = mw.db.card_owners(cid)
+            if not owners:
+                return "【事件卡】还没有任何事件卡。"
+            total = sum(int(o["n"]) for o in owners)
+            lines = [f"{i}. {_owner_label(o['base'])} · {o['n']} 张"
+                     for i, o in enumerate(owners, 1)]
+            return (f"【事件卡】{len(owners)} 个会话｜合计 {total} 张\n"
+                    + "\n".join(lines)
+                    + "\n查看当前会话：/memory cards")
+        page = int(rest[0]) if rest and rest[0].isdigit() else 1
+        keyword = "" if (not rest or rest[0].isdigit()) else " ".join(rest)
+        return _cards_report(cid, sid, max(1, page), keyword)
+    if head in ("card", "卡"):
+        rest = parts[1:]
+        if not rest:
+            return ("用法：/memory card 编号｜edit 编号 新正文｜del 编号｜add 正文")
+        sub = rest[0].lower()
+        if sub in ("add", "新增", "补"):
+            return _card_add(cid, sid, " ".join(rest[1:]))
+        if sub in ("del", "删除", "删"):
+            return _card_delete(cid, rest[1] if len(rest) > 1 else "")
+        if sub in ("edit", "改", "修改"):
+            if len(rest) < 3:
+                return "用法：/memory card edit 编号 新正文"
+            return _card_edit(cid, rest[1], " ".join(rest[2:]))
+        return _card_detail(cid, rest[0])
     if not parts:
         owners = mw.db.fact_owners(cid)
         if not owners:
-            return "【记忆词条】还没有保存过任何长期事实。"
+            return ("【记忆词条】还没有保存过任何长期事实。\n"
+                    "事件卡：/memory cards｜合并记录：/memory log")
         total = sum(int(o["n"]) for o in owners)
         lines = [f"{i}. {_owner_label(o['base'])} · {o['n']} 条"
                  for i, o in enumerate(owners, 1)]
         return (f"【记忆词条】{len(owners)} 个会话｜合计 {total} 条\n"
                 + "\n".join(lines)
                 + "\n查看：/memory 1｜翻页：/memory 1 2｜全局搜索：/memory 猫"
-                + "\n删除：/memory del 142（编号见词条行首 #）")
+                + "\n删除：/memory del 142｜修改：/memory edit 142 新正文"
+                + "｜新增：/memory add 正文"
+                + "\n事件卡：/memory cards｜合并记录：/memory log")
     if parts[0].isdigit():
         idx = int(parts[0])
         owners = mw.db.fact_owners(cid)
@@ -1558,6 +1827,64 @@ def _memory_delete(parts: list) -> str:
             f"所属 {_owner_label(base)}｜共清理 {n} 条（含 epoch 副本）")
 
 
+def _merge_card_receipt(base: str, groups: list, applied: bool, start=0) -> list:
+    """合并回执：每组标明保留哪张、每张来源卡的时间/轮次/原文。"""
+    lines = []
+    for i, g in enumerate(groups, 1):
+        srcs = g.get("sources") or []
+        tag = (f"（记录 #{g['log_id']}）"
+               if applied and g.get("log_id") else "")
+        lines.append(f"{start + i}) {_owner_label(base)}｜{len(srcs)} 张 → 保留 "
+                     f"{_short_id(g.get('keep_id'))}{tag}")
+        lines.append(f"   合并后：{g.get('summary') or ''}")
+        for s in srcs[:6]:
+            body = str(s.get("summary") or "").replace("\n", " ")
+            shown = body[:50] + ("…" if len(body) > 50 else "")
+            mark = "（保留）" if s.get("event_id") == g.get("keep_id") else ""
+            lines.append(f"   - {_short_id(s.get('event_id'))} {s.get('date') or '—'} "
+                         f"t{s.get('turn_start')}-{s.get('turn_end')}{mark} {shown}")
+        if len(srcs) > 6:
+            lines.append(f"   …其余 {len(srcs) - 6} 张见 /memory log "
+                         f"{g.get('log_id') or ''}")
+    return lines
+
+
+def _merge_fact_receipt(base: str, groups: list, applied: bool, start=0) -> list:
+    lines = []
+    for i, g in enumerate(groups, 1):
+        srcs = g.get("sources") or []
+        tag = (f"（记录 #{g['log_id']}）"
+               if applied and g.get("log_id") else "")
+        lines.append(f"{start + i}) {_owner_label(base)}｜{len(srcs)} 条 → 保留 "
+                     f"#{g.get('keep_id')}{tag}")
+        lines.append(f"   合并后：{g.get('fact') or ''}")
+        for s in srcs[:5]:
+            body = str(s.get("fact") or "").replace("\n", " ")
+            shown = body[:50] + ("…" if len(body) > 50 else "")
+            mark = "（保留）" if str(s.get("id")) == str(g.get("keep_id")) else ""
+            lines.append(f"   - #{s.get('id')} {s.get('date') or '—'} "
+                         f"t{s.get('turn_end')}{mark} {shown}")
+        if len(srcs) > 5:
+            lines.append(f"   …其余 {len(srcs) - 5} 条见 /memory log "
+                         f"{g.get('log_id') or ''}")
+    return lines
+
+
+async def _send_long(text: str, limit: int = 1200) -> None:
+    """按行切成多条发送：合并回执动辄上千字，单条太长会被平台吞。"""
+    parts, buf = [], ""
+    for line in str(text).split("\n"):
+        if buf and len(buf) + 1 + len(line) > limit:
+            parts.append(buf)
+            buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+    if buf:
+        parts.append(buf)
+    for p in parts:
+        await matcher.send(p)
+
+
 async def _admin(event: MessageEvent, text: str) -> bool:
     """管理员自测/管理命令，绕过模型。"""
     if not ADMIN or str(event.user_id) not in ADMIN:
@@ -1579,7 +1906,8 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         await matcher.finish(_persona_report(event))
         return True
     if cmd in ("memory", "词条", "记忆"):
-        await matcher.finish(_memory_report(arg))
+        base = _sid(event).split("#")[0]
+        await matcher.finish(_memory_report(arg, mw.db.latest_sid(base, CID)))
         return True
     if cmd == "voice" and arg:
         audio = await tts_audio(arg)
@@ -1786,27 +2114,37 @@ async def _admin(event: MessageEvent, text: str) -> bool:
                 await matcher.finish("没有可合并的事件卡（至少 2 张）。")
             await matcher.send(
                 f"开始{'合并' if do_go else '试跑'}事件卡 {len(targets)} 个会话，请稍等…")
-            lines, groups_n, removed_n = [], 0, 0
+            lines, groups_n, removed_n, extra_n, shown_n = [], 0, 0, 0, 0
             for base, sid in targets[:8]:
                 try:
                     groups = await asyncio.to_thread(mw.merge_cards, sid, CID, do_go)
                 except Exception as exc:            # noqa: BLE001  单个会话失败不影响其余
                     lines.append(f"{_owner_label(base)}：失败 {type(exc).__name__}")
                     continue
-                for g in groups[:6]:
+                for g in groups:
                     groups_n += 1
                     removed_n += int(g.get("removed") or 0)
-                    merged = str(g.get("summary") or "")
-                    shown = merged[:80] + ("…" if len(merged) > 80 else "")
-                    lines.append(f"{_owner_label(base)}：{len(g['ids'])} 张并成「{shown}」")
+                    if shown_n >= 12:               # 回执最多展开 12 组，其余看记录
+                        extra_n += 1
+                        continue
+                    lines += _merge_card_receipt(base, [g], do_go, groups_n - 1)
+                    shown_n += 1
             if not lines:
                 await matcher.finish("没发现重复事件卡。")
             head = (f"事件卡合并完成：{groups_n} 组，删除 {removed_n} 张重复卡"
                     if do_go else f"试跑：{groups_n} 组可能重复的事件卡，未写库")
-            tail = "" if do_go else "\n确认无误后发 /merge cards go（全部会话：/merge cards all go）"
+            tail = ""
+            if extra_n:
+                tail += (f"\n还有 {extra_n} 组未展开"
+                         + ("，已写入合并记录，用 /memory log 查看。" if do_go else "。"))
+            if do_go:
+                tail += "\n查看来源：/memory log｜改合并结果：/memory cards"
+            else:
+                tail += "\n确认无误后发 /merge cards go（全部会话：/merge cards all go）"
             if do_all and len(targets) > 8:
                 tail += f"\n本次只处理前 8 个会话（共 {len(targets)} 个），可再发一次继续。"
-            await matcher.finish(head + "\n" + "\n".join(lines[:20]) + tail)
+            await _send_long(head + "\n" + "\n".join(lines) + tail)
+            return True
         if do_all:
             bases = [o["base"] for o in mw.db.fact_owners(CID)
                      if int(o["n"] or 0) >= 2]
@@ -1815,7 +2153,7 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         if not bases:
             await matcher.finish("没有可合并的会话（事实不足 2 条）。")
         await matcher.send(f"开始{'合并' if do_go else '试跑'} {len(bases)} 个会话，请稍等…")
-        lines, groups_n, removed_n = [], 0, 0
+        lines, groups_n, removed_n, extra_n, shown_n = [], 0, 0, 0, 0
         card_note = ""
         if do_all:                               # 全部会话时顺带并掉重复事件卡
             cards_n = 0
@@ -1835,18 +2173,29 @@ async def _admin(event: MessageEvent, text: str) -> bool:
             except Exception as exc:                # noqa: BLE001  单个会话失败不影响其余
                 lines.append(f"{_owner_label(base)}：失败 {type(exc).__name__}")
                 continue
-            for g in groups[:6]:
+            for g in groups:
                 groups_n += 1
                 removed_n += int(g.get("removed") or 0)
-                lines.append(f"{_owner_label(base)}：{len(g['ids'])} 条并成「{g['fact']}」")
+                if shown_n >= 10:
+                    extra_n += 1
+                    continue
+                lines += _merge_fact_receipt(base, [g], do_go, groups_n - 1)
+                shown_n += 1
         if not lines:
             await matcher.finish(f"没发现重复词条。{card_note}")
         head = (f"合并完成：{groups_n} 组，删除 {removed_n} 条重复（含各 epoch 副本）"
                 if do_go else f"试跑：{groups_n} 组可能重复，未写库")
-        tail = "" if do_go else "\n确认无误后发 /merge go（全部会话：/merge all go）"
+        tail = ""
+        if extra_n:
+            tail += (f"\n还有 {extra_n} 组未展开"
+                     + ("，已写入合并记录，用 /memory log 查看。" if do_go else "。"))
+        if do_go:
+            tail += "\n查看来源：/memory log｜改合并结果：/memory edit 编号 新正文"
+        else:
+            tail += "\n确认无误后发 /merge go（全部会话：/merge all go）"
         if do_all and len(bases) > 8:
             tail += f"\n本次只处理前 8 个会话（共 {len(bases)} 个），可再发一次继续。"
-        await matcher.finish(head + card_note + "\n" + "\n".join(lines[:20]) + tail)
+        await _send_long(head + card_note + "\n" + "\n".join(lines) + tail)
         return True
     if cmd == "testrich":
         await matcher.send("【自测】文本 OK")

@@ -20,7 +20,7 @@ import copy, difflib, hashlib, json, logging, math, queue, re, sqlite3, threadin
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-import conflict, promise, retriever
+import conflict, embedding, promise, retriever
 from persona_guard import PersonaGuard
 from summarizer import parse as parse_json, summarize
 
@@ -77,6 +77,33 @@ def _clip_sentence(text, limit):
     if i >= limit // 2:
         return head[:i + 1]
     return head + "…"
+
+
+_MANUAL_STOP = retriever.STOP_CHARS | set("吗嘛呀哦嗯啦呐哟哈这那我你他她它")
+
+
+def _manual_hooks(text):
+    """手工补卡/补词条时从正文提取实体钩子：中文双字 + 英文词，最多 8 个。
+
+    自动归档有后台模型给钩子；手工录入没有，只能用确定性规则兜底。
+    只取相邻双字并剔掉停用字边界，避免「主人的」拆出「人的」这类噪声。
+    """
+    t = str(text or "")
+    grams = []
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", t):
+        for i in range(len(run) - 1):
+            g = run[i:i + 2]
+            if g[0] in _MANUAL_STOP or g[-1] in _MANUAL_STOP:
+                continue
+            grams.append(g)
+    grams += re.findall(r"[A-Za-z][A-Za-z0-9_]{1,15}", t)
+    out = []
+    for g in grams:
+        if g not in out:
+            out.append(g)
+        if len(out) >= 8:
+            break
+    return out
 
 
 # 定期合并用的提示词：只判「指同一件事」，不判语义相近，宁可漏并不可错并
@@ -317,6 +344,18 @@ CREATE TABLE IF NOT EXISTS session_epoch(
   base_sid TEXT NOT NULL, character_id TEXT NOT NULL,
   epoch INTEGER NOT NULL DEFAULT 0, last_active REAL NOT NULL,
   PRIMARY KEY(base_sid, character_id));
+CREATE TABLE IF NOT EXISTS merge_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+  session_id TEXT NOT NULL, character_id TEXT NOT NULL,
+  keep_id TEXT NOT NULL, merged TEXT NOT NULL, sources TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_merge_log ON merge_log(character_id, id);
+CREATE TABLE IF NOT EXISTS vectors(
+  kind TEXT NOT NULL, ref_id TEXT NOT NULL, character_id TEXT NOT NULL,
+  model TEXT NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY(kind, ref_id));
+CREATE INDEX IF NOT EXISTS idx_vectors ON vectors(character_id, kind);
 """
 
 
@@ -743,10 +782,12 @@ class DB:
             speaker = str(keep["speaker"] or "")
             removed = 0
             for text in drop_facts:
+                # id<>keep：跨 epoch 的副本正文可能和保留行一模一样，
+                # 按正文删会把 keep 自己一起删掉，合并结果就丢了
                 cur = c.execute(
                     "DELETE FROM durable_facts WHERE character_id=? AND fact=?"
-                    " AND speaker=? AND (session_id=? OR session_id LIKE ?)",
-                    (cid, text, speaker, base, base + "#%"))
+                    " AND speaker=? AND id<>? AND (session_id=? OR session_id LIKE ?)",
+                    (cid, text, speaker, keep_id, base, base + "#%"))
                 removed += max(0, cur.rowcount)
             params = (fact, json.dumps(tags, ensure_ascii=False), float(importance),
                       category, expires_at, keep_id, cid)
@@ -787,13 +828,16 @@ class DB:
 
     def apply_card_merge(self, cid, keep_id, drop_ids, summary, turn_start, turn_end,
                          importance=None):
-        """把一组重复事件卡并到 keep_id：改正文/轮次范围，删掉其余（置顶卡跳过）。"""
+        """把一组重复事件卡并到 keep_id：改正文/轮次范围，删掉其余（置顶卡跳过）。
+
+        返回 (实际删除数, 实际被删的 event_id 列表)，合并记录据此只登记真删的卡。
+        """
         with self._c() as c:
             keep = c.execute("SELECT event_id, importance FROM event_cards"
                              " WHERE event_id=? AND character_id=?",
                              (keep_id, cid)).fetchone()
             if not keep:
-                return 0
+                return 0, []
             drop = []
             for eid in drop_ids:
                 if eid == keep_id:
@@ -803,7 +847,7 @@ class DB:
                     continue                     # 被人工置顶的卡不删
                 drop.append(eid)
             if not drop:
-                return 0
+                return 0, []
             imp = float(keep["importance"] or 0.5) if importance is None else float(importance)
             c.execute("UPDATE event_cards SET summary=?, turn_start=?, turn_end=?,"
                       " importance=? WHERE event_id=? AND character_id=?",
@@ -811,7 +855,204 @@ class DB:
             marks = ",".join("?" * len(drop))
             cur = c.execute(f"DELETE FROM event_cards WHERE character_id=?"
                             f" AND event_id IN ({marks})", [cid] + drop)
-            return max(0, cur.rowcount)
+            c.execute(f"DELETE FROM vectors WHERE kind='card' AND ref_id IN ({marks})", drop)
+            c.execute("DELETE FROM vectors WHERE kind='card' AND ref_id=?", (keep_id,))
+        return max(0, cur.rowcount), drop
+
+    # ---------- 合并记录：合并删掉的原文必须留档，否则事后无法回答「跟什么并了」 ----------
+    def log_merge(self, kind, base_sid, cid, keep_id, merged, sources):
+        with self._c() as c:
+            cur = c.execute(
+                "INSERT INTO merge_log(kind,session_id,character_id,keep_id,merged,sources)"
+                " VALUES(?,?,?,?,?,?)",
+                (kind, base_sid, cid, str(keep_id), str(merged),
+                 json.dumps(sources, ensure_ascii=False)))
+        return int(cur.lastrowid or 0)
+
+    def merge_logs(self, cid, kind="", offset=0, limit=8):
+        where, args = "character_id=?", [cid]
+        if kind:
+            where += " AND kind=?"
+            args.append(kind)
+        with self._c() as c:
+            total = c.execute(f"SELECT COUNT(*) FROM merge_log WHERE {where}",
+                              args).fetchone()[0]
+            rows = c.execute(
+                "SELECT id, kind, session_id, keep_id, merged, sources, created_at"
+                f" FROM merge_log WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                args + [max(1, int(limit)), max(0, int(offset))]).fetchall()
+        return [dict(r) for r in rows], total
+
+    def get_merge_log(self, log_id, cid):
+        with self._c() as c:
+            row = c.execute(
+                "SELECT id, kind, session_id, keep_id, merged, sources, created_at"
+                " FROM merge_log WHERE id=? AND character_id=?",
+                (log_id, cid)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["sources"] = json.loads(d.get("sources") or "[]")
+        except (TypeError, ValueError):
+            d["sources"] = []
+        return d
+
+    # ---------- 事件卡 CRUD：合并结果要能查、能改、能删、能补 ----------
+    def card_page(self, sid, cid, offset=0, limit=8, keyword=""):
+        """管理员查看：本会话事件卡分页，可按摘要/钩子搜关键词。返回 (cards, 总数)。"""
+        where, args = "session_id=? AND character_id=?", [sid, cid]
+        if keyword:
+            where += " AND (summary LIKE ? OR entity_hooks LIKE ?)"
+            args += [f"%{keyword}%"] * 2
+        with self._c() as c:
+            total = c.execute(f"SELECT COUNT(*) FROM event_cards WHERE {where}",
+                              args).fetchone()[0]
+            rows = c.execute(
+                f"SELECT * FROM event_cards WHERE {where}"
+                " ORDER BY turn_start, turn_end, created_at LIMIT ? OFFSET ?",
+                args + [max(1, int(limit)), max(0, int(offset))]).fetchall()
+        return [_card(r) for r in rows], total
+
+    def find_cards(self, ref, cid):
+        """按 event_id 前缀找卡；返回列表（空=没有，多于 1=前缀有歧义）。"""
+        ref = str(ref or "").strip()
+        if not ref:
+            return []
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT * FROM event_cards WHERE character_id=? AND event_id LIKE ?"
+                " ORDER BY created_at DESC LIMIT 6", (cid, ref + "%")).fetchall()
+        return [_card(r) for r in rows]
+
+    def update_card(self, event_id, cid, summary):
+        """改卡正文；向量同步作废，下一轮回填按新正文重算。返回 (旧正文, 成功)。"""
+        with self._c() as c:
+            row = c.execute("SELECT summary FROM event_cards"
+                            " WHERE event_id=? AND character_id=?",
+                            (event_id, cid)).fetchone()
+            if not row:
+                return "", False
+            c.execute("UPDATE event_cards SET summary=? WHERE event_id=? AND character_id=?",
+                      (str(summary), event_id, cid))
+            c.execute("DELETE FROM vectors WHERE kind='card' AND ref_id=?", (event_id,))
+        return str(row["summary"] or ""), True
+
+    def delete_card(self, event_id, cid):
+        """删卡 + 置顶 + 向量一起清。返回 (正文, 是否删除)。"""
+        with self._c() as c:
+            row = c.execute("SELECT summary FROM event_cards"
+                            " WHERE event_id=? AND character_id=?",
+                            (event_id, cid)).fetchone()
+            if not row:
+                return "", False
+            c.execute("DELETE FROM event_cards WHERE event_id=? AND character_id=?",
+                      (event_id, cid))
+            c.execute("DELETE FROM cross_session_pin WHERE event_id=?", (event_id,))
+            c.execute("DELETE FROM vectors WHERE kind='card' AND ref_id=?", (event_id,))
+        return str(row["summary"] or ""), True
+
+    def add_card(self, sid, cid, summary, turn=0):
+        """手工补一张卡：钩子用确定性规则提取，幂等键带 uuid。返回 event_id。"""
+        eid = uuid.uuid4().hex
+        card = {"event_id": eid, "session_id": sid, "character_id": cid,
+                "turn_start": int(turn), "turn_end": int(turn),
+                "summary": str(summary), "state_changes": {},
+                "entity_hooks": _manual_hooks(summary),
+                "rel_hooks": [], "knowledge_boundary": "both", "importance": 0.6,
+                "conflict_flags": [], "precision": "normal",
+                "idempotency_key": f"manual:{eid}"}
+        with self._c() as c:
+            c.execute(INSERT_CARD, _card_params(card))
+        return eid
+
+    def next_turn(self, sid, cid):
+        """手工卡/手工词条的轮次：排在已归档内容之后，不动归档游标。"""
+        with self._c() as c:
+            row = c.execute("SELECT MAX(turn_end) AS m FROM event_cards"
+                            " WHERE session_id=? AND character_id=?",
+                            (sid, cid)).fetchone()
+            cur = c.execute("SELECT summarized_until_turn AS m FROM archive_cursor"
+                            " WHERE session_id=? AND character_id=?",
+                            (sid, cid)).fetchone()
+        return max(int(row["m"] or 0) if row else 0,
+                   int(cur["m"] or 0) if cur else 0)
+
+    def update_fact(self, fact_id, cid, text):
+        """改词条正文（连同跨 epoch 副本）。撞唯一键返回 (旧正文, 0)。"""
+        with self._c() as c:
+            row = c.execute("SELECT session_id, fact, speaker FROM durable_facts"
+                            " WHERE id=? AND character_id=?", (fact_id, cid)).fetchone()
+            if not row:
+                return "", 0
+            base = str(row["session_id"]).split("#")[0]
+            try:
+                cur = c.execute(
+                    "UPDATE durable_facts SET fact=? WHERE character_id=? AND fact=?"
+                    " AND speaker=? AND (session_id=? OR session_id LIKE ?)",
+                    (str(text), cid, row["fact"], row["speaker"],
+                     base, base + "#%"))
+            except sqlite3.IntegrityError:
+                return str(row["fact"] or ""), 0
+        return str(row["fact"] or ""), max(0, cur.rowcount)
+
+    def add_fact(self, sid, cid, text, turn=0, speaker="", importance=0.7):
+        """手工补一条长期词条；标签留空，检索仍按正文命中。返回新 id 或 0。"""
+        fact = _clip_sentence(text, 160)
+        if not fact:
+            return 0
+        with self._c() as c:
+            try:
+                cur = c.execute(
+                    "INSERT INTO durable_facts(session_id,character_id,turn_end,fact,"
+                    " tags,importance,category,expires_at,speaker)"
+                    " VALUES(?,?,?,?,?,?,?,NULL,?)",
+                    (sid, cid, int(turn), fact, "[]", float(importance), "", speaker))
+            except sqlite3.IntegrityError:
+                return 0
+        return int(cur.lastrowid or 0)
+
+    # ---------- 向量：只存归一化后的 float32，召回时算点积即可 ----------
+    def put_vectors(self, kind, cid, model, items):
+        """items: [(ref_id, blob, dim)]；同一 ref 覆盖写。"""
+        with self._c() as c:
+            for ref, blob, dims in items:
+                c.execute(
+                    "INSERT OR REPLACE INTO vectors"
+                    "(kind,ref_id,character_id,model,dim,vec) VALUES(?,?,?,?,?,?)",
+                    (kind, str(ref), cid, str(model), int(dims),
+                     sqlite3.Binary(bytes(blob))))
+
+    def cards_missing_vectors(self, cid, model, limit=32):
+        """还没算过向量的卡（按创建时间倒序，新卡优先）。"""
+        with self._c() as c:
+            return c.execute(
+                "SELECT e.event_id, e.summary, e.entity_hooks FROM event_cards e"
+                " LEFT JOIN vectors v ON v.kind='card' AND v.ref_id=e.event_id"
+                " AND v.model=?"
+                " WHERE e.character_id=? AND v.ref_id IS NULL"
+                " ORDER BY e.created_at DESC LIMIT ?",
+                (str(model), cid, max(1, int(limit)))).fetchall()
+
+    def card_vectors(self, sid, cid, model):
+        """本会话已有向量的卡：[(event_id, blob, dim)]。"""
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT e.event_id, v.vec, v.dim FROM event_cards e"
+                " JOIN vectors v ON v.kind='card' AND v.ref_id=e.event_id"
+                " AND v.model=?"
+                " WHERE e.session_id=? AND e.character_id=?",
+                (str(model), sid, cid)).fetchall()
+        return [(r["event_id"], r["vec"], int(r["dim"])) for r in rows]
+
+    def sweep_vectors(self, cid):
+        """清掉已删除卡片的孤儿向量；返回清理条数。"""
+        with self._c() as c:
+            cur = c.execute(
+                "DELETE FROM vectors WHERE character_id=? AND kind='card'"
+                " AND ref_id NOT IN (SELECT event_id FROM event_cards"
+                " WHERE character_id=?)", (cid, cid))
+        return max(0, cur.rowcount)
 
     def latest_sid(self, base_sid, cid):
         """某会话最新 epoch 的 sid；事件卡按 session_id 存，合并要落在当前 epoch。"""
@@ -1115,6 +1356,39 @@ class RPContextMiddleware:
             logger.warning("重生成后仍违规，放行：%s", "；".join(still))
         return reply2
 
+    def _vector_recall(self, sid, cid, query, cards, exclude, limit=4):
+        """语义召回：查询向量 vs 本会话卡向量（bge-m3）。
+
+        未配置 / 服务故障 / 还没回填时返回空列表，调用方自动只用钩子召回。
+        只补钩子漏掉的语义近邻，阈值定在 0.40：更低的多数是「同一话题、不同事件」。
+        """
+        if not query or not embedding.enabled() or not cards:
+            return []
+        qv = embedding.embed_query(query)
+        if not qv:
+            return []
+        table, skip, scored = {c["event_id"]: c for c in cards}, set(exclude), []
+        try:
+            rows = self.db.card_vectors(sid, cid, embedding.model_name())
+        except Exception as e:                      # noqa: BLE001 向量读失败不能拦住前台
+            logger.warning("读取事件卡向量失败：%s", e)
+            return []
+        for eid, blob, dims in rows:
+            c = table.get(eid)
+            if not c or eid in skip:
+                continue
+            if (c.get("knowledge_boundary") or "both") == "player":
+                continue
+            if retriever.suspicious(c["summary"]):
+                continue
+            cos = embedding.dot(qv, blob, dims)
+            if cos < 0.40:
+                continue
+            scored.append((cos, c))
+        scored.sort(key=lambda x: (x[0], x[1].get("importance", 0.5),
+                                   x[1].get("turn_end", 0)), reverse=True)
+        return scored[:max(1, int(limit))]
+
     def _build_messages(self, persona, sid, cid, upto=None, query=""):
         lg, cursor = self._ledger(sid, cid), self.db.get_cursor(sid, cid)
         floor = max(cursor, self._floor.get((sid, cid), 0))   # 手术挤出过的轮次不再回到 prompt
@@ -1169,6 +1443,14 @@ class RPContextMiddleware:
                 | {c["event_id"] for _, c in hits})
             hits += [(s, c) for s, c in extra
                      if not retriever.suspicious(c["summary"])]
+        # 语义召回：钩子只认字面，改口/同义说法会漏；用 bge-m3 向量补长尾，
+        # 再按名次融合，两路都命中的卡排最前。未配置或服务故障时自动退回钩子。
+        vec = self._vector_recall(
+            sid, cid, query, all_cards,
+            shown | {c["event_id"] for c in strict} | {c["event_id"] for _, c in hits},
+            limit=self.recall_limit)
+        if vec:
+            hits = retriever.fuse(hits, vec, limit=max(2, self.recall_limit))
         if facts:
             anchors[1]["content"] += "\n已记录事实（长期有效）：" + "；".join(facts)
         # 让前台明确知道自己有一整套记忆库：相关的必须先查，查不到才说不记得
@@ -1399,15 +1681,26 @@ class RPContextMiddleware:
             cat = next((index[i]["category"] for i in ids
                         if index[i]["category"] == "设定"),
                        index[keep]["category"] or "")
-            removed = 0
+            sources = [{"id": int(index[i]["id"]),
+                        "turn_end": int(index[i].get("turn_end") or 0),
+                        "date": _mmdd(index[i].get("created_at")),
+                        "fact": str(index[i]["fact"]),
+                        "speaker": str(index[i].get("speaker") or ""),
+                        "tags": _fact_tags(index[i]["tags"])}
+                       for i in ids]
+            removed, log_id = 0, 0
             if apply:
                 removed = self.db.apply_fact_merge(
                     cid, index[keep]["id"],
                     [index[i]["fact"] for i in ids if i != keep],
                     fact, tags, imp, cat, exp)
+                base = str(index[keep].get("session_id") or "").split("#")[0]
+                log_id = self.db.log_merge("fact", base, cid, index[keep]["id"],
+                                           fact, sources)
             used.update(index[i]["id"] for i in ids)
-            reports.append({"ids": ids, "fact": fact, "tags": tags,
-                            "removed": removed})
+            reports.append({"ids": ids, "keep_id": index[keep]["id"], "fact": fact,
+                            "tags": tags, "removed": removed, "sources": sources,
+                            "log_id": log_id})
         return reports
 
     def merge_cards(self, sid, cid, apply=False, batch=80, overlap=20):
@@ -1466,14 +1759,26 @@ class RPContextMiddleware:
             lo = min(int(index[i]["turn_start"]) for i in ids)
             hi = max(int(index[i]["turn_end"]) for i in ids)
             imp = max(float(index[i]["importance"] or 0.5) for i in ids)
-            removed = 0
+            sources = [{"event_id": index[i]["event_id"],
+                        "turn_start": int(index[i]["turn_start"]),
+                        "turn_end": int(index[i]["turn_end"]),
+                        "date": _mmdd(index[i].get("created_at")),
+                        "summary": retriever.clean_text(index[i]["summary"], 160),
+                        "boundary": str(index[i].get("knowledge_boundary") or "both")}
+                       for i in ids]
+            removed, dropped, log_id, keep_id = 0, [], 0, index[keep]["event_id"]
             if apply:
-                removed = self.db.apply_card_merge(
-                    cid, index[keep]["event_id"],
+                removed, dropped = self.db.apply_card_merge(
+                    cid, keep_id,
                     [index[i]["event_id"] for i in ids if i != keep],
                     summary, lo, hi, imp)
+                real = set(dropped) | {keep_id}
+                log_id = self.db.log_merge(
+                    "card", str(sid).split("#")[0], cid, keep_id, summary,
+                    [s for s in sources if s["event_id"] in real])
             used.update(index[i]["event_id"] for i in ids)
-            reports.append({"ids": ids, "summary": summary, "removed": removed})
+            reports.append({"ids": ids, "keep_id": keep_id, "summary": summary,
+                            "removed": removed, "sources": sources, "log_id": log_id})
         return reports
 
     def _inherit_longterm(self, old_sid, sid, cid):
@@ -1577,6 +1882,40 @@ class RPContextMiddleware:
             return
         if self.db.pin_card(hits[0][1]["event_id"], sid, cid, reason=text):
             logger.info("跨会话 pin：%s <- %s", hits[0][1]["event_id"], text[:40])
+
+    def warm_vectors(self, cid, limit=24):
+        """给还没向量的卡补 bge-m3 向量；返回本次补了几张。
+
+        由后台定时任务调用，不阻塞回复。单次上限 24 条，整库很快就追平。
+        """
+        if not embedding.enabled():
+            return 0
+        model = embedding.model_name()
+        rows = self.db.cards_missing_vectors(cid, model, limit)
+        if not rows:
+            return 0
+        texts = []
+        for r in rows:
+            try:
+                hooks = json.loads(r["entity_hooks"] or "[]")
+            except (TypeError, ValueError):
+                hooks = []
+            hooks = [str(h) for h in hooks if str(h).strip()][:6]
+            texts.append(str(r["summary"]) + ("（" + "、".join(hooks) + "）" if hooks else ""))
+        try:
+            vecs = embedding.embed_documents(texts)
+        except embedding.EmbeddingError as e:
+            logger.info("事件卡向量回填失败，等下一轮：%s", e)
+            return 0
+        items = []
+        for r, vec in zip(rows, vecs):
+            try:
+                items.append((r["event_id"], embedding.pack(vec), embedding.dim()))
+            except embedding.EmbeddingError:
+                continue
+        if items:
+            self.db.put_vectors("card", cid, model, items)
+        return len(items)
 
     def _loop(self):
         while True:

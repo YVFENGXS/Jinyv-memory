@@ -8,9 +8,10 @@
         R12 停用字与追问判定 / R13 规则召回注入 strict 卡 /
         R14 同批建兑不误报 / R15 候选清单一致性 / R16 空区间单事务
 """
-import json, math, sqlite3, time
+import json, math, os, sqlite3, time
 from pathlib import Path
 
+import embedding
 import retriever
 from rp_skeleton import DB, RPContextMiddleware, est_tokens
 from demo import MockFront, MockBack, PERSONA, SCRIPT
@@ -1121,6 +1122,134 @@ def test_migrate_stage1_db():
     print("老库迁移: OK 5 列补齐，默认值可读")
 
 
+class MergeAllBack:
+    """固定把前两项并成一组：覆盖合并落库、来源留档与日志读取。"""
+
+    def __init__(self, kind):
+        self.kind = kind
+
+    def chat(self, messages, **kwargs):
+        if self.kind == "card":
+            return json.dumps({"groups": [{
+                "ids": [1, 2], "keep": 1,
+                "summary": "主人把旧伞收好，也把铺子的秘密说给了客人"}]},
+                ensure_ascii=False)
+        return json.dumps({"groups": [{
+            "ids": [1, 2], "keep": 1,
+            "fact": "主人养了一只橘猫叫团子", "tags": ["猫", "团子"]}]},
+            ensure_ascii=False)
+
+
+def test_merge_log_and_card_crud():
+    """合并留档 + 事件卡 CRUD：来源可查、卡可增删改查、向量随删改失效。"""
+    mw, _ = run_session("/tmp/rp_card_crud.db", "s1", SCRIPT)
+    db = mw.db
+    mw.back = MergeAllBack("card")
+    groups = mw.merge_cards("s1", "c1", True)
+    assert len(groups) == 1, groups
+    g = groups[0]
+    assert g["removed"] == 1 and g["log_id"] > 0, g
+    assert len(g["sources"]) == 2, g["sources"]
+    log = db.get_merge_log(g["log_id"], "c1")
+    assert log["kind"] == "card" and len(log["sources"]) == 2
+    assert log["merged"] == g["summary"]
+    assert {s["event_id"] for s in log["sources"]} == \
+        {s["event_id"] for s in g["sources"]}
+    assert db.count_cards("s1", "c1") == 3
+
+    cards, total = db.card_page("s1", "c1")
+    assert total == 3 and len(cards) == 3
+    _, hits = db.card_page("s1", "c1", keyword="旧伞")
+    assert hits >= 1, hits
+
+    turn = db.next_turn("s1", "c1") + 1
+    eid = db.add_card("s1", "c1", "主人喜欢桂花茶，秋天常泡一壶", turn=turn)
+    assert db.find_cards(eid[:8], "c1")[0]["event_id"] == eid
+    assert db.find_cards(eid[:8], "c1")[0]["entity_hooks"], "手工卡应有兜底钩子"
+
+    old, ok = db.update_card(eid, "c1", "主人喜欢乌龙茶")
+    assert ok and "桂花" in old
+    dims = embedding.dim()
+    blob = embedding.pack([1.0] * dims)
+    db.put_vectors("card", "c1", "test", [(eid, blob, dims)])
+    assert [x[0] for x in db.card_vectors("s1", "c1", "test")] == [eid]
+    assert eid not in {r["event_id"] for r in db.cards_missing_vectors("c1", "test")}
+
+    db.update_card(eid, "c1", "主人喜欢白茶")
+    assert db.card_vectors("s1", "c1", "test") == []
+    db.put_vectors("card", "c1", "test", [(eid, blob, dims), ("ghost", blob, dims)])
+    assert db.sweep_vectors("c1") == 1
+    body, ok = db.delete_card(eid, "c1")
+    assert ok and "白茶" in body
+    assert db.find_cards(eid, "c1") == []
+    assert db.sweep_vectors("c1") == 0
+    print("合并留档 + 事件卡 CRUD: OK 来源 2 条 / 增删改查 / 向量随删改失效")
+
+
+def test_fact_merge_log_and_edit():
+    """词条合并留档 + 词条增删改：撞唯一键不覆盖，日志能查到原始词条。"""
+    mw, _ = run_session("/tmp/rp_fact_crud.db", "s1", SCRIPT)
+    db = mw.db
+    f1 = db.add_fact("s1", "c1", "主人养了猫", turn=20, speaker="user")
+    f2 = db.add_fact("s1", "c1", "主人养了一只猫", turn=21, speaker="user")
+    assert f1 and f2
+    mw.back = MergeAllBack("fact")
+    groups = mw.merge_facts("s1", "c1", True)
+    assert len(groups) == 1, groups
+    g = groups[0]
+    assert g["removed"] == 1 and g["log_id"] > 0
+    assert g["keep_id"] == f1, g
+    log = db.get_merge_log(g["log_id"], "c1")
+    assert log["kind"] == "fact" and len(log["sources"]) == 2
+    assert {s["id"] for s in log["sources"]} == {f1, f2}
+
+    old, n = db.update_fact(f1, "c1", "主人养了一只白猫")
+    assert n == 1 and old == "主人养了一只橘猫叫团子", (old, n)
+    f3 = db.add_fact("s1", "c1", "主人喜欢桂花", turn=22, speaker="user")
+    assert f3
+    old, n = db.update_fact(f1, "c1", "主人喜欢桂花")
+    assert n == 0 and "白猫" in old, (old, n)
+    assert db.add_fact("s1", "c1", "主人喜欢桂花", speaker="user") == 0
+    rows, total = db.merge_logs("c1", "fact")
+    assert total >= 1 and rows[0]["kind"] == "fact"
+    print("词条合并留档 + 增删改: OK 来源 2 条 / 撞唯一键不覆盖 / 日志可查")
+
+
+def test_fuse_and_embedding_math():
+    """RRF 融合排序 + 归一化点积 + 未配置时安全降级。"""
+    def card(eid, imp=0.5, te=1):
+        return {"event_id": eid, "importance": imp, "turn_end": te, "summary": eid}
+
+    out = retriever.fuse([(0.9, card("A")), (0.8, card("B"))],
+                         [(0.7, card("B")), (0.6, card("C"))])
+    assert [c["event_id"] for _, c in out] == ["B", "A", "C"], out
+    tie = retriever.fuse([(0.9, card("X", 0.9))], [(0.8, card("Y", 0.1))])
+    assert tie[0][1]["event_id"] == "X"                 # 同分时 importance 高者优先
+
+    dims = embedding.dim()
+    a = [0.0] * dims
+    a[0], a[1] = 3.0, 4.0
+    blob = embedding.pack(a)
+    assert abs(embedding.dot(embedding._normalize(a), blob, dims) - 1.0) < 1e-3
+    b = [0.0] * dims
+    b[0], b[1] = 4.0, 3.0
+    cos = embedding.dot(embedding._normalize(b), blob, dims)
+    assert 0.95 < cos < 1.0, cos
+    assert embedding.dot(embedding._normalize(a), b"bad", dims) == 0.0
+
+    old = os.environ.get("RP_EMBED")
+    os.environ["RP_EMBED"] = "0"
+    try:
+        assert embedding.enabled() is False
+        assert embedding.embed_query("桂花") is None
+    finally:
+        if old is None:
+            os.environ.pop("RP_EMBED", None)
+        else:
+            os.environ["RP_EMBED"] = old
+    print("RRF 融合 + 嵌入数学: OK 排序 / 余弦=1 / 坏数据归零 / 关闭时降级")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -1145,6 +1274,8 @@ if __name__ == "__main__":
                test_closed_slot_values, test_unmapped_values_observed,
                test_watermark_levels_and_surgery, test_forced_archive_on_hard,
                test_claims_validated_and_capped, test_idle_epoch_rotation,
-               test_retry_backoff_bounds, test_time_awareness, test_migrate_stage1_db):
+               test_retry_backoff_bounds, test_time_awareness, test_migrate_stage1_db,
+               test_merge_log_and_card_crud, test_fact_merge_log_and_edit,
+               test_fuse_and_embedding_math):
         fn()
     print("\nall regression tests passed")
