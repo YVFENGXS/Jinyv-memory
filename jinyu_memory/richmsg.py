@@ -926,6 +926,16 @@ def save_and_tag(data: bytes, extra_tags: Optional[List[str]] = None,
 # ---------------------------------------------------------------- 搜图
 
 _BING_URL = "https://cn.bing.com/images/search?q={q}&form=HDRSC2&first=1"
+_BAIDU_HOME = "https://image.baidu.com/"
+_BAIDU_API = "https://image.baidu.com/search/acjson"
+_BAIDU_PAGE = "https://image.baidu.com/search/index?tn=baiduimage&word={q}"
+_BAIDU_WARM = ("https://www.baidu.com/", "https://image.baidu.com/")
+_BAIDU_CACHE_TTL = 600          # 同一关键词 10 分钟内复用，别反复戳接口
+_BAIDU_MIN_GAP = 1.5            # 两次接口请求的最小间隔，避免被判成爬虫
+_baidu_session = {"client": None, "ts": 0.0}
+_baidu_next = 0.0
+_baidu_cache = {}
+_baidu_lock = threading.Lock()
 _MURL_RE = re.compile(r'murl&quot;:&quot;(https?://[^&"]+)')
 _MURL_RE2 = re.compile(r'"murl"\s*:\s*"(https?://[^"]+)"')
 # 真实结果项的锚点；顶部的联想词/相关搜索块不在 a.iusc 里，按结构取就不会
@@ -945,6 +955,118 @@ def _bing_image_urls(page: str) -> list[str]:
         return urls
     blob = html_mod.unescape(page)
     return _MURL_RE2.findall(blob) + _MURL_RE.findall(page)
+
+
+def _baidu_client(force: bool = False):
+    """百度图片接口要 BAIDUID cookie：先访问首页拿一份，缓存一小时。
+
+    只带 UA 时 acjson 会直接回 {"antiFlag":1,"message":"Forbid spider access"}；
+    补上 Accept / Accept-Language，并确认首页真的发了 BAIDUID，才算建好会话。
+    """
+    now = time.time()
+    with _baidu_lock:
+        if force:
+            cached = _baidu_session["client"]
+            if cached is not None:
+                cached.close()
+            _baidu_session.update(client=None, ts=0.0)
+        cached = _baidu_session["client"]
+        if cached is not None and now - _baidu_session["ts"] < 3600:
+            return cached
+        try:
+            import httpx
+            client = httpx.Client(
+                timeout=20, follow_redirects=True,
+                headers={
+                    "User-Agent": UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;"
+                              "q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                })
+            for warm in _BAIDU_WARM:       # 先百度主站拿 BIDUPSID/PSTM，再补图片站 cookie
+                client.get(warm)
+                if warm == _BAIDU_WARM[0] and not client.cookies.get("BAIDUID"):
+                    break
+        except Exception as exc:                # noqa: BLE001 拿不到就退回必应
+            logger.info("百度图片会话建立失败：%s", exc)
+            return None
+        if not client.cookies.get("BAIDUID"):
+            logger.info("百度图片会话没有拿到 BAIDUID，本轮改用必应")
+            client.close()
+            return None
+        _baidu_session.update(client=client, ts=now)
+        return client
+
+
+def _baidu_image_urls(query: str) -> list[str]:
+    """百度图片结果直链。
+
+    用户给的那个 index 页面是 JS 渲染的空壳，真正的结果在它背后的 acjson
+    接口里；这里带上同一组参数直接请求接口，省掉浏览器。同一关键词缓存 10
+    分钟，两次请求至少隔 1.5 秒，尽量不触发风控；被拦就重建会话再试一次，
+    仍失败返回空，由调用方退回必应。
+    """
+    global _baidu_next
+    from urllib.parse import quote
+    with _baidu_lock:
+        hit = _baidu_cache.get(query)
+        if hit and time.time() - hit[0] < _BAIDU_CACHE_TTL:
+            return list(hit[1])
+    params = {
+        "tn": "resultjson_com", "ipn": "rj", "ct": "201326592",
+        "is": "", "fp": "result", "fr": "", "word": query, "queryWord": query,
+        "cl": "2", "lm": "-1", "ie": "utf-8", "oe": "utf-8", "st": "-1",
+        "z": "", "ic": "0", "hd": "", "latest": "", "copyright": "",
+        "s": "", "se": "", "tab": "", "width": "", "height": "", "face": "0",
+        "istype": "2", "qc": "", "nc": "1", "expermode": "", "nojc": "",
+        "pn": "0", "rn": "30", "gsm": "1e",
+    }
+    blocked = ""
+    for attempt in range(2):
+        client = _baidu_client(force=attempt > 0)
+        if client is None:
+            return []
+        with _baidu_lock:
+            wait = _baidu_next - time.time()
+            _baidu_next = max(time.time(), _baidu_next) + _BAIDU_MIN_GAP
+        if wait > 0:
+            time.sleep(min(wait, 3.0))
+        try:
+            resp = client.get(_BAIDU_API, params=params,
+                              headers={"Referer": _BAIDU_PAGE.format(q=quote(query))})
+            data = resp.json()
+        except Exception as exc:                # noqa: BLE001
+            logger.info("百度图片接口失败 q=%r：%s", query, exc)
+            return []
+        if isinstance(data, dict) and data.get("antiFlag"):
+            blocked = str(data.get("message") or "antiFlag")
+            continue                            # 重建会话再试一次
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            logger.info("百度图片接口无结果 q=%r：%s", query, str(data)[:120])
+            return []
+        urls = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("adType") or "0") != "0":   # 广告位
+                continue
+            url = str(item.get("middleURL") or item.get("thumbURL") or "")
+            if url.startswith("http") and url not in urls:
+                urls.append(url)
+        with _baidu_lock:
+            if len(_baidu_cache) >= 64:         # 只留最近的，避免无限增长
+                _baidu_cache.clear()
+            _baidu_cache[query] = (time.time(), list(urls))
+        return urls
+    logger.info("百度图片接口被风控 q=%r：%s，本轮改用必应", query, blocked)
+    return []
+
+
+def _is_baidu_image(url: str) -> bool:
+    """百度图片 CDN 的直链没有扩展名，不能按 .jpg/.png 过滤。"""
+    host = (urlparse(url).hostname or "").lower()
+    return host.endswith(".baidu.com") and "/it/u=" in url
 
 
 # 素材/图库站常带水印，直链能过 SSRF 校验但不是表情包；先按域名跳过，省下载和判读
@@ -1106,36 +1228,56 @@ def _search_variants(query: str, mode: str = "image") -> List[str]:
 
 
 def image_search(query: str) -> Optional[str]:
-    """必应图片搜索：逐张下载 + 后台视觉校验，返回第一张合格的图片直链。
+    """图片搜索，只要直链。"""
+    return _image_search(query)[0]
 
-    以前取第一张能打开的图就发，图库素材照（带水印的写实照片）也会被当成
-    表情包发出去。现在每个候选都要过三关：视觉判读切题且可用、不是素材站/
+
+def image_search_info(query: str) -> tuple[Optional[str], dict]:
+    """图片搜索，连同视觉判读一起返回。
+
+    工具调用要先知道「搜到的是什么样的图」再开口，否则前台只能瞎猜画面。
+    """
+    return _image_search(query)
+
+
+def _image_search(query: str) -> tuple[Optional[str], dict]:
+    """图片搜索：先百度、失败退回必应；逐张下载 + 后台视觉校验，返回第一张合格直链。
+
+    百度那个 index 页面是 JS 空壳，真正结果从 acjson 接口取；必应只取
+    a.iusc 里的真实结果。每个候选都要过三关：视觉判读切题且可用、不是素材站/
     水印图、画面描述和关键词对得上；不合格换下一张或换关键词重搜，全不合格
-    返回 None。画风不再设限，只核对内容是否切题。
+    返回 (None, {})。画风不再设限，只核对内容是否切题。
     """
     mode = _search_mode(query)
     terms = _search_variants(query, mode)
     if not terms:
-        return None
+        return None, {}
     from urllib.parse import quote
     seen, seen_hash, tried = set(), set(), 0
     for term in terms:
         per = 0
-        try:
-            import httpx
-            resp = httpx.get(_BING_URL.format(q=quote(term)),
-                             headers={"User-Agent": UA}, timeout=20,
-                             follow_redirects=True)
-            page = resp.text
-        except Exception:                 # noqa: BLE001
-            continue
-        urls = _bing_image_urls(page)
+        urls = _baidu_image_urls(term)
+        engine = "百度"
+        if not urls:
+            engine = "必应"
+            try:
+                import httpx
+                resp = httpx.get(_BING_URL.format(q=quote(term)),
+                                 headers={"User-Agent": UA}, timeout=20,
+                                 follow_redirects=True)
+                urls = _bing_image_urls(resp.text)
+            except Exception:             # noqa: BLE001
+                continue
+        if urls:
+            logger.info("搜图候选 q=%r 引擎=%s 共=%d", term, engine, len(urls))
         for u in urls:
             if u in seen:
                 continue
             seen.add(u)
             low = urlparse(u).path.lower()
-            if not any(low.endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp", ".gif")):
+            if (not any(low.endswith(e) for e in
+                        (".jpg", ".jpeg", ".png", ".webp", ".gif"))
+                    and not _is_baidu_image(u)):
                 continue
             if not url_is_public(u) or _is_stock(u):
                 continue
@@ -1173,11 +1315,11 @@ def image_search(query: str) -> Optional[str]:
                 continue
             logger.info("搜图命中 q=%r 模式=%s 主体=%.2f desc=%r", term, mode, score,
                         info.get("desc"))
-            return u
+            return u, info
         if tried >= SEARCH_MAX_CANDIDATES:
             break
     logger.info("搜图无合格结果 q=%r 模式=%s 已判读 %d 张", query, mode, tried)
-    return None
+    return None, {}
 
 
 # ---------------------------------------------------------------- TTS
@@ -1322,6 +1464,9 @@ def rich_hint() -> str:
 - [[search:两三个关键词]] 搜一张贴合语境的图发出来：要表情包/梗图就在末尾写
   「表情包」；主人要照片、风景、插画、原画、壁纸时按内容原样写，别加「表情包」
   和「二次元」（例如 [[search:北京 风景照]]、[[search:原神 插画]]）
+  本轮工具列表里如果有 search_image，要发图就调用它：它会先把画面描述返回给你，
+  你按描述说话，图由插件附上；这时不要再写 [[search:...]]。只有没有这个工具时
+  才用标记。
 - [[voice:要说的话]] 用语音说
 - [[img:https://图片直链]] 只发确定真实存在的直链（不确定就用 search）
 只在以下时机使用，其余时候一律纯文字：

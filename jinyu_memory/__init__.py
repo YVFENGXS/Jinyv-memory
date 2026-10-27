@@ -131,6 +131,7 @@ from richmsg import (                                       # noqa: E402
     fix_sticker,
     image_segment,
     image_search,
+    image_search_info,
     list_stickers,
     list_tags,
     pick_sticker,
@@ -257,6 +258,31 @@ def _tool_set_reminder(args, sid, cid, ctx=None) -> str:
     return f"已登记：{plan.get('content') or '到点提醒'}，将在 {plan['when']} 提醒。"
 
 
+def _tool_search_image(args, sid, cid, ctx=None) -> str:
+    """工具 search_image：先搜到图、拿到画面描述，再让前台开口。
+
+    以前只有 [[search:...]] 标记：图是在回复生成之后才搜的，前台根本不知道
+    自己发出去的是什么画面，只能说「瑾瑜搜了一张」。改成工具后，搜图发生在
+    生成之前，模型可以按 desc 描述，图片由插件在回复后附上。
+    """
+    query = str((args or {}).get("query") or "").strip()
+    if not query:
+        return "缺少搜索关键词，写清楚画面内容再试。"
+    if ctx is not None and ctx.get("image"):
+        return "这一轮已经搜好一张图了，不要再搜，按刚才那张的画面说。"
+    url, info = image_search_info(query)
+    if not url:
+        return "没搜到合适的图。回复里别答应发图，可以换个更具体的词再试一次。"
+    desc = str(info.get("desc") or "").strip()
+    kind = str(info.get("kind") or "").strip()
+    if ctx is not None:
+        ctx["image"] = url
+    logger.info(f"[jinyu] 工具搜图 sid={sid} 词={query!r} 画面={desc!r}")
+    return (f"图已经准备好了，会随这条回复发出：{kind}，画面是「{desc}」。"
+            "回复里按这个画面对照说，不要编图里没有的东西；"
+            "不要再输出搜图标记，否则会再发一张。")
+
+
 def _mcp_handler(mgr, tool_name: str):
     """MCP 工具的同步适配器：异常交给 _run_tool 统一降级。"""
     def handler(args, sid, cid, ctx=None) -> str:
@@ -284,6 +310,17 @@ def _install_tools(inst) -> None:
                                  "description": "到点要说或要做的事，写清楚"}},
          "required": ["when", "what"]},
         _tool_set_reminder)
+    inst.register_tool(
+        "search_image",
+        "搜一张图并直接发给主人：先拿到这张图的画面描述，再组织回复。"
+        "主人要表情包、梗图、照片、插画，或你想配一张图时调用。"
+        "关键词按画面内容写；要表情包就在末尾写「表情包」。"
+        "调用后按返回的画面描述说话，不要再写 [[search:...]]。",
+        {"type": "object",
+         "properties": {"query": {"type": "string",
+                                  "description": "搜索关键词，按画面内容写"}},
+         "required": ["query"]},
+        _tool_search_image)
     if mcp_mgr is None:
         return
     for spec in mcp_mgr.tool_specs():
@@ -2480,12 +2517,13 @@ async def _handle(event: MessageEvent):
             t0 = loop.time()
             speaker = (_social_label(event) if SOCIAL_ON
                        else (_speaker(event) if is_group else ""))
+            tool_ctx = {"user_id": int(event.user_id),
+                        "group_id": int(getattr(event, "group_id", 0) or 0),
+                        "reminded": False}
             reply = await asyncio.to_thread(
                 mw.chat, text, persona, session_sid, CID,
                 (lambda r: _strip_speaker_prefix(r, speaker)) if speaker else None,
-                {"user_id": int(event.user_id),
-                 "group_id": int(getattr(event, "group_id", 0) or 0),
-                 "reminded": False})
+                tool_ctx)
             logger.info(f"[jinyu] 前台生成 sid={session_sid} "
                         f"群={getattr(event, 'group_id', None) or '私聊'} "
                         f"用户={event.user_id} "
@@ -2507,3 +2545,11 @@ async def _handle(event: MessageEvent):
     for kind, body in posts:
         asyncio.create_task(_run_social(kind, body, event))
     await _send_rich(reply)
+    image = str(tool_ctx.get("image") or "")
+    # 工具已经搜好图，文字说完再附图；模型若又写了 search/img 标记就让标记那条发，
+    # 避免同一轮重复两张
+    if image and reply.strip() and not re.search(r"\[\[\s*(search|img)\s*:", reply, re.I):
+        try:
+            await matcher.send(Message(MessageSegment.image(image)))
+        except Exception as exc:          # noqa: BLE001 附图失败不影响已发出的文字
+            logger.opt(exception=exc).warning(f"[jinyu] 工具搜图发送失败: {exc}")
