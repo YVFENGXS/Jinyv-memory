@@ -213,6 +213,29 @@ def retrieve(cards, text, limit=2, exclude_ids=()):
     return scored[:limit]
 
 
+def fuse(keyword_hits, vector_hits, limit=None):
+    """RRF 融合钩子召回与语义召回：两路各自排名，同时命中的卡自然靠前。
+
+    分数尺度不同（钩子 0.6~4.0，余弦 0~1），直接相加会让钩子永远压死语义，
+    所以只按名次融合；并列时用热力与时间兜底，保证结果稳定。
+    """
+    k, scores, cards = 20.0, {}, {}
+    for rank, (_, c) in enumerate(keyword_hits, 1):
+        eid = c["event_id"]
+        cards[eid] = c
+        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
+    for rank, (_, c) in enumerate(vector_hits, 1):
+        eid = c["event_id"]
+        cards[eid] = c
+        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
+    out = sorted(scores.items(),
+                 key=lambda x: (x[1], cards[x[0]].get("importance", 0.5),
+                                cards[x[0]].get("turn_end", 0)), reverse=True)
+    if limit:
+        out = out[:limit]
+    return [(s, cards[eid]) for eid, s in out]
+
+
 def card_date(card):
     """事件卡 created_at（SQLite UTC）→ 本地「月-日」；坏值返回空串。"""
     try:
