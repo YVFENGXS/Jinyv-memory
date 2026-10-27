@@ -4,7 +4,7 @@
 支持的标记（写在回复正文里即可）：
 
     [[img:https://example.com/a.jpg]]   发送网络图片
-    [[search:关键词]]                    服务端搜图（必应），发第一张可用结果
+    [[search:关键词]]                    服务端搜图（必应），逐张视觉校验后发合格结果
     [[sticker:标签]]                     从本地贴纸库按标签挑一张
     [[face:14]]                         原生 QQ 表情（数字 id，直传不校验）
     [[voice:要念的文字]]                 文字转语音后以语音发送
@@ -26,6 +26,7 @@ import hashlib
 import html as html_mod
 import ipaddress
 import json
+import logging
 import os
 import random
 import re
@@ -38,6 +39,8 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
+logger = logging.getLogger("jinyu_memory.richmsg")
 
 MARKER_RE = re.compile(r"\[\[(img|sticker|face|voice|search):(.+?)\]\]", re.S)
 CTRL = re.compile(r"[\u0000-\u001f\u202a-\u202e\u2066-\u2069]")   # 控制符/bidi 清洗
@@ -204,6 +207,109 @@ def add_sticker_from_url(url: str, tags: List[str]) -> Optional[Path]:
         return add_sticker_bytes(resp.content, tags)
     except Exception:                     # noqa: BLE001
         return None
+
+
+# ---------------------------------------------------------------- 感知去重
+# 同一张表情包多次发送时，QQ 图床会重新编码（甚至换分辨率），字节 md5 不同
+# 但画面一样，只按 md5 去重会往库里堆同一张图。入库前先算 8x8 差分哈希
+# （dhash）找候选，再用 64x64 灰度平均差复核，确认同图就复用已有文件。
+PHASH_NEAR = 6          # dhash 汉明距离上限：重编码/缩放通常不超过 4
+PHASH_MAE = 8.0         # 灰度平均差上限，排除「构图相似的不同图」
+
+
+def _dhash(data: bytes) -> Optional[int]:
+    """首帧灰度 8x8 差分哈希；动图只取首帧，解析失败返回 None。"""
+    try:
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            im.seek(0)
+            gray = im.convert("L").resize((9, 8), Image.LANCZOS).tobytes()
+    except Exception:                     # noqa: BLE001
+        return None
+    bits = 0
+    for row in range(8):
+        base = row * 9
+        for col in range(8):
+            bits = (bits << 1) | (1 if gray[base + col] > gray[base + col + 1] else 0)
+    return bits
+
+
+def _gray64(data: bytes) -> Optional[bytes]:
+    try:
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            im.seek(0)
+            return im.convert("L").resize((64, 64), Image.LANCZOS).tobytes()
+    except Exception:                     # noqa: BLE001
+        return None
+
+
+def _pixel_mae(a: bytes, b: bytes) -> float:
+    if len(a) != len(b):
+        return 255.0
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
+def _ensure_phashes() -> None:
+    """给库里还没有 phash 的图片补齐（手工放进目录的图也能参与去重）。"""
+    d = sticker_dir()
+    if not d.is_dir():
+        return
+    store = _load_meta()
+    changed = False
+    for p in d.iterdir():
+        if not p.is_file() or p.suffix.lower() not in IMG_EXT:
+            continue
+        if (store.get(p.name) or {}).get("phash"):
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        ph = _dhash(data)
+        if ph is None:
+            continue
+        store.setdefault(p.name, {})["phash"] = f"{ph:016x}"
+        changed = True
+    if changed:
+        _save_meta(store)
+
+
+def _find_duplicate(data: bytes, ph: Optional[int]) -> Optional[str]:
+    """找同一张图的已有文件（只是编码/分辨率不同），返回文件名或 None。"""
+    if ph is None:
+        return None
+    d = sticker_dir()
+    store = _load_meta()
+    hits = []
+    for name, m in store.items():
+        raw = m.get("phash")
+        if not raw or not (d / name).is_file():
+            continue
+        try:
+            dist = bin(int(raw, 16) ^ ph).count("1")
+        except ValueError:
+            continue
+        if dist <= PHASH_NEAR:
+            hits.append((dist, name))
+    if not hits:
+        return None
+    mine = None
+    for _, name in sorted(hits)[:5]:
+        try:
+            other_data = (d / name).read_bytes()
+        except OSError:
+            continue
+        if mine is None:
+            mine = _gray64(data)
+            if mine is None:
+                return None
+        other = _gray64(other_data)
+        if other is not None and _pixel_mae(mine, other) <= PHASH_MAE:
+            return name
+    return None
 
 
 def _is_usable(name: str, meta: Dict[str, dict]) -> bool:
@@ -530,7 +636,13 @@ def prepare_image_for_vision(data: bytes) -> bytes:
         return data
 
 
-def _vision_call(data: bytes, prompt: str) -> str:
+def _brief_text(value, limit: int = 600) -> str:
+    """日志用：压成一行并截断，图片 base64 永远不进日志。"""
+    text = " ".join(str(value or "").split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _vision_call(data: bytes, prompt: str, label: str = "图片判读") -> str:
     """一次视觉请求：推理型模型会把预算花在思考上，截断就加倍重试。"""
     key = _front_key()
     if not key:
@@ -540,6 +652,8 @@ def _vision_call(data: bytes, prompt: str) -> str:
     b64 = base64.b64encode(data).decode()
     want = 6000
     content = ""
+    logger.info("[jinyu] 后台模型 视觉入参 用途=%s 模型=%s 提示词=%r",
+                label, _tag_model(), _brief_text(prompt))
     for _ in range(3):
         payload = {
             "model": _tag_model(),
@@ -562,11 +676,15 @@ def _vision_call(data: bytes, prompt: str) -> str:
         content = (choice.get("message", {}).get("content") or "").strip()
         finish = choice.get("finish_reason")
         if content and finish != "length":
+            logger.info("[jinyu] 后台模型 视觉出参 用途=%s %r", label,
+                        _brief_text(content))
             return content
         if finish == "length" and want < 16000:
             want *= 2
             continue
         if content:
+            logger.info("[jinyu] 后台模型 视觉出参 用途=%s %r", label,
+                        _brief_text(content))
             return content                   # 截断且预算到顶：交给调用方判错
         time.sleep(1.0)
     return content
@@ -671,6 +789,8 @@ def download_image_ex(url: str) -> Tuple[Optional[bytes], str]:
 
     返回 (字节, 失败原因)，成功时原因为空串。日志带上原因，才能区分
     「链接过期」「文件太大」「网络抖动」，不用再翻服务器抓包。
+    借鉴 VimgFind 的做法：重定向后的地址重新校验，且 Content-Type 明显不是
+    图片（HTML 错误页、JSON）时直接放弃，不把整页内容当图下载。
     """
     if not url or len(url) > 500:
         return None, "地址为空或过长"
@@ -686,6 +806,9 @@ def download_image_ex(url: str) -> Tuple[Optional[bytes], str]:
                 return None, f"HTTP {resp.status_code}"
             if not host_is_public(resp.url.host):      # 重定向到内网：拒绝
                 return None, "重定向到内网地址"
+            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype.startswith("text/") or ctype in ("application/json", "application/xml"):
+                return None, f"非图片类型 {ctype}"
             buf = bytearray()
             for chunk in resp.iter_bytes():
                 buf.extend(chunk)
@@ -736,9 +859,11 @@ def _text_tags(text: str) -> List[str]:
     return [text]
 
 
-def _record_meta(name: str, info: dict, tags: List[str]) -> None:
+def _record_meta(name: str, info: dict, tags: List[str],
+                 phash: Optional[int] = None) -> None:
     """把判读结果写进 meta.json；已存在的图也要写，否则手工/重复入库的图永远没有审核记录。"""
     store = _load_meta()
+    old = store.get(name) or {}
     store[name] = {"kind": info.get("kind") or "表情包",
                    "desc": info.get("desc") or "",
                    "text": info.get("text") or "",
@@ -746,6 +871,7 @@ def _record_meta(name: str, info: dict, tags: List[str]) -> None:
                    "tags": tags,
                    "suitable": True,
                    "blocked": False,
+                   "phash": f"{phash:016x}" if phash is not None else (old.get("phash") or ""),
                    "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     _save_meta(store)
 
@@ -764,8 +890,10 @@ def save_and_tag(data: bytes, extra_tags: Optional[List[str]] = None,
     if not force and (info.get("err") or not info.get("suitable", True)):
         return None
     md5 = hashlib.md5(data).hexdigest()[:16]
+    ph = _dhash(data)
     with _STORE_LOCK:                      # 配额检查 → 入库 → 记 meta，必须原子
         d = sticker_dir()
+        _ensure_phashes()
         known = any(p.stem == md5 for p in d.iterdir()) if d.is_dir() else False
         tags = list(info.get("tags") or []) \
             + ([info["character"]] if info.get("character") else []) \
@@ -774,8 +902,16 @@ def save_and_tag(data: bytes, extra_tags: Optional[List[str]] = None,
         if known:
             path = add_sticker_bytes(data, tags)
             if path is not None:
-                _record_meta(path.name, info, tags or ["未分类"])
+                _record_meta(path.name, info, tags or ["未分类"], ph)
             return path
+        dup = _find_duplicate(data, ph)
+        if dup:
+            # 同一张图只是换了编码/分辨率：复用旧文件，只并标签，不再落盘
+            add_tags(dup, tags or ["未分类"])
+            merged = _load_tags().get(dup) or tags or ["未分类"]
+            _record_meta(dup, info, merged, ph)
+            logger.info("[jinyu] 贴纸复用 %s（同图不同编码，未重复落盘）", dup)
+            return d / dup
         if not force and autosave_quota_left() <= 0:
             return None
         path = add_sticker_bytes(data, tags or ["未分类"])
@@ -783,7 +919,7 @@ def save_and_tag(data: bytes, extra_tags: Optional[List[str]] = None,
             return None
         if not force:
             autosave_consume()
-        _record_meta(path.name, info, tags or ["未分类"])
+        _record_meta(path.name, info, tags or ["未分类"], ph)
         return path
 
 
@@ -793,39 +929,237 @@ _BING_URL = "https://cn.bing.com/images/search?q={q}&form=HDRSC2&first=1"
 _MURL_RE = re.compile(r'murl&quot;:&quot;(https?://[^&"]+)')
 _MURL_RE2 = re.compile(r'"murl"\s*:\s*"(https?://[^"]+)"')
 
+# 素材/图库站常带水印，直链能过 SSRF 校验但不是表情包；先按域名跳过，省下载和判读
+_STOCK_HOSTS = ("nipic.com", "58pic.com", "699pic.com", "veer.com",
+                "shutterstock.com", "gettyimages", "dreamstime.com",
+                "123rf.com", "alamy.com", "tuchong.com", "zcool.com.cn")
+_STOCK_MARKS = ("昵图网", "摄图网", "千图网", "我图网", "包图网", "汇图网",
+                "素材中国", "nipic", "shutterstock", "gettyimages", "水印")
+SEARCH_MAX_CANDIDATES = 8      # 一条回复最多下载并判读 8 张（含换关键词重搜），避免拖住发消息
+SEARCH_PER_VARIANT = 4         # 每个关键词变体先试 4 张，不合格再换下一个变体
+
+# 搜图意图：只有明确写了「表情包/梗图」才走表情包通道，其余一律按普通图片搜。
+# 「深圳 高楼 建筑」这种没说清类型的查询以前默认走表情包，必应返回的实拍大楼
+# 会被画风门全部拦掉，一张都发不出来。
+_STICKER_WORDS = re.compile(r"表情包|梗图|斗图|贴纸|沙雕图|meme", re.I)
+_IMAGE_WORDS = re.compile(r"风景|风景照|照片|实拍|实景|壁纸|背景图|插画|原画|"
+                          r"立绘|海报|截图|原图|高清图|图片|头像", re.I)
+
+
+def _search_mode(query: str) -> str:
+    """判断这次搜图要表情包（sticker）还是一般图片（image）。
+
+    只有明确要表情包/梗图才走 sticker，其余（包括没写清楚的）都按普通图片搜。
+    """
+    q = str(query or "")
+    if _STICKER_WORDS.search(q) and not _IMAGE_WORDS.search(q):
+        return "sticker"
+    return "image"
+
+
+def _screen_candidate(data: bytes) -> str:
+    """下载后的确定性预筛：过小图、超宽横幅、纯色卡先淘汰，省一次视觉调用。
+
+    借鉴 VimgFind「在索引阶段就把垃圾图挡在门外」的思路：它的排除规则针对本地
+    路径，这里换成对图片本身的像素统计。返回淘汰原因，空串表示通过。
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image
+    except ImportError:
+        return ""
+    try:
+        with Image.open(BytesIO(data)) as im:
+            im.seek(0)
+            w, h = im.size
+            if min(w, h) < 80:
+                return f"尺寸过小 {w}x{h}"
+            if max(w, h) / max(1, min(w, h)) > 4:
+                return f"长宽比异常 {w}x{h}"
+            small = im.convert("RGB").resize((32, 32))
+            colors = small.getcolors(1024) or []
+    except Exception as exc:                     # noqa: BLE001 解不开的图直接淘汰
+        return f"无法解析 {type(exc).__name__}"
+    if len(colors) <= 3:
+        top = sum(n for n, _ in sorted(colors, reverse=True)[:3])
+        if top / 1024 >= 0.98:                   # 98% 以上像素同色：纯色卡/渐变卡
+            return "接近纯色"
+    return ""
+
+
+def _is_stock(url: str, info: Optional[dict] = None) -> bool:
+    """图库素材站 / 带水印的图：不是表情包，直接淘汰。"""
+    host = (urlparse(url).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _STOCK_HOSTS):
+        return True
+    if info:
+        blob = f"{info.get('text') or ''} {info.get('desc') or ''}".lower()
+        return any(m in blob for m in _STOCK_MARKS)
+    return False
+
+
+_SEARCH_CHECK_PROMPT = """这是为聊天搜到的一张候选图，主人在找「{q}」相关的内容。
+仔细看，只输出一个 JSON：
+{{"ok":true,"kind":"照片","match":true,"desc":"30字内画面","text":"图中文字，没有就空串","why":"20字内"}}
+kind：照片 / 插画 / 壁纸 / 表情包 / 素材 / 其他。
+ok=true 必须同时满足：
+1. 画面主体与「{q}」对得上（要找深圳高楼，就得看得出城市高楼；
+   要找表情包，就得有对应的角色、动作、情绪或文字）；
+2. 不是图库素材样图、带水印、纯色卡、二维码、logo、图表、聊天截图；
+3. 文字不含辱骂、人身攻击、性暗示。
+match 只填 true/false：画面主体是不是「{q}」要的东西。
+画面风格不限：实拍、二次元、插画、卡通都可以，只看内容对不对。
+拿不准填 false。"""
+
+
+_QUERY_GENERIC = re.compile(r"动漫表情包|二次元|表情包|动漫|卡通|可爱|搞笑|沙雕|高清|壁纸|图片")
+_QUERY_GENERIC_IMAGE = re.compile(
+    r"风景照|风景|照片|实拍|实景|插画|原画|立绘|海报|截图|原图|高清图|图片|壁纸|头像")
+_QUERY_LEAD = re.compile(r"^(?:深|浅|亮|暗)?(?:蓝|红|金|白|黑|粉|紫|绿|灰|棕|橙|黄)色?")
+
+
+def _subject_score(query: str, info: dict, mode: str = "sticker") -> float:
+    """确定性主体核对：搜「蓝鲸」不能返回粉发少女，模型判切题也要对得上字面主体。
+
+    去掉「表情包/二次元/可爱」或「风景照/插画/图片」这类泛词和「蓝色/大」这类修饰后，
+    剩下的词至少有一半能在画面描述里找到；找不到任何字（如蓝鲸→鲸）就判 0。
+    """
+    generic = _QUERY_GENERIC_IMAGE if mode == "image" else _QUERY_GENERIC
+    terms = [t for t in re.sub(r"[\s\W_]+", " ",
+                               generic.sub(" ", query or "")).split() if t]
+    if not terms:
+        return 1.0
+    hay = " ".join([str(info.get("desc") or ""),
+                    str(info.get("character") or ""),
+                    str(info.get("text") or ""),
+                    str(info.get("kind") or ""),
+                    " ".join(info.get("tags") or [])])
+    hit = 0.0
+    for t in terms:
+        if t in hay:
+            hit += 1.0
+            continue
+        core = _QUERY_LEAD.sub("", t) or t
+        if core != t and core in hay:
+            hit += 1.0
+            continue
+        if any(ch in hay for ch in core):
+            hit += 0.5
+    return hit / len(terms)
+
+
+def _search_check(data: bytes, query: str) -> Optional[dict]:
+    """搜图候选的一次性判读：是否切题、是否可用。画风不设限。"""
+    try:
+        content = _vision_call(prepare_image_for_vision(data),
+                               _SEARCH_CHECK_PROMPT.replace("{q}", query), label="搜图校验")
+    except Exception:                     # noqa: BLE001 判不了就换下一张，宁可不发
+        return None
+    info = _json_obj(content)
+    if not isinstance(info, dict):
+        return None
+    info["text"] = CTRL.sub("", str(info.get("text") or "")).strip()[:60]
+    info["desc"] = CTRL.sub("", str(info.get("desc") or "")).strip()[:60]
+    if (not info.get("ok") or info.get("match") is False
+            or str(info.get("kind") or "") in ("素材", "其他")):
+        info["ok"] = False
+    if text_is_blocked(info["text"]):
+        info["ok"] = False
+    return info
+
+
+def _search_variants(query: str, mode: str = "image") -> List[str]:
+    """搜索词变体：表情包补「表情包」，普通图片原样搜。
+
+    以前给表情包查询再追加「二次元 表情包」，必应会返回动漫插画而不是用户要的
+    实拍图；现在不再自动加「二次元」，只在缺「表情包」时补一个词。
+    """
+    q = re.sub(r"\s+", " ", (query or "").strip())
+    if not q:
+        return []
+    if mode == "image":
+        return [q]
+    q = re.sub(r"动漫(?=表情包)", "", q).strip()
+    if not q:
+        return []
+    if "表情包" not in q:
+        q += " 表情包"
+    return [q]
+
 
 def image_search(query: str) -> Optional[str]:
-    """必应图片搜索，返回第一个通过 SSRF 校验的图片直链。失败返回 None。
+    """必应图片搜索：逐张下载 + 后台视觉校验，返回第一张合格的图片直链。
 
-    用户偏好动漫/二次元风格：查询缺「表情包」字样时自动补
-    「动漫表情包」后缀，保证搜出来的图贴合人设。
+    以前取第一张能打开的图就发，图库素材照（带水印的写实照片）也会被当成
+    表情包发出去。现在每个候选都要过三关：视觉判读切题且可用、不是素材站/
+    水印图、画面描述和关键词对得上；不合格换下一张或换关键词重搜，全不合格
+    返回 None。画风不再设限，只核对内容是否切题。
     """
-    query = (query or "").strip()
-    if not query:
+    mode = _search_mode(query)
+    terms = _search_variants(query, mode)
+    if not terms:
         return None
-    if "表情包" not in query:
-        query += " 动漫表情包"
     from urllib.parse import quote
-    try:
-        import httpx
-        resp = httpx.get(_BING_URL.format(q=quote(query)),
-                         headers={"User-Agent": UA}, timeout=20,
-                         follow_redirects=True)
-        page = resp.text
-    except Exception:                     # noqa: BLE001
-        return None
-    urls = [html_mod.unescape(m) for m in _MURL_RE.findall(page)]
-    urls += _MURL_RE2.findall(page)
-    seen = set()
-    for u in urls:
-        if u in seen:
+    seen, seen_hash, tried = set(), set(), 0
+    for term in terms:
+        per = 0
+        try:
+            import httpx
+            resp = httpx.get(_BING_URL.format(q=quote(term)),
+                             headers={"User-Agent": UA}, timeout=20,
+                             follow_redirects=True)
+            page = resp.text
+        except Exception:                 # noqa: BLE001
             continue
-        seen.add(u)
-        low = urlparse(u).path.lower()
-        if not any(low.endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp", ".gif")):
-            continue
-        if url_is_public(u):
+        urls = [html_mod.unescape(m) for m in _MURL_RE.findall(page)]
+        urls += _MURL_RE2.findall(page)
+        for u in urls:
+            if u in seen:
+                continue
+            seen.add(u)
+            low = urlparse(u).path.lower()
+            if not any(low.endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                continue
+            if not url_is_public(u) or _is_stock(u):
+                continue
+            if tried >= SEARCH_MAX_CANDIDATES or per >= SEARCH_PER_VARIANT:
+                break
+            per += 1
+            tried += 1
+            data, why = download_image_ex(u)
+            if not data:
+                logger.info("搜图候选下载失败 q=%r：%s", term, why)
+                continue
+            digest = hashlib.md5(data).hexdigest()
+            if digest in seen_hash:              # 不同直链可能是同一张图
+                continue
+            seen_hash.add(digest)
+            why_bad = _screen_candidate(data)
+            if why_bad:
+                logger.info("搜图候选预筛淘汰 q=%r：%s", term, why_bad)
+                continue
+            info = _search_check(data, term)
+            if not info:
+                logger.info("搜图候选判读失败 q=%r", term)
+                continue
+            score = _subject_score(term, info, mode)
+            # 表情包必须字面主体对得上；一般图片以模型 match 为准，主体分只记录，
+            # 免得「北京」没写进描述就把真正的北京风景全毙掉。
+            bad = not info.get("ok") or _is_stock(u, info)
+            if mode == "sticker":
+                bad = bad or score < 0.5
+            if bad:
+                logger.info("搜图候选不合格 q=%r 模式=%s：主体=%.2f kind=%s style=%s "
+                            "match=%s desc=%r text=%r why=%s", term, mode, score,
+                            info.get("kind"), info.get("style"), info.get("match"),
+                            info.get("desc"), info.get("text"), info.get("why"))
+                continue
+            logger.info("搜图命中 q=%r 模式=%s 主体=%.2f desc=%r", term, mode, score,
+                        info.get("desc"))
             return u
+        if tried >= SEARCH_MAX_CANDIDATES:
+            break
+    logger.info("搜图无合格结果 q=%r 模式=%s 已判读 %d 张", query, mode, tried)
     return None
 
 
@@ -959,14 +1293,18 @@ def split_markers(text: str) -> List[Tuple]:
 def rich_hint() -> str:
     """追加到人设之后的能力说明：标记用法 + 当前贴纸库标签。"""
     counts = list_tags()
-    tags = [t for t, _ in sorted(counts.items(), key=lambda kv: -kv[1])][:50]
+    # 必须列全量：以前只给前 50 个，长尾标签（如排第 262 的「笨蛋」）模型看不到，
+    # 它会直接说「库里没有这个标签」，可实际用 [[sticker:笨蛋]] 能发出来。
+    tags = [t for t, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
     tag_line = "、".join(tags) if tags else "（还没有贴纸，主人发来的表情包会自动入库）"
     return f"""
 
 【动作标记——默认不用，读清下面的使用条件】
 大多数回复应该只有文字。你能用的标记只有这些：
 - [[sticker:标签]] 从贴纸库随机发一张贴纸（[[sticker:开心*2]] 随机发两张，最多 *3），可用标签：{tag_line}
-- [[search:两三个关键词 动漫表情包]] 搜一张贴合语境的图发出来
+- [[search:两三个关键词]] 搜一张贴合语境的图发出来：要表情包/梗图就在末尾写
+  「表情包」；主人要照片、风景、插画、原画、壁纸时按内容原样写，别加「表情包」
+  和「二次元」（例如 [[search:北京 风景照]]、[[search:原神 插画]]）
 - [[voice:要说的话]] 用语音说
 - [[img:https://图片直链]] 只发确定真实存在的直链（不确定就用 search）
 只在以下时机使用，其余时候一律纯文字：
@@ -978,11 +1316,20 @@ def rich_hint() -> str:
 【黄豆小表情 [[face:id]] 默认禁用】主人不喜欢，尤其是争议大的那几款
 （滑稽、斜眼笑、doge、吃瓜、微笑这类）。只有主人自己先发黄豆斗图时才跟着用；
 日常回复一个黄豆都不要加。
-【审美要求】搜图和选贴纸必须偏向动漫/二次元风格：search 的关键词末尾要带上
-「动漫表情包」（例如 [[search:哭泣 动漫表情包]]）；真人照片、风景照、写实图都不合格。
-标签尽量从上面的清单里选；没有合适的就用 [[search:关键词 动漫表情包]]。
+【搜图风格不设限】服务端不按动漫/二次元风格筛图，关键词只描述画面内容：要表情包
+就在末尾带「表情包」（例如 [[search:哭泣 表情包]]）；要实拍照片、建筑、风景、插画，
+按内容原样写（例如 [[search:深圳 高楼 建筑]]、[[search:北京 风景照]]），不要加
+「二次元」「动漫」，也别加「图片」这种泛词。
+【搜图关键词怎么取】主人转过参考图，或说「这种 / 类似这种 / 还有嘛」时，关键词必须
+沿用参考图的外形（发色、服装、角色、动作），不能只用主人顺口的称呼。例：参考图是
+蓝发女仆鲸鱼娘，就写 [[search:蓝发 鲸鱼娘 女仆 表情包]]；只写「蓝色大鱼」会搜回普通
+卡通鲸鱼。主人纠正过一次后，后续搜索沿用纠正后的词，不要退回字面称呼。
+标签尽量从上面的清单里选。主人点名要某个标签（比如「发一张笨蛋表情包」）时，
+直接写 [[sticker:主人说的那个词]]：服务端会按标签名和同义词匹配，发不出来这条
+会自动省略。不要凭印象提前说「库里没有这个标签」——清单很长，只是给你参考。
+没有能用的贴纸，再用 [[search:关键词 表情包]]。
 贴纸库已做过内容审核（含脏话、辱骂、擦边的图已被剔除），你按标签挑即可，
-不用猜图上写了什么；标签对不上的时候宁可不发，也不要硬塞一个。"""
+不用猜图上写了什么；主人没点名、标签又确实对不上时宁可不发，也不要硬塞一个。"""
 
 
 async def build_messages(reply: str, chunk: int = 1000) -> List[Message]:

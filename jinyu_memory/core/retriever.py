@@ -213,21 +213,31 @@ def retrieve(cards, text, limit=2, exclude_ids=()):
     return scored[:limit]
 
 
-def fuse(keyword_hits, vector_hits, limit=None):
-    """RRF 融合钩子召回与语义召回：两路各自排名，同时命中的卡自然靠前。
+# 融合权重：向量为主、钩子补充。100 条真实探针实测 1:1 RRF 的 R@4 只有 0.760，
+# 低于纯向量的 0.800——钩子 top-1 命中率低（0.220），等权时会把向量的正确卡挤下去。
+# 权重扫描（R@1 / R@4 / MRR）：纯向量 0.680/0.800/0.740，0.1 → 0.620/0.810/0.710，
+# 0.2 → 0.570/0.810/0.672，0.35 → 0.540/0.770/0.651。取 0.1：R@4 最高且少牺牲 top-1。
+FUSE_K = 20.0
+FUSE_VECTOR_WEIGHT = 1.0
+FUSE_KEYWORD_WEIGHT = 0.1
+
+
+def fuse(keyword_hits, vector_hits, limit=None,
+         vector_weight=FUSE_VECTOR_WEIGHT, keyword_weight=FUSE_KEYWORD_WEIGHT):
+    """RRF 融合钩子召回与语义召回：向量定主序，钩子只做加权补充。
 
     分数尺度不同（钩子 0.6~4.0，余弦 0~1），直接相加会让钩子永远压死语义，
-    所以只按名次融合；并列时用热力与时间兜底，保证结果稳定。
+    所以只按名次融合；两路同时命中的卡自然靠前。并列时用热力与时间兜底。
     """
-    k, scores, cards = 20.0, {}, {}
+    scores, cards = {}, {}
     for rank, (_, c) in enumerate(keyword_hits, 1):
         eid = c["event_id"]
         cards[eid] = c
-        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
+        scores[eid] = scores.get(eid, 0.0) + keyword_weight / (FUSE_K + rank)
     for rank, (_, c) in enumerate(vector_hits, 1):
         eid = c["event_id"]
         cards[eid] = c
-        scores[eid] = scores.get(eid, 0.0) + 1.0 / (k + rank)
+        scores[eid] = scores.get(eid, 0.0) + vector_weight / (FUSE_K + rank)
     out = sorted(scores.items(),
                  key=lambda x: (x[1], cards[x[0]].get("importance", 0.5),
                                 cards[x[0]].get("turn_end", 0)), reverse=True)

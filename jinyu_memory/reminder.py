@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -38,7 +39,16 @@ _AUTO_PATTERNS = (
                r"\s*(?:之后|以后|后)?\s*(.*)", re.S | re.I),
 )
 _CMD_RE = re.compile(r"^/remind(?:\s+(.*))?$", re.I | re.S)
-_DUR_RE = re.compile(rf"^({_NUM})\s*(m|min|分钟|分|h|小时|钟头|d|天|s|秒)\s*(.*)$", re.I | re.S)
+# 一段时长（可连续出现，支持「2小时40分钟」这种组合）
+_DUR_PART = re.compile(rf"({_NUM})\s*(?:个)?\s*(m|min|分钟|分|h|小时|钟头|d|天|s|秒)\s*",
+                       re.I)
+# 绝对钟点：零点 / 24点 / 23:59 / 今晚12点 / 明天0点 / 下午3点半
+_CLOCK_RE = re.compile(
+    r"^(?P<day>今天|今晚|明天|明早|明晚|次日)?\s*"
+    r"(?P<period>凌晨|早上|上午|中午|下午|傍晚|晚上|半夜)?\s*"
+    r"(?P<h>24|\d{1,2}|[零一二两三四五六七八九十]{1,3})"
+    r"(?:\s*[:：]\s*(?P<m>\d{1,2})|\s*[点时]\s*(?P<m2>\d{1,2}|半)?\s*分?)"
+    r"\s*$", re.I)
 _SUB = {"list": "list", "列表": "list", "cancel": "cancel", "取消": "cancel", "删除": "cancel"}
 _HELP = ("用法：/remind 20分钟 吃药 ｜ /remind list 查看 ｜ "
          "/remind cancel 编号 或 all 取消")
@@ -119,6 +129,68 @@ def _number(raw: str) -> float:
 
 def _delay(num: str, unit: str) -> float:
     return _number(num) * _UNIT_TOKEN.get(unit.lower(), 0)
+
+
+def _parse_duration(raw: str):
+    """解析开头的相对时长，支持组合（2小时40分钟）；返回 (秒数, 余下文本)。
+
+    以前只认第一段，「2小时40分钟」会被当成 2 小时并吞掉后文，导致提醒早到。
+    """
+    text = (raw or "").strip()
+    total, pos, hit = 0.0, 0, False
+    while pos < len(text):
+        match = _DUR_PART.match(text, pos)
+        if not match:
+            break
+        total += _delay(match.group(1), match.group(2))
+        pos = match.end()
+        hit = True
+    if not hit:
+        return None
+    return total, text[pos:].strip()
+
+
+def _clock_delay(raw: str) -> Optional[float]:
+    """绝对钟点 → 距现在多少秒；认不出返回 None。
+
+    相对时长要模型自己算「距离零点还有多久」，这一步大模型经常算错，
+    所以让模型直接写钟点（零点 / 24:00 / 明天0点），由服务端换算。
+    """
+    match = _CLOCK_RE.match((raw or "").strip())
+    if not match:
+        return None
+    day = match.group("day") or ""
+    period = match.group("period") or ""
+    hour = int(_number(match.group("h")))
+    minute_raw = match.group("m") or match.group("m2")
+    minute = 30 if minute_raw == "半" else int(_number(minute_raw or ""))
+    offset = 1 if day in ("明天", "明早", "明晚", "次日") else 0
+    if hour == 24:                        # 24:00 / 24点 = 次日零点
+        hour, offset = 0, offset + 1
+    if period in ("下午", "傍晚", "晚上") and hour < 12:
+        hour += 12
+    if period == "中午" and hour < 11:
+        hour += 12
+    if hour == 12 and (period in ("凌晨", "半夜", "晚上") or day == "今晚"):
+        hour, offset = 0, offset + 1    # 今晚/晚上十二点 = 次日零点
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    now = datetime.now()
+    target = datetime.combine(
+        (now + timedelta(days=offset)).date(),
+        dtime(hour=hour, minute=minute))
+    if target <= now:
+        target += timedelta(days=1)       # 没写日期：取下一次出现
+    return (target - now).total_seconds()
+
+
+def _parse_when(raw: str) -> Optional[float]:
+    """相对时长或绝对钟点都行；组合时长后面还带字则判为不合法。"""
+    parsed = _parse_duration(raw)
+    if parsed is not None:
+        delay, rest = parsed
+        return delay if not rest else None
+    return _clock_delay(raw)
 
 
 def _clean_text(text: str) -> str:
@@ -267,11 +339,11 @@ def handle_command(text: str, sid: str, user_id: int, group_id: int) -> Optional
         return "待办提醒（显示前 20）：\n" + "\n".join(lines)
     if sub == "cancel":
         return cancel(user_id, rest.strip())
-    dur = _DUR_RE.match(arg)
+    dur = _parse_duration(arg)
     if not dur:
         return _HELP
-    delay = _delay(dur.group(1), dur.group(2))
-    content = _clean_content(dur.group(3))
+    delay, rest = dur
+    content = _clean_content(rest)
     plan = schedule(sid, user_id, group_id, delay, content)
     return _reply(plan, content)
 
@@ -297,3 +369,23 @@ def auto_schedule(text: str, sid: str, user_id: int,
             plan["content"] = content
         return plan
     return None
+
+
+def schedule_text(when: str, what: str, sid: str, user_id: int,
+                  group_id: int) -> dict:
+    """工具调用用：when 只接受相对时长（如「20分钟」「2小时」「1天」）。
+
+    返回同 auto_schedule 的 plan；模型给出的时间说法不规范时返回 ok=False，
+    让模型自己换一种说法，而不是猜一个错误的时间。
+    """
+    delay = _parse_when(when)
+    if delay is None:
+        return {"ok": False,
+                "error": "时间填相对时长（20分钟、2小时40分钟）或钟点"
+                         "（零点、24:00、明天0点），不要带别的话。"}
+    content = _clean_content(what)
+    plan = schedule(sid, user_id, group_id, delay, content)
+    if plan.get("ok"):
+        plan["when"] = fmt_when(float(plan["due"]))
+        plan["content"] = content
+    return plan
