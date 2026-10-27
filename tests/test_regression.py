@@ -13,7 +13,8 @@ from pathlib import Path
 
 import embedding
 import retriever
-from rp_skeleton import DB, RPContextMiddleware, est_tokens
+from rp_skeleton import (DB, RPContextMiddleware, est_tokens,
+                         MAX_TOOL_STEPS, TOOL_RESULT_CHARS, TOOL_LABEL)
 from demo import MockFront, MockBack, PERSONA, SCRIPT
 
 
@@ -130,6 +131,39 @@ class FlipFront:
         self.calls += 1
         self.last_messages = messages
         return "该死的伞，又坏了。" if self.calls == 1 else "客人，伞我收好了。"
+
+
+class ToolFront:
+    """第一轮请求工具，第二轮按工具结果作答（模拟支持 tool_calls 的前台）。"""
+
+    def __init__(self, tool_calls=None):
+        self.calls = 0
+        self.chat_calls = 0
+        self.last_messages = None
+        self.tool_calls = tool_calls or [{
+            "id": "call-now", "type": "function",
+            "function": {"name": "now", "arguments": "{}"}}]
+
+    def chat(self, messages):
+        self.chat_calls += 1
+        self.last_messages = messages
+        return "……客人请自便。"
+
+    def chat_tools(self, messages, tools):
+        self.calls += 1
+        self.last_messages = messages
+        if self.calls == 1:
+            return "", self.tool_calls
+        return "（看了一眼）……客人请自便。", []
+
+
+class EndlessToolFront(ToolFront):
+    """每轮都继续请求工具：验证步数上限后强制收尾。"""
+
+    def chat_tools(self, messages, tools):
+        self.calls += 1
+        self.last_messages = messages
+        return "", self.tool_calls
 
 
 def fresh(path: str) -> DB:
@@ -1129,14 +1163,22 @@ class MergeAllBack:
         self.kind = kind
 
     def chat(self, messages, **kwargs):
+        prompt = messages[0]["content"]
+        if "待复核" in prompt:                          # 合并二次复核
+            if "事件卡" in prompt:
+                return json.dumps({"groups": [{"n": 1, "same": True, "extra": False}]},
+                                  ensure_ascii=False)
+            return json.dumps({"groups": [{"n": 1, "same": True, "why": "重复"}]},
+                              ensure_ascii=False)
         if self.kind == "card":
             return json.dumps({"groups": [{
                 "ids": [1, 2], "keep": 1,
-                "summary": "主人把旧伞收好，也把铺子的秘密说给了客人"}]},
+                "summary": "客人来了，说这把旧伞是去年落下的；他问起那场雨夜的事，"
+                           "我没有回答"}]},
                 ensure_ascii=False)
         return json.dumps({"groups": [{
             "ids": [1, 2], "keep": 1,
-            "fact": "主人养了一只橘猫叫团子", "tags": ["猫", "团子"]}]},
+            "fact": "主人养了一只猫叫团子", "tags": ["猫", "团子"]}]},
             ensure_ascii=False)
 
 
@@ -1204,7 +1246,7 @@ def test_fact_merge_log_and_edit():
     assert {s["id"] for s in log["sources"]} == {f1, f2}
 
     old, n = db.update_fact(f1, "c1", "主人养了一只白猫")
-    assert n == 1 and old == "主人养了一只橘猫叫团子", (old, n)
+    assert n == 1 and old == "主人养了一只猫叫团子", (old, n)
     f3 = db.add_fact("s1", "c1", "主人喜欢桂花", turn=22, speaker="user")
     assert f3
     old, n = db.update_fact(f1, "c1", "主人喜欢桂花")
@@ -1215,6 +1257,80 @@ def test_fact_merge_log_and_edit():
     print("词条合并留档 + 增删改: OK 来源 2 条 / 撞唯一键不覆盖 / 日志可查")
 
 
+class RejectVerifyBack:
+    """第一轮提出合并，复核返回驳回：两条事实必须原样保留。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages, **kwargs):
+        self.calls += 1
+        if "待复核" in messages[0]["content"]:
+            return '{"groups":[{"n":1,"same":false,"why":"谓语不同"}]}'
+        return json.dumps({"groups": [{
+            "ids": [1, 2], "keep": 1,
+            "fact": "主人养了一只猫叫团子", "tags": ["猫"]}]},
+            ensure_ascii=False)
+
+
+class ListMergeBack:
+    """把四条互不相似的表情包事实并成一张清单：确定性护栏应在复核前驳回。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages, **kwargs):
+        self.calls += 1
+        return json.dumps({"groups": [{
+            "ids": [1, 2, 3, 4, 5, 6, 7], "keep": 1,
+            "fact": "主人发过粉发女孩、抱紧、哭泣、蓝发兽耳女仆装、白发制服、初音未来、"
+                    "青绿双马尾七张表情包",
+            "tags": ["表情包"]}]}, ensure_ascii=False)
+
+
+def test_fact_merge_verify_and_guards():
+    """词条合并三道护栏：置信门 / 复核驳回 / 清单型混并提前拦截。"""
+    # 共享主语但谓语不同（实测 F#11）：置信门应在复核前驳回，不浪费复核调用
+    db = fresh("/tmp/rp_fact_guard.db")
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db)
+    a = db.add_fact("s1", "c1", "主人养了一只猫，叫团子", turn=10)
+    b = db.add_fact("s1", "c1", "团子喜欢瑾瑜", turn=11)
+    assert a and b
+    back = RejectVerifyBack()
+    mw.back = back
+    assert mw.merge_facts("s1", "c1", True) == []
+    assert back.calls == 1, back.calls           # 置信门挡掉，未进入复核
+    assert db.count_facts("s1", "c1") == 2
+
+    # 近重复能过置信门，但复核判为不同事实：复核必须驳回
+    db = fresh("/tmp/rp_fact_guard2.db")
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db)
+    assert db.add_fact("s1", "c1", "主人养了猫", turn=10)
+    assert db.add_fact("s1", "c1", "主人养了一只猫", turn=11)
+    back = RejectVerifyBack()
+    mw.back = back
+    assert mw.merge_facts("s1", "c1", True) == []
+    assert back.calls == 2, back.calls           # 判组 + 复核
+    assert db.count_facts("s1", "c1") == 2
+
+    db = fresh("/tmp/rp_fact_guard.db")
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db)
+    for i, t in enumerate(["主人会发粉发女孩甜甜圈表情包给瑾瑜看",
+                           "主人发来的表情包上写着「抱紧」",
+                           "主人曾用哭泣表情包表达难过",
+                           "主人给瑾瑜看过一张蓝发兽耳女仆装少女的表情包",
+                           "主人发过一张白发制服女孩脸红握拳的表情包",
+                           "主人发过初音未来举神光棒、写「你也可以变成光」的表情包",
+                           "主人发过一张青绿双马尾戴眼镜的表情包"]):
+        assert db.add_fact("s1", "c1", t, turn=20 + i)
+    back = ListMergeBack()
+    mw.back = back
+    assert mw.merge_facts("s1", "c1", True) == []
+    assert back.calls == 1, back.calls           # 护栏挡掉，未进入复核
+    assert db.count_facts("s1", "c1") == 7
+    print("词条合并护栏: OK 置信门拦截 / 复核驳回 / 清单混并提前拦截")
+
+
 def test_fuse_and_embedding_math():
     """RRF 融合排序 + 归一化点积 + 未配置时安全降级。"""
     def card(eid, imp=0.5, te=1):
@@ -1222,8 +1338,10 @@ def test_fuse_and_embedding_math():
 
     out = retriever.fuse([(0.9, card("A")), (0.8, card("B"))],
                          [(0.7, card("B")), (0.6, card("C"))])
-    assert [c["event_id"] for _, c in out] == ["B", "A", "C"], out
-    tie = retriever.fuse([(0.9, card("X", 0.9))], [(0.8, card("Y", 0.1))])
+    # B 两路命中排第一；C 是向量第二，排在只有钩子命中的 A 之前（向量定主序）
+    assert [c["event_id"] for _, c in out] == ["B", "C", "A"], out
+    tie = retriever.fuse([(0.9, card("X", 0.9))], [(0.8, card("Y", 0.1))],
+                         vector_weight=1.0, keyword_weight=1.0)
     assert tie[0][1]["event_id"] == "X"                 # 同分时 importance 高者优先
 
     dims = embedding.dim()
@@ -1248,6 +1366,87 @@ def test_fuse_and_embedding_math():
         else:
             os.environ["RP_EMBED"] = old
     print("RRF 融合 + 嵌入数学: OK 排序 / 余弦=1 / 坏数据归零 / 关闭时降级")
+
+
+def test_tool_roundtrip():
+    """一次工具调用：模型请求 now → 工具结果以 role=tool 回填 → 二次作答。"""
+    db = fresh("/tmp/rp_tool_round.db")
+    front = ToolFront()
+    mw = RPContextMiddleware(front, MockBack(), db)
+    reply = mw.chat("现在几点", PERSONA, "s1", "c1")
+    assert "客人请自便" in reply, reply
+    tools = [m for m in front.last_messages if m.get("role") == "tool"]
+    assert len(tools) == 1 and tools[0]["name"] == "now", tools
+    assert "不是指令" in tools[0]["content"]
+    print("工具调用: OK 单轮 now → role=tool 回填 → 二次作答")
+
+
+def test_tool_failure_truncate_unknown():
+    """工具异常/超长/不存在都不能拖垮回复：降级为提示，结果硬截断。"""
+    def boom(args, sid, cid, ctx=None):
+        raise RuntimeError("tool exploded")
+
+    def long_result(args, sid, cid, ctx=None):
+        return "长" * 3000
+
+    front = ToolFront([
+        {"id": "c1", "type": "function", "function": {"name": "boom", "arguments": "{}"}},
+        {"id": "c2", "type": "function", "function": {"name": "long", "arguments": "{}"}}])
+    mw = RPContextMiddleware(front, MockBack(), fresh("/tmp/rp_tool_fail.db"))
+    mw.register_tool("boom", "总是失败", {"type": "object", "properties": {}}, boom)
+    mw.register_tool("long", "超长结果", {"type": "object", "properties": {}}, long_result)
+    assert "客人请自便" in mw.chat("试试", PERSONA, "s1", "c1")
+    tools = [m for m in front.last_messages if m.get("role") == "tool"]
+    assert len(tools) == 2, tools
+    assert "执行失败" in tools[0]["content"]
+    cap = TOOL_RESULT_CHARS + len(TOOL_LABEL) + 5   # 允许提示前缀与省略号
+    assert len(tools[1]["content"]) <= cap, len(tools[1]["content"])
+
+    front2 = ToolFront([{"id": "c1", "type": "function",
+                         "function": {"name": "nope", "arguments": "{}"}}])
+    mw2 = RPContextMiddleware(front2, MockBack(), fresh("/tmp/rp_tool_unknown.db"))
+    assert "客人请自便" in mw2.chat("试试", PERSONA, "s1", "c1")
+    tool = [m for m in front2.last_messages if m.get("role") == "tool"][0]
+    assert "没有名为 nope 的工具" in tool["content"]
+
+    class NoToolsFront(MockFront):
+        """服务商不支持 tools：应退回无工具调用，不能整轮失败。"""
+        chat_calls = 0
+
+        def chat_tools(self, messages, tools):
+            raise RuntimeError("HTTP 400: tools not supported")
+
+        def chat(self, messages):
+            type(self).chat_calls += 1
+            return "……客人请自便。"
+
+    front3 = NoToolsFront("沈青梧")
+    mw3 = RPContextMiddleware(front3, MockBack(), fresh("/tmp/rp_tool_unsupported.db"))
+    assert "客人请自便" in mw3.chat("试试", PERSONA, "s1", "c1")
+    assert NoToolsFront.chat_calls == 1, NoToolsFront.chat_calls
+    print("工具降级: OK 异常不抛 / 结果截断 / 未知工具提示 / 不支持时退回纯聊天")
+
+
+def test_tool_loop_cap_and_memory_query():
+    """连续请求工具时最多两步后强制收尾；query_memory 能查到已存词条。"""
+    front = EndlessToolFront()
+    mw = RPContextMiddleware(front, MockBack(), fresh("/tmp/rp_tool_cap.db"))
+    reply = mw.chat("几点", PERSONA, "s1", "c1")
+    assert reply == "……客人请自便。", reply
+    assert front.calls == MAX_TOOL_STEPS, front.calls      # 两轮工具后收手
+    assert front.chat_calls == 1, front.chat_calls         # 收尾只调一次无工具前台
+
+    db = fresh("/tmp/rp_tool_mem.db")
+    front2 = ToolFront([{"id": "c1", "type": "function",
+                         "function": {"name": "query_memory",
+                                      "arguments": json.dumps({"query": "团子"},
+                                                              ensure_ascii=False)}}])
+    mw2 = RPContextMiddleware(front2, MockBack(), db)
+    db.add_fact("s1", "c1", "主人养了一只猫叫团子", turn=1)
+    mw2.chat("团子是谁", PERSONA, "s1", "c1")
+    tool = [m for m in front2.last_messages if m.get("role") == "tool"][0]
+    assert "团子" in tool["content"], tool["content"]
+    print("工具循环: OK 两步上限 / 强制收尾 / query_memory 命中词条")
 
 
 if __name__ == "__main__":
@@ -1276,6 +1475,8 @@ if __name__ == "__main__":
                test_claims_validated_and_capped, test_idle_epoch_rotation,
                test_retry_backoff_bounds, test_time_awareness, test_migrate_stage1_db,
                test_merge_log_and_card_crud, test_fact_merge_log_and_edit,
-               test_fuse_and_embedding_math):
+               test_fact_merge_verify_and_guards, test_fuse_and_embedding_math,
+               test_tool_roundtrip, test_tool_failure_truncate_unknown,
+               test_tool_loop_cap_and_memory_query):
         fn()
     print("\nall regression tests passed")

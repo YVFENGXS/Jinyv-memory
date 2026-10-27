@@ -9,3 +9,7 @@ pillow>=10.0
 
 # 语音合成（可选：不装则 [[voice:...]] 标记会被跳过）
 edge-tts>=6.1
+
+# MCP 只读工具（可选：不装或没有 mcp.json 时自动跳过，不影响聊天）
+mcp>=1.0
+mcp-server-fetch

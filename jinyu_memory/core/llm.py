@@ -8,6 +8,7 @@
 urllib 会读取 http(s)_proxy，适配远端沙箱的出口代理。
 """
 import json
+import logging
 import os
 import random
 import time
@@ -17,6 +18,31 @@ import urllib.request
 
 OFF_VALUES = {"off", "none", "0", "false", "no", "disabled"}
 MAX_RETRY_DELAY = 30.0
+IODUMP_CHARS = 600                     # 单条消息/输出在日志里最多展示这么多字
+logger = logging.getLogger("jinyu_memory.llm")
+
+
+def _brief(value, limit=IODUMP_CHARS):
+    """日志用：把消息内容压成一行；图片块只显示 [图片]，不写 base64。"""
+    if isinstance(value, str):
+        text = " ".join(value.split())
+        return text[:limit] + ("…" if len(text) > limit else "")
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if not isinstance(item, dict):
+                parts.append(str(item))
+            elif item.get("type") == "image_url":
+                parts.append("[图片]")
+            else:
+                parts.append(str(item.get("text") or item.get("content") or ""))
+        return _brief(" ".join(p for p in parts if p), limit)
+    return _brief(str(value), limit)
+
+
+def _messages_brief(messages):
+    return " | ".join(f"{m.get('role') or '?'}={_brief(m.get('content'))}"
+                     for m in messages if isinstance(m, dict))
 
 
 def retry_delay(attempt, retry_after=None):
@@ -42,7 +68,8 @@ def _retry_after(error):
 
 
 class LLM:
-    def __init__(self, key, model, base=None, timeout=120, retries=4, thinking=None):
+    def __init__(self, key, model, base=None, timeout=120, retries=4, thinking=None,
+                 role=""):
         if not key:
             raise ValueError("缺少 API key：请设置 RP_FRONT_KEY / RP_BACK_KEY")
         self.key, self.model = key, model
@@ -50,6 +77,7 @@ class LLM:
                      or "https://api.deepseek.com").rstrip("/")
         self.timeout, self.retries = timeout, retries
         self.thinking = (thinking or "").strip().lower()
+        self.role = role
         self.calls = 0
 
     def chat(self, messages, temperature=0.7, max_tokens=1200, json_mode=False):
@@ -59,18 +87,48 @@ class LLM:
             payload["thinking"] = {"type": "disabled"}
         if json_mode:                                  # 归纳体：强约束返回 JSON 对象
             payload["response_format"] = {"type": "json_object"}
+        return (self._complete(payload, max_tokens).get("content") or "").strip()
+
+    def chat_tools(self, messages, tools, temperature=0.7, max_tokens=1200):
+        """带工具的一轮补全：返回 (content, tool_calls)。
+
+        和 chat 的差别只有 payload 里多 tools/tool_choice：多步循环由
+        rp_skeleton 负责，这里只把模型这次想调的工具原样交出去。
+        """
+        if not tools:
+            return self.chat(messages, temperature, max_tokens), []
+        payload = {"model": self.model, "messages": messages,
+                   "temperature": temperature, "tools": tools,
+                   "tool_choice": "auto"}
+        if self.thinking in OFF_VALUES:
+            payload["thinking"] = {"type": "disabled"}
+        message = self._complete(payload, max_tokens)
+        return ((message.get("content") or "").strip(),
+                message.get("tool_calls") or [])
+
+    def _complete(self, payload, max_tokens):
+        """带重试的补全，返回原始 message（可能只有 tool_calls 没有 content）。"""
         want = max_tokens
         last = None
+        started = time.time()
+        if self.role == "back":                        # 后台模型的输入也进 monitor 日志
+            logger.info("[jinyu] 后台模型 入参 模型=%s %s",
+                        self.model, _messages_brief(payload["messages"]))
         for i in range(self.retries):
             try:
                 with urllib.request.urlopen(self._req(payload, want),
                                             timeout=self.timeout) as r:
                     body = json.loads(r.read().decode())
                 choice = body["choices"][0]
-                content = (choice["message"].get("content") or "").strip()
-                if content:
+                message = choice.get("message") or {}
+                content = (message.get("content") or "").strip()
+                if content or message.get("tool_calls"):
                     self.calls += 1
-                    return content
+                    if self.role == "back":
+                        logger.info("[jinyu] 后台模型 出参 模型=%s 耗时=%.1fs %s",
+                                    self.model, time.time() - started,
+                                    _brief(content or "[tool_calls]"))
+                    return message
                 # 推理模型可能把预算全花在 reasoning 上；截断则加倍重试
                 last = f"空输出 finish={choice.get('finish_reason')}"
                 if choice.get("finish_reason") == "length" and want < 8000:
@@ -106,4 +164,5 @@ def from_env(role):
     default = "deepseek-v4-pro" if role == "front" else "deepseek-flash"
     return LLM(os.environ.get(prefix + "_KEY", ""),
                os.environ.get(prefix + "_MODEL", default),
-               thinking=os.environ.get(prefix + "_THINKING", ""))
+               thinking=os.environ.get(prefix + "_THINKING", ""),
+               role=role)
