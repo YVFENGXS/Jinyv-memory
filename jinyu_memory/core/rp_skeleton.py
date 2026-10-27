@@ -18,7 +18,7 @@ R6-R9 阶段二：事件卡扩列（rel_hooks / knowledge_boundary / importance 
 """
 import copy, difflib, hashlib, json, logging, math, queue, re, sqlite3, threading, time, uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import conflict, embedding, promise, retriever
 from persona_guard import PersonaGuard
@@ -369,11 +369,23 @@ def _human_gap(sec: float) -> str:
     return f"{max(1, round(sec / 60)):.0f} 分钟"
 
 
+def _to_midnight(now: datetime) -> str:
+    """距零点还有多久。模型心算这一步实测会错（把 21:48 说成只剩十来分钟），
+    所以由服务端算好直接写进上下文，别让它自己减。"""
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    sec = max(0, int((midnight - now).total_seconds()))
+    if sec < 60:
+        return "不到 1 分钟"
+    if sec < 3600:
+        return f"{sec // 60} 分钟"
+    return f"{sec // 3600} 小时 {sec % 3600 // 60} 分"
+
+
 def _now_line(last_dt=None) -> str:
     """「现在几点」锚：随账本每轮注入；距最近一条消息太久时补一句人话间隔。"""
     now = datetime.now().astimezone()
     wk = WEEK_CN[now.weekday() * 2: now.weekday() * 2 + 2]
-    line = f"当前时间：{now:%Y-%m-%d %H:%M} {wk}"
+    line = f"当前时间：{now:%Y-%m-%d %H:%M} {wk}（距零点还有 {_to_midnight(now)}）"
     if last_dt is not None:
         sec = (now - last_dt).total_seconds()
         if sec >= RECENT_GAP_SECONDS:
@@ -1434,7 +1446,8 @@ class RPContextMiddleware:
             self._tool_query_memory)
         self.register_tool(
             "now",
-            "获取服务器当前日期、时间与星期。回答时间相关问题前调用。",
+            "获取服务器当前日期、时间、星期，以及距零点还有多久。"
+            "回答时间相关问题前调用，不要自己心算。",
             {"type": "object", "properties": {}},
             self._tool_now)
 
@@ -1466,7 +1479,8 @@ class RPContextMiddleware:
     def _tool_now(self, args, sid, cid, ctx=None) -> str:
         now = datetime.now().astimezone()
         week = WEEK_CN[now.weekday() * 2:now.weekday() * 2 + 2]
-        return now.strftime("%Y-%m-%d %H:%M:%S ") + week + f"（{now.tzname() or '本地时间'}）"
+        return (now.strftime("%Y-%m-%d %H:%M:%S ") + week
+                + f"（{now.tzname() or '本地时间'}）；距零点还有 {_to_midnight(now)}")
 
     def _tool_reply(self, msgs, sid, cid, tool_context=None) -> str:
         """前台调用：有工具就最多跑两步，之后强制不带工具收尾。

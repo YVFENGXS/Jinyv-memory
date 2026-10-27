@@ -928,6 +928,24 @@ def save_and_tag(data: bytes, extra_tags: Optional[List[str]] = None,
 _BING_URL = "https://cn.bing.com/images/search?q={q}&form=HDRSC2&first=1"
 _MURL_RE = re.compile(r'murl&quot;:&quot;(https?://[^&"]+)')
 _MURL_RE2 = re.compile(r'"murl"\s*:\s*"(https?://[^"]+)"')
+# 真实结果项的锚点；顶部的联想词/相关搜索块不在 a.iusc 里，按结构取就不会
+# 把「大肥 / 大群 / 大妹子」这些建议词当成搜索结果。先按原文取属性（内部引号
+# 还是 &quot;），再反转义，避免 JSON 里的引号把属性提前截断
+_IUSC_RE = re.compile(r'<a[^>]*\bclass="iusc"[^>]*\bm="([^"]*)"', re.S)
+
+
+def _bing_image_urls(page: str) -> list[str]:
+    """从必应图片页取真实结果直链：优先按 a.iusc 结构，结构变了再退回全文匹配。"""
+    urls = []
+    for raw in _IUSC_RE.findall(page):
+        hit = _MURL_RE2.search(html_mod.unescape(raw))
+        if hit:
+            urls.append(hit.group(1))
+    if urls:
+        return urls
+    blob = html_mod.unescape(page)
+    return _MURL_RE2.findall(blob) + _MURL_RE.findall(page)
+
 
 # 素材/图库站常带水印，直链能过 SSRF 校验但不是表情包；先按域名跳过，省下载和判读
 _STOCK_HOSTS = ("nipic.com", "58pic.com", "699pic.com", "veer.com",
@@ -1111,8 +1129,7 @@ def image_search(query: str) -> Optional[str]:
             page = resp.text
         except Exception:                 # noqa: BLE001
             continue
-        urls = [html_mod.unescape(m) for m in _MURL_RE.findall(page)]
-        urls += _MURL_RE2.findall(page)
+        urls = _bing_image_urls(page)
         for u in urls:
             if u in seen:
                 continue
