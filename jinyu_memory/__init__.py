@@ -42,8 +42,19 @@
   RP_LINK                           选填，1/0 链接抓取，默认 1
   RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
   RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
-  RP_ADMIN_QQ                       选填，允许 /persona /memory /save /tags /find /img /sticker
-                                    /fix /voice /testrich 的 QQ
+  RP_ADMIN_QQ                       选填，允许 /persona /memory /merge /save /tags /find /img
+                                    /sticker /fix /voice /testrich /social 的 QQ
+  RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
+  RP_FACT_MERGE_MIN                 选填，会话事实达到多少条才自动合并，默认 20
+  RP_SIGN                           选填，1/0 允许模型在情真意切时改自己的QQ签名，默认 1
+  RP_SIGN_COOLDOWN_HOURS            选填，两次改签名的最小间隔小时数，默认 24
+  RP_QZONE                          选填，1/0 允许模型在遇到有趣的事时发QQ空间说说，默认 1
+  RP_QZONE_DAILY                    选填，每天最多发几条说说，默认 1
+  RP_QZONE_GAP_HOURS                选填，两条说说之间的最小间隔小时数，默认 6
+  RP_QZONE_RIGHT                    选填，说说可见范围 1公开/4仅好友/16部分好友/64仅自己，
+                                    默认 4
+  RP_SOCIAL_AFFINITY_HOURS          选填，社交圈模式每隔多少小时复盘一次好感度，默认 3
+                                    （社交圈默认关闭，用 /social on 开启，独立 db 存记忆）
   RP_SESSION_EPOCH_HOURS            选填，闲置多少小时后开启新会话 epoch，默认 48，0=不轮换
   RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
 """
@@ -53,6 +64,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import sys
 import time
 from datetime import date
@@ -122,6 +134,7 @@ from richmsg import (                                       # noqa: E402
     url_is_public,
 )
 from rp_skeleton import DB, RPContextMiddleware             # noqa: E402
+from summarizer import parse as parse_json                  # noqa: E402
 
 CID = "jinyu"
 COOLDOWN = float(os.environ.get("RP_COOLDOWN") or 2)
@@ -142,6 +155,20 @@ POKE_COOLDOWN = max(0.0, float(os.environ.get("RP_POKE_COOLDOWN") or 30))
 MAX_SILENT = 2            # 允许连续沉默的轮数；超过后强制开口，避免对话彻底断死
 EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48) * 3600))
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
+FACT_MERGE_HOURS = max(0.0, float(os.environ.get("RP_FACT_MERGE_HOURS") or 6))
+FACT_MERGE_MIN = max(2, int(float(os.environ.get("RP_FACT_MERGE_MIN") or 20)))
+SIGN_ON = (os.environ.get("RP_SIGN") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+SIGN_GAP = max(0.0, float(os.environ.get("RP_SIGN_COOLDOWN_HOURS") or 24) * 3600)
+QZONE_ON = (os.environ.get("RP_QZONE") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+QZONE_DAILY = max(0, int(float(os.environ.get("RP_QZONE_DAILY") or 1)))
+QZONE_GAP = max(0.0, float(os.environ.get("RP_QZONE_GAP_HOURS") or 6) * 3600)
+_QZONE_RIGHT = int(float(os.environ.get("RP_QZONE_RIGHT") or 4))
+# NapCat 允许值：1 所有人 / 4 好友 / 16 部分好友 / 64 仅自己 / 128 部分好友不可见
+QZONE_RIGHT = _QZONE_RIGHT if _QZONE_RIGHT in {1, 4, 16, 64, 128} else 4
+SOCIAL_AFFINITY_HOURS = max(0.0, float(
+    os.environ.get("RP_SOCIAL_AFFINITY_HOURS") or 3))
 NUDGE_LINES = ([
     os.environ["RP_IDLE_NUDGE_TEXT"]] if os.environ.get("RP_IDLE_NUDGE_TEXT") else [
     "你怎么这么长时间没找我说话了......",
@@ -149,6 +176,11 @@ NUDGE_LINES = ([
 ])
 
 mw = None
+mw_plain = None            # 分离上下文（每个群/私聊一套记忆）
+mw_social = None           # 社交圈（全局一份记忆 + 好感度，独立 db）
+SOCIAL_ON = False
+SOCIAL_DB: Optional[Path] = None
+SOCIAL_SID = "qq-social"
 _locks = {}
 _last_seen = {}
 _nudged_at = {}           # sid -> 上次闲置提醒时间（同一轮沉默只提醒一次）
@@ -187,16 +219,22 @@ def _bind_core_log() -> None:
 
 @driver.on_startup
 async def _startup():
-    global mw
+    global mw, mw_plain, SOCIAL_DB
     _bind_core_log()
     db_path = Path(os.environ.get("RP_DB") or "data/rp_memory.db").expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    mw = RPContextMiddleware(
+    _social_load(db_path.with_name("social_state.json"))
+    mw_plain = RPContextMiddleware(
         from_env("front"), from_env("back"), DB(str(db_path)),
         max_tokens=int(os.environ.get("RP_MAX_TOKENS") or 64000),
         output_reserve=int(os.environ.get("RP_OUTPUT_RESERVE") or 4096),
         profile=os.environ.get("RP_PROFILE") or "cl100k",
     )
+    mw = mw_plain
+    SOCIAL_DB = db_path.with_name(db_path.stem + "_social" + db_path.suffix)
+    if str(_SOCIAL_STATE.get("mode") or "") == "on":
+        _social_switch(True, save=False)
+        logger.info("[jinyu] 社交圈模式已恢复（独立的全局记忆库）")
     logger.info(f"[jinyu] 记忆体就绪 db={db_path} profile={mw.profile} "
                 f"budget={mw.budget}")
     logger.info(
@@ -216,6 +254,10 @@ async def _startup():
         asyncio.create_task(_reminder_loop())
     if IDLE_NUDGE_MIN > 0:
         asyncio.create_task(_idle_nudge_loop())
+    if FACT_MERGE_HOURS > 0:
+        asyncio.create_task(_fact_merge_loop())
+    if SOCIAL_AFFINITY_HOURS > 0:
+        asyncio.create_task(_social_affinity_loop())
     asyncio.create_task(asyncio.to_thread(sweep_tts_cache, True))   # 启动时清一次 TTS 缓存
 
 
@@ -270,6 +312,34 @@ async def _idle_nudge_loop():
                     logger.warning(f"[jinyu] 主动消息发送失败 sid={sid}: {exc}")
         except Exception as exc:                        # noqa: BLE001
             logger.warning(f"[jinyu] 闲置提醒循环异常: {exc}")
+
+
+async def _fact_merge_loop():
+    """定期让后台模型合并重复词条（同一件事被反复说时不再堆成多条）。
+
+    只在事实数达到 RP_FACT_MERGE_MIN 的会话上跑，一轮最多处理一个会话的一批；
+    模型调用在线程里执行，不阻塞对话。失败只记日志，下轮再试。
+    """
+    while True:
+        await asyncio.sleep(max(600.0, FACT_MERGE_HOURS * 3600))
+        if mw is None:
+            continue
+        try:
+            owners = mw.db.fact_owners(CID)
+        except Exception as exc:                    # noqa: BLE001
+            logger.warning(f"[jinyu] 词条合并扫描失败: {exc}")
+            continue
+        for o in owners:
+            if int(o["n"] or 0) < FACT_MERGE_MIN:
+                continue
+            try:
+                groups = await asyncio.to_thread(mw.merge_facts, o["base"], CID, True)
+            except Exception as exc:                # noqa: BLE001  模型/写库失败不致命
+                logger.warning(f"[jinyu] 词条合并失败 base={o['base']}: {exc}")
+                continue
+            if groups:
+                logger.info(f"[jinyu] 词条合并 base={o['base']} 组={len(groups)}：" +
+                            "；".join(f"{len(g['ids'])}→{g['fact'][:16]}" for g in groups[:6]))
 
 
 async def _reminder_loop():
@@ -355,13 +425,23 @@ async def _proactive_line(sid: str, idle_min: int) -> str:
 
 @driver.on_shutdown
 async def _shutdown():
-    if mw is None:
-        return
-    await asyncio.to_thread(mw.shutdown)      # 分段冲刷归档，总超时 60s
-    logger.info(f"[jinyu] 已停止｜归档失败区间 {len(mw.db.list_failures())} 个")
+    # 两套记忆体各自冲刷：切换过社交圈后，未生效那套的尾部对话也要归档
+    done = []
+    for inst, label in ((mw_plain, "分离上下文"), (mw_social, "社交圈")):
+        if inst is None or any(inst is d for d in done):
+            continue
+        done.append(inst)
+        try:
+            await asyncio.to_thread(inst.shutdown)  # 分段冲刷归档，各自总超时 60s
+            logger.info(f"[jinyu] {label}已停止｜归档失败区间 "
+                        f"{len(inst.db.list_failures())} 个")
+        except Exception as exc:                    # noqa: BLE001  停止失败不能拦住退出
+            logger.warning(f"[jinyu] {label}停止失败: {exc}")
 
 
 def _sid(event: MessageEvent) -> str:
+    if SOCIAL_ON:                          # 社交圈：所有群+私聊共用一份记忆
+        return SOCIAL_SID
     if isinstance(event, GroupMessageEvent):
         return f"qq-g{event.group_id}"     # 整群共享一条上下文（2026-10-25 用户需求）
     return f"qq-u{event.user_id}"
@@ -837,6 +917,9 @@ async def _send_rich(reply: str) -> None:
 async def _send_to(reply: str, user_id: int = 0, group_id: int = 0) -> bool:
     """往指定私聊/群发送（主动消息、戳一戳、提醒用），返回是否全部发出。"""
     reply = _split_poke(reply)
+    reply, posts = _take_social(reply)
+    for kind, body in posts:        # 主动消息里也能发说说；签名无法核验身份，直接丢弃
+        asyncio.create_task(_run_social(kind, body, None))
     if not reply.strip():
         return False
     bot = get_bot()
@@ -857,6 +940,373 @@ async def _send_to(reply: str, user_id: int = 0, group_id: int = 0) -> bool:
             logger.opt(exception=exc).warning(
                 f"[jinyu] 消息发送失败 uid={user_id} gid={group_id}: {exc}")
     return ok
+
+
+# ---------- 个性签名 / QQ空间：低频、后台执行、失败静默 ----------
+_SOCIAL_RE = re.compile(
+    r"\[\[\s*(sign|qzone|签名|空间|说说)\s*[:：](.*?)\]\]", re.S | re.I)
+_SOCIAL_STATE: dict = {}
+_SOCIAL_PATH: Optional[Path] = None
+
+
+def _social_load(path: Path) -> None:
+    """读上次改签名/发说说的状态，避免重启后立刻又发一遍。"""
+    global _SOCIAL_PATH
+    _SOCIAL_PATH = path
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except Exception as exc:                    # noqa: BLE001  坏文件不该拦住启动
+        logger.warning(f"[jinyu] 社交状态读取失败: {exc}")
+        return
+    if isinstance(data, dict):
+        _SOCIAL_STATE.update(data)
+
+
+def _social_save() -> None:
+    if _SOCIAL_PATH is None:
+        return
+    try:
+        tmp = _SOCIAL_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_SOCIAL_STATE, ensure_ascii=False),
+                       encoding="utf-8")
+        tmp.replace(_SOCIAL_PATH)
+    except Exception as exc:                    # noqa: BLE001
+        logger.warning(f"[jinyu] 社交状态保存失败: {exc}")
+
+
+def _clip(text: str, limit: int, keep_lines: bool = False) -> str:
+    """清掉控制符并限长；签名压成一行，说说允许换行。"""
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f]", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not keep_lines:
+        text = " ".join(text.split())
+    return text[:limit].strip()
+
+
+def _take_social(reply: str):
+    """把 [[sign:..]] / [[qzone:..]] 从回复里摘掉，返回 (剩余文字, [(类型, 内容)])。"""
+    posts = []
+
+    def _grab(m):
+        kind = m.group(1).lower()
+        body = _clip(m.group(2), 500, keep_lines=True)
+        if body:
+            posts.append(("sign" if kind in ("sign", "签名") else "qzone", body))
+        return ""
+
+    return _SOCIAL_RE.sub(_grab, reply or ""), posts
+
+
+def _post_hint() -> str:
+    """给前台模型的签名/空间使用说明；两个功能都关掉时不追加。"""
+    lines = []
+    if SIGN_ON:
+        lines.append(
+            "- [[sign:一句新的个性签名]]：只有和主人聊到情绪激动、情真意切，"
+            "或者你真心想留下点什么时才改；一天最多一次，平时绝对不要用")
+    if QZONE_ON:
+        lines.append(
+            "- [[qzone:一条说说内容]]：只有你自己遇到特别有趣的事、或者想记录"
+            "此刻的生活时才发；一天最多一条，没有这种冲动就不发")
+    if not lines:
+        return ""
+    return ("\n\n【签名与QQ空间——极少数才用】\n" + "\n".join(lines)
+            + "\n这两个标记会自动执行，不会出现在聊天文字里；不要为了用而用。")
+
+
+async def _change_sign(body: str, event) -> bool:
+    """改签名：只认管理员触发，且受冷却与内容去重限制。"""
+    if not SIGN_ON or event is None:
+        return False
+    if str(getattr(event, "user_id", "")) not in ADMIN:
+        logger.info("[jinyu] 签名改动被忽略：不是管理员触发")
+        return False
+    text = _clip(body, 100)
+    if not text or text == _SOCIAL_STATE.get("sign_text"):
+        return False
+    now = time.time()
+    if now - float(_SOCIAL_STATE.get("sign_at") or 0.0) < SIGN_GAP:
+        logger.info("[jinyu] 签名改动被忽略：还在冷却期")
+        return False
+    bot = get_bot()
+    await bot.call_api("set_self_longnick", longNick=text)
+    _SOCIAL_STATE.update({"sign_at": now, "sign_text": text})
+    _social_save()
+    logger.info(f"[jinyu] 个性签名已更新：{text}")
+    return True
+
+
+async def _post_qzone(body: str) -> bool:
+    """发说说：每日条数与最小间隔双限，失败由调用方静默。"""
+    if not QZONE_ON or QZONE_DAILY <= 0:
+        return False
+    text = _clip(body, 500, keep_lines=True)
+    if not text or text == _SOCIAL_STATE.get("qzone_text"):
+        return False
+    now = time.time()
+    today = date.today().isoformat()
+    if _SOCIAL_STATE.get("qzone_day") != today:
+        _SOCIAL_STATE.update({"qzone_day": today, "qzone_count": 0})
+    if int(_SOCIAL_STATE.get("qzone_count") or 0) >= QZONE_DAILY:
+        logger.info("[jinyu] 说说被忽略：今天的额度已用完")
+        return False
+    if now - float(_SOCIAL_STATE.get("qzone_at") or 0.0) < QZONE_GAP:
+        logger.info("[jinyu] 说说被忽略：还没到最小间隔")
+        return False
+    bot = get_bot()
+    await bot.call_api("send_qzone_msg", content=text, images=[],
+                       ugc_right=QZONE_RIGHT)
+    _SOCIAL_STATE.update({
+        "qzone_at": now,
+        "qzone_count": int(_SOCIAL_STATE.get("qzone_count") or 0) + 1,
+        "qzone_text": text,
+    })
+    _social_save()
+    logger.info(f"[jinyu] 已发QQ空间说说（ugc_right={QZONE_RIGHT}）：{text[:60]}")
+    return True
+
+
+async def _run_social(kind: str, body: str, event) -> None:
+    try:
+        if kind == "sign":
+            await _change_sign(body, event)
+        else:
+            await _post_qzone(body)
+    except Exception as exc:                    # noqa: BLE001  签名/说说失败不能影响聊天
+        logger.warning(f"[jinyu] {kind} 执行失败: {exc}")
+
+
+# ---------- 社交圈模式：全局一份记忆 + 按人好感度（独立 db） ----------
+def _social_conn():
+    if SOCIAL_DB is None:
+        raise RuntimeError("社交圈数据库未初始化")
+    return sqlite3.connect(str(SOCIAL_DB))
+
+
+def _contacts_init() -> None:
+    with _social_conn() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS social_contacts("
+                  "qq TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',"
+                  " affinity REAL NOT NULL DEFAULT 50,"
+                  " note TEXT NOT NULL DEFAULT '',"
+                  " updated_at TEXT DEFAULT (datetime('now')))")
+
+
+def _contact_rows(limit=30):
+    """联系人列表：主人永远排最前，其余按好感降序。"""
+    if SOCIAL_DB is None or not SOCIAL_DB.exists():
+        return []
+    try:
+        with _social_conn() as c:
+            rows = c.execute("SELECT qq, name, affinity, note FROM social_contacts"
+                             " ORDER BY affinity DESC, updated_at DESC").fetchall()
+    except Exception as exc:                    # noqa: BLE001  联系人表坏了不能影响聊天
+        logger.warning(f"[jinyu] 联系人读取失败: {exc}")
+        return []
+    master = [r for r in rows if str(r[0]) in ADMIN]
+    others = [r for r in rows if str(r[0]) not in ADMIN]
+    return (master + others)[:max(1, int(limit))]
+
+
+def _social_name(event) -> str:
+    """社交圈里的说话人显示名：群名片优先，私聊用昵称。"""
+    if isinstance(event, GroupMessageEvent):
+        return _speaker(event)
+    sender = getattr(event, "sender", None)
+    name = _clean_name(getattr(sender, "nickname", "") or "")
+    if not name:
+        name = f"私聊{str(getattr(event, 'user_id', ''))[-4:]}"
+    return name
+
+
+def _social_touch(event) -> str:
+    """记录说话人（新人默认好感 50，主人固定 100），返回显示名。"""
+    qq = str(getattr(event, "user_id", "") or "")
+    if not qq:
+        return ""
+    name = _social_name(event)
+    master = qq in ADMIN
+    try:
+        with _social_conn() as c:
+            row = c.execute("SELECT affinity FROM social_contacts WHERE qq=?",
+                            (qq,)).fetchone()
+            if row is None:
+                c.execute("INSERT INTO social_contacts(qq,name,affinity) VALUES(?,?,?)",
+                          (qq, name, 100.0 if master else 50.0))
+            else:
+                c.execute("UPDATE social_contacts SET name=?, affinity=?,"
+                          " updated_at=datetime('now') WHERE qq=?",
+                          (name, 100.0 if master else float(row[0]), qq))
+    except Exception as exc:                    # noqa: BLE001
+        logger.warning(f"[jinyu] 联系人记录失败 qq={qq}: {exc}")
+    return name
+
+
+def _social_label(event) -> str:
+    """社交圈里的稳定说话人标签：昵称(QQ)。同名的人靠 QQ 也能分开。"""
+    qq = str(getattr(event, "user_id", "") or "")
+    name = _social_name(event)
+    return f"{name}({qq})" if qq else name
+
+
+def _social_text(event, text: str) -> str:
+    """社交圈消息前缀：标清群/私聊和说话人，全局记忆才分得清谁是谁。"""
+    _social_touch(event)
+    label = _social_label(event)
+    if isinstance(event, GroupMessageEvent):
+        return f"[群{event.group_id}] {label}：{text}"
+    return f"[私聊] {label}：{text}"
+
+
+def _social_hint() -> str:
+    lines = []
+    for qq, name, aff, _note in _contact_rows(30):
+        if str(qq) in ADMIN:
+            lines.append(f"- {name}({qq})：主人，好感永远 100，最重要的人")
+        else:
+            lines.append(f"- {name}({qq})：好感 {float(aff):.0f}/100")
+    people = "\n".join(lines) if lines else "（还没有认识其他人）"
+    return f"""
+
+【社交圈模式】
+- 你没有分开的聊天窗口：所有群和私聊共用同一段记忆，像真人只有一个社交圈
+- 每条消息开头的「[群号]/[私聊] 昵称(QQ)：」是说话人标签；同一标签是同一个人，
+  同名的人靠括号里的 QQ 区分，别把不同人当成同一人
+- 你记得别人在别的群/私聊里说过的话，但不要主动把某人的私聊内容讲给另一个人听
+- 对主人永远是最高的好感（100），但不同事情上可以有细微的情绪差别，不是无脑顺从
+- 对其他人的好感（0-100，50 是普通朋友）如下，会随相处慢慢变化：
+{people}
+- 好感高的人可以更亲近随意，好感低的人保持客气或疏远，不要假装很熟
+- 私聊里也要带着群里的记忆去认识对方；群聊回复保持简短"""
+
+
+def _social_report() -> str:
+    """管理员查看社交圈开关、独立记忆库与人际好感。"""
+    lines = [f"【社交圈模式】{'开启' if SOCIAL_ON else '关闭'}"]
+    if SOCIAL_DB is not None:
+        lines.append(f"独立记忆库：{SOCIAL_DB}")
+    rows = _contact_rows(200)
+    if rows:
+        lines.append(f"联系人 {len(rows)} 位（好感 0-100，50 是普通朋友）：")
+        for qq, name, aff, note in rows[:20]:
+            role = "主人（永远 100）" if str(qq) in ADMIN else f"{float(aff):.0f}"
+            tail = f"｜{note}" if str(note or "") else ""
+            lines.append(f"- {name}（QQ {qq}）：{role}{tail}")
+        if len(rows) > 20:
+            lines.append(f"……另有 {len(rows) - 20} 位未显示")
+    else:
+        lines.append("还没有记录任何联系人。")
+    lines.append("开启：/social on｜关闭：/social off｜查看：/social status")
+    return "\n".join(lines)
+
+
+def _social_switch(on: bool, save: bool = True) -> None:
+    """切换记忆体：on=社交圈库，off=原来的分离上下文库。只切指针，不合并数据。"""
+    global mw, SOCIAL_ON
+    if on:
+        _social_ensure()
+        mw = mw_social
+        SOCIAL_ON = True
+    else:
+        if mw_plain is not None:
+            mw = mw_plain
+        SOCIAL_ON = False
+    if save:
+        _SOCIAL_STATE["mode"] = "on" if on else "off"
+        _social_save()
+
+
+def _social_ensure():
+    """懒加载社交圈记忆体；独立 db，除人设与主人身份外不与原库共享。"""
+    global mw_social
+    if mw_social is not None:
+        return mw_social
+    if SOCIAL_DB is None:
+        raise RuntimeError("社交圈数据库路径未初始化")
+    mw_social = RPContextMiddleware(
+        from_env("front"), from_env("back"), DB(str(SOCIAL_DB)),
+        max_tokens=int(os.environ.get("RP_MAX_TOKENS") or 64000),
+        output_reserve=int(os.environ.get("RP_OUTPUT_RESERVE") or 4096),
+        profile=os.environ.get("RP_PROFILE") or "cl100k",
+        social=True,
+    )
+    _contacts_init()
+    logger.info(f"[jinyu] 社交圈记忆体就绪 db={SOCIAL_DB}")
+    return mw_social
+
+
+def _social_affinity_tick() -> None:
+    """定期让后台模型复盘最近对话，给非主人的联系人加减好感度。"""
+    if not SOCIAL_ON or mw_social is None:
+        return
+    rows = mw_social.db.turns_after(
+        CID, int(_SOCIAL_STATE.get("affinity_id") or 0), 200)
+    if len(rows) < 6:
+        return
+    contacts = []
+    for qq, name, aff, _note in _contact_rows(30):
+        contacts.append(f"{qq}｜{name}｜{float(aff):.0f}")
+    if not contacts:
+        return
+    dialogue = "\n".join(f"{r['role']}: {str(r['content'])[:200]}" for r in rows)
+    masters = "、".join(sorted(ADMIN)) or "（未配置）"
+    prompt = AFFINITY_PROMPT.replace("{master}", masters) \
+        .replace("{contacts}", "\n".join(contacts)) \
+        .replace("{dialogue}", dialogue[:6000])
+    reply = mw_social.back.chat([{"role": "user", "content": prompt}],
+                                temperature=0.2, max_tokens=800, json_mode=True)
+    data = parse_json(reply) or {}
+    updates = data.get("updates") if isinstance(data, dict) else []
+    known = {str(r[0]) for r in _contact_rows(200)}
+    changed = 0
+    with _social_conn() as c:
+        for item in updates or []:
+            if not isinstance(item, dict):
+                continue
+            qq = str(item.get("qq") or "").strip()
+            if qq not in known or qq in ADMIN:
+                continue
+            try:
+                delta = max(-10.0, min(10.0, float(item.get("delta") or 0)))
+            except (TypeError, ValueError):
+                continue
+            note = str(item.get("note") or "")[:80]
+            c.execute("UPDATE social_contacts SET affinity=MAX(0,MIN(100,affinity+?)),"
+                      " note=?, updated_at=datetime('now') WHERE qq=?",
+                      (delta, note, qq))
+            changed += 1
+    _SOCIAL_STATE["affinity_id"] = int(rows[-1]["id"])
+    _social_save()
+    logger.info(f"[jinyu] 好感度复盘：{len(rows)} 轮，{changed} 人变化")
+
+
+AFFINITY_PROMPT = """你在维护一个QQ角色对社交圈里每个人的好感度（0-100，50 是普通朋友）。
+主人（QQ：{master}）的好感永远 100，不要更新，也不要评价主人。
+当前联系人（QQ｜昵称｜当前好感）：
+{contacts}
+
+最近对话（role: 内容，用户消息带说话人前缀）：
+{dialogue}
+
+只判断这段时间里每个人和角色的关系有没有真实变化：
+被关心、陪伴、真诚聊天可以 +1~+5；被冒犯、欺骗、恶意冷落可以 -1~-8；
+普通闲聊、没有明显变化就不要写。delta 取 -10~+10 的整数。
+只输出 JSON：{"updates":[{"qq":"12345","delta":3,"note":"一起聊猫，气氛轻松"}]}
+没有变化就输出 {"updates":[]}。"""
+
+
+async def _social_affinity_loop():
+    while True:
+        try:
+            await asyncio.sleep(max(600.0, SOCIAL_AFFINITY_HOURS * 3600))
+            if SOCIAL_ON:
+                await asyncio.to_thread(_social_affinity_tick)
+        except Exception as exc:                # noqa: BLE001  复盘失败不能拖垮机器人
+            logger.warning(f"[jinyu] 好感度复盘失败: {exc}")
 
 
 async def _send_poke(event) -> bool:
@@ -907,7 +1357,7 @@ async def _on_poke(event) -> None:
     if mw is None:
         return
     gid = getattr(event, "group_id", None)
-    sid = f"qq-g{gid}" if gid else f"qq-u{uid}"
+    sid = SOCIAL_SID if SOCIAL_ON else (f"qq-g{gid}" if gid else f"qq-u{uid}")
     key = f"{sid}:{uid}"
     loop = asyncio.get_running_loop()
     now = loop.time()
@@ -919,17 +1369,25 @@ async def _on_poke(event) -> None:
         _last_seen[sid] = now                        # 戳一下也算互动，重置闲置计时
     if is_group:
         name = await _mention_name_async(get_bot(), int(gid), uid)
+    elif SOCIAL_ON:
+        # 社交圈里私聊戳一戳的也可能是别人：按联系人记名字与好感
+        name = await asyncio.to_thread(_social_touch, event) or "主人"
     else:
         name = "主人"
+    label = f"{name}({uid})" if SOCIAL_ON else name
     text = (f"（系统事件：{name}戳了戳你。回一句符合人设的话，短一点；"
             f"别问「在吗」，别解释这是系统事件。）")
     if is_group:
-        text = f"{name}：{text}"
+        text = f"[群{gid}] {label}：{text}" if SOCIAL_ON else f"{name}：{text}"
+    elif SOCIAL_ON:
+        text = f"[私聊] {label}：{text}"
     persona = dict(PERSONA)
     if rich_enabled():
         persona["core"] = persona["core"] + rich_hint()
-    if is_group:
+    if is_group and not SOCIAL_ON:
         persona["core"] = persona["core"] + GROUP_HINT
+    if SOCIAL_ON:
+        persona["core"] = persona["core"] + await asyncio.to_thread(_social_hint)
     lock = _locks.setdefault(sid, asyncio.Lock())
     session_sid = sid
     reply = ""
@@ -939,7 +1397,8 @@ async def _on_poke(event) -> None:
                 mw.session_identity, sid, CID, EPOCH_SECONDS, flush_timeout=EPOCH_FLUSH)
             reply = await asyncio.to_thread(
                 mw.chat, text, persona, session_sid, CID,
-                (lambda r: _strip_speaker_prefix(r, name)) if is_group else None)
+                (lambda r: _strip_speaker_prefix(r, label))
+                if (is_group or SOCIAL_ON) else None)
         except Exception as exc:                     # noqa: BLE001
             logger.exception(f"[jinyu] 戳一戳回复失败 sid={sid}: {exc}")
     if reply:
@@ -964,7 +1423,9 @@ def _persona_report(event: MessageEvent) -> str:
     extra = []
     if rich_enabled():
         extra.append("富消息说明（图片/贴纸/语音/搜图标记）")
-    if isinstance(event, GroupMessageEvent):
+    if SOCIAL_ON:
+        extra.append("社交圈模式（全局一份记忆、按人记词条与好感度）")
+    elif isinstance(event, GroupMessageEvent):
         extra.append("群聊模式（说话人前缀、按昵称互动）")
     parts = [
         f"【当前会话】{_sid(event)}｜角色={PERSONA.get('name') or '?'}"
@@ -982,8 +1443,10 @@ def _persona_report(event: MessageEvent) -> str:
 
 
 def _owner_label(base: str) -> str:
-    """qq-u123456 -> 私聊 123456；qq-g789 -> 群 789。"""
+    """qq-u123456 -> 私聊 123456；qq-g789 -> 群 789；qq-social -> 社交圈（全局）。"""
     b = str(base or "")
+    if b == SOCIAL_SID:
+        return "社交圈（全局）"
     if b.startswith("qq-g"):
         return f"群 {b[4:]}"
     if b.startswith("qq-u"):
@@ -1003,6 +1466,9 @@ def _fact_line(row, with_owner=False) -> str:
             f"{float(row['importance'] or 0):.2f}]")
     if tag_list:
         line += " " + "/".join(map(str, tag_list))
+    speaker = str(row["speaker"] or "") if "speaker" in row.keys() else ""
+    if speaker:
+        line += f"（{speaker}）"
     return line + " → " + str(row["fact"])
 
 
@@ -1267,6 +1733,56 @@ async def _admin(event: MessageEvent, text: str) -> bool:
                              f"当前标签：{'、'.join(res[1]) or '无'}\n"
                              "同一张图再发会直接用新结果；已写进长期记忆的旧说法用 /memory del 清。")
         return True
+    if cmd in ("social", "社交圈"):
+        act = (arg.split() or [""])[0].lower()
+        if act in ("on", "开", "开启"):
+            try:
+                await asyncio.to_thread(_social_switch, True)
+            except Exception as exc:                # noqa: BLE001  建库失败不能切半截
+                logger.exception(f"[jinyu] 社交圈开启失败: {exc}")
+                await matcher.finish(f"社交圈开启失败：{exc}")
+            await matcher.finish(
+                "社交圈模式已开启：所有群和私聊共用一份记忆（独立记忆库，"
+                "不与原来的记忆合并），按人记录词条和好感度。")
+        if act in ("off", "关", "关闭"):
+            await asyncio.to_thread(_social_switch, False)
+            await matcher.finish("社交圈模式已关闭：回到每个群/私聊各自分离的记忆。")
+        await matcher.finish(await asyncio.to_thread(_social_report))
+        return True
+    if cmd in ("merge", "合并"):
+        words = arg.split()
+        do_all = any(w in ("all", "全部") for w in words)
+        do_go = any(w in ("go", "执行") for w in words)
+        if mw is None:
+            await matcher.finish("记忆体还没就绪，稍后再试。")
+        if do_all:
+            bases = [o["base"] for o in mw.db.fact_owners(CID)
+                     if int(o["n"] or 0) >= 2]
+        else:
+            bases = [_sid(event).split("#")[0]]
+        if not bases:
+            await matcher.finish("没有可合并的会话（事实不足 2 条）。")
+        await matcher.send(f"开始{'合并' if do_go else '试跑'} {len(bases)} 个会话，请稍等…")
+        lines, groups_n, removed_n = [], 0, 0
+        for base in bases[:8]:
+            try:
+                groups = await asyncio.to_thread(mw.merge_facts, base, CID, do_go)
+            except Exception as exc:                # noqa: BLE001  单个会话失败不影响其余
+                lines.append(f"{_owner_label(base)}：失败 {type(exc).__name__}")
+                continue
+            for g in groups[:6]:
+                groups_n += 1
+                removed_n += int(g.get("removed") or 0)
+                lines.append(f"{_owner_label(base)}：{len(g['ids'])} 条并成「{g['fact']}」")
+        if not lines:
+            await matcher.finish("没发现重复词条。")
+        head = (f"合并完成：{groups_n} 组，删除 {removed_n} 条重复（含各 epoch 副本）"
+                if do_go else f"试跑：{groups_n} 组可能重复，未写库")
+        tail = "" if do_go else "\n确认无误后发 /merge go（全部会话：/merge all go）"
+        if do_all and len(bases) > 8:
+            tail += f"\n本次只处理前 8 个会话（共 {len(bases)} 个），可再发一次继续。"
+        await matcher.finish(head + "\n" + "\n".join(lines[:20]) + tail)
+        return True
     if cmd == "testrich":
         await matcher.send("【自测】文本 OK")
         await matcher.send(Message(MessageSegment.face(14)))
@@ -1421,7 +1937,10 @@ async def _handle(event: MessageEvent):
         # 已经连续沉默到上限：这一轮把规则说在前面，逼它开口，避免真的变成哑巴
         text += ("（系统提示：你已经连续两轮没回话了，这一轮必须开口回应，"
                  "不要再输出 [[pass]]。）")
-    if is_group:
+    if SOCIAL_ON:
+        # 社交圈：标清群号/私聊与说话人，全局一份上下文才分得清谁是谁
+        text = await asyncio.to_thread(_social_text, event, text)
+    elif is_group:
         text = _group_text(event, text)   # 群消息加说话人前缀 → 共享上下文分得清谁说的
     lock = _locks.setdefault(sid, asyncio.Lock())
     # PERSONA 是宪法层字典（core 字段才是系统提示词）。传副本并只在副本上追加
@@ -1429,9 +1948,12 @@ async def _handle(event: MessageEvent):
     persona = dict(PERSONA)
     if rich_enabled():
         persona["core"] = persona["core"] + rich_hint()
-    if is_group:
+    if is_group and not SOCIAL_ON:
         persona["core"] = persona["core"] + GROUP_HINT
     persona["core"] = persona["core"] + SILENCE_HINT   # 允许沉默（[[pass]]），QQ 侧才生效
+    persona["core"] = persona["core"] + _post_hint()   # 签名/说说：默认不用，条件苛刻
+    if SOCIAL_ON:
+        persona["core"] = persona["core"] + await asyncio.to_thread(_social_hint)
     async with lock:
         try:
             # 闲置轮换：超过阈值先把旧 epoch 尾部归档并标 closed，再开新会话；
@@ -1440,7 +1962,8 @@ async def _handle(event: MessageEvent):
                 mw.session_identity, sid, CID, EPOCH_SECONDS,
                 flush_timeout=EPOCH_FLUSH)
             t0 = loop.time()
-            speaker = _speaker(event) if is_group else ""
+            speaker = (_social_label(event) if SOCIAL_ON
+                       else (_speaker(event) if is_group else ""))
             reply = await asyncio.to_thread(
                 mw.chat, text, persona, session_sid, CID,
                 (lambda r: _strip_speaker_prefix(r, speaker)) if speaker else None)
@@ -1461,4 +1984,7 @@ async def _handle(event: MessageEvent):
             await _send_rich("……嗯。")
         return
     _silent_count[sid] = 0
+    reply, posts = _take_social(reply)          # 签名/说说标记不发给用户，后台静默执行
+    for kind, body in posts:
+        asyncio.create_task(_run_social(kind, body, event))
     await _send_rich(reply)

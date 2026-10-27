@@ -16,13 +16,13 @@ R6-R9 阶段二：事件卡扩列（rel_hooks / knowledge_boundary / importance 
 保留：turns 同步落库、游标只在卡落库后推进、账本按 (sid,cid) 隔离。
 演示：python demo.py；回归：python test_regression.py
 """
-import copy, hashlib, json, logging, math, queue, re, sqlite3, threading, time, uuid
+import copy, difflib, hashlib, json, logging, math, queue, re, sqlite3, threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import conflict, promise, retriever
 from persona_guard import PersonaGuard
-from summarizer import summarize
+from summarizer import parse as parse_json, summarize
 
 logger = logging.getLogger("rp_memory")
 
@@ -45,6 +45,32 @@ _FACT_TEMP = re.compile(
 # 「还不知道 / 名字未知」这类陈述会被后来的事实覆盖，别让它压过同名的最新设定
 _FACT_STALE = re.compile(
     r"(尚不(知道|清楚|了解)|还不知道|尚未(知道|确认)|名字未知|暂时不知道)")
+
+_FACT_PUNCT = re.compile(r"[\s，。！？、,.!?;；:：\"'“”‘’（）()\[\]【】…—~·/]+")
+
+
+def _fact_core(text):
+    """事实正文归一化：去标点空白，用来判断两条是不是同一句话。"""
+    return _FACT_PUNCT.sub("", str(text or "")).lower()
+
+
+# 定期合并用的提示词：只判「指同一件事」，不判语义相近，宁可漏并不可错并
+MERGE_PROMPT = """你在整理同一会话的长期记忆词条，目标是去掉重复、保留信息最全的那条。
+
+编号事实（编号｜正文｜标签｜类别｜说话人）：
+{rows}
+
+规则：
+1. 只有「指的是同一件事、同一条设定」才合并。只是提到同一个对象但说的不是一回事
+   （例如「养了猫」和「猫爱吃鱼」）不要合并。
+   不同说话人的事实绝对不能合并，哪怕正文一模一样。
+2. 说法不同但能看出是同一件事的，可以合并；明显矛盾、无法判断谁对的不要合并。
+3. 每组给出 ids（至少 2 个编号）、keep（保留哪条编号，优先信息最全的）、
+   fact（合并后的一句话，保留组内所有已知信息，≤40 字）、
+   tags（2-5 个检索标签，合并组内所有有用标签）。
+4. 没有重复就返回 {"groups": []}。
+
+只输出 JSON：{"groups":[{"ids":[1,2],"keep":1,"fact":"...","tags":["..."]}]}"""
 
 
 def _fact_tags(raw):
@@ -87,12 +113,13 @@ def _fact_labels(fact, category="", importance=None):
 def _fact_item(raw):
     """后台输出的事实条目 → 落库字段（老格式是纯字符串，保持兼容）。"""
     if isinstance(raw, str):
-        text, tags, cat, imp, ttl = raw.strip(), [], "", None, None
+        text, tags, cat, imp, ttl, speaker = raw.strip(), [], "", None, None, ""
     elif isinstance(raw, dict):
         text = str(raw.get("fact") or "").strip()
         tags = _fact_tags(raw.get("tags"))
         cat = str(raw.get("category") or "").strip()
         imp, ttl = raw.get("importance"), raw.get("ttl_hours")
+        speaker = str(raw.get("speaker") or raw.get("about") or "").strip()[:32]
     else:
         return None
     if not text:
@@ -113,7 +140,7 @@ def _fact_item(raw):
             time.time() + hours * 3600, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     return {"fact": text[:40], "tags": json.dumps(tags, ensure_ascii=False),
             "importance": max(0.0, min(1.0, imp)),
-            "category": cat, "expires_at": expires}
+            "category": cat, "expires_at": expires, "speaker": speaker}
 
 
 # 实测 token/汉字（详见 token_estimate.py）：cl100k 1.31–1.43、o200k 0.97、Qwen2.5 0.81。
@@ -232,8 +259,8 @@ CREATE TABLE IF NOT EXISTS durable_facts(
   turn_end INTEGER NOT NULL, fact TEXT NOT NULL,
   tags TEXT NOT NULL DEFAULT '[]', importance REAL NOT NULL DEFAULT 0.5,
   category TEXT NOT NULL DEFAULT '', expires_at TEXT DEFAULT NULL,
-  created_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(session_id, character_id, fact));
+  created_at TEXT DEFAULT (datetime('now')), speaker TEXT NOT NULL DEFAULT '',
+  UNIQUE(session_id, character_id, fact, speaker));
 CREATE TABLE IF NOT EXISTS session_epoch(
   base_sid TEXT NOT NULL, character_id TEXT NOT NULL,
   epoch INTEGER NOT NULL DEFAULT 0, last_active REAL NOT NULL,
@@ -271,6 +298,7 @@ FACT_EXTRA_COLS = {
     "importance": "REAL NOT NULL DEFAULT 0.5",
     "category": "TEXT NOT NULL DEFAULT ''",
     "expires_at": "TEXT DEFAULT NULL",
+    "speaker": "TEXT NOT NULL DEFAULT ''",   # 社交圈：这条事实属于谁（空=通用/单聊）
 }
 
 
@@ -327,6 +355,29 @@ class DB:
         for name, decl in FACT_EXTRA_COLS.items():
             if name not in fcols:
                 conn.execute(f"ALTER TABLE durable_facts ADD COLUMN {name} {decl}")
+        # 老库唯一键不含 speaker：不同人说同一句话会互相顶掉。重建表补进唯一键。
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table'"
+                           " AND name='durable_facts'").fetchone()
+        table_sql = str(row[0] if row else "")
+        if not re.search(r"UNIQUE\s*\([^)]*\bspeaker\b", table_sql, re.I):
+            conn.execute("ALTER TABLE durable_facts RENAME TO durable_facts_old")
+            conn.execute(
+                "CREATE TABLE durable_facts("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,"
+                " character_id TEXT NOT NULL, turn_end INTEGER NOT NULL,"
+                " fact TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]',"
+                " importance REAL NOT NULL DEFAULT 0.5,"
+                " category TEXT NOT NULL DEFAULT '', expires_at TEXT DEFAULT NULL,"
+                " created_at TEXT DEFAULT (datetime('now')),"
+                " speaker TEXT NOT NULL DEFAULT '',"
+                " UNIQUE(session_id, character_id, fact, speaker))")
+            conn.execute(
+                "INSERT INTO durable_facts(id, session_id, character_id, turn_end, fact,"
+                " tags, importance, category, expires_at, created_at, speaker)"
+                " SELECT id, session_id, character_id, turn_end, fact, tags, importance,"
+                " category, expires_at, created_at, speaker FROM durable_facts_old")
+            conn.execute("DROP TABLE durable_facts_old")
+            logger.info("durable_facts 唯一键已重建（加入 speaker，兼容社交圈）")
 
     @contextmanager
     def _c(self):
@@ -362,6 +413,17 @@ class DB:
             args.append(hi)
         with self._c() as c:
             return [dict(r) for r in c.execute(sql + " ORDER BY turn_idx, id", args)]
+
+    def turns_after(self, cid, after_id=0, limit=200):
+        """社交圈好感度复盘用：按自增 id 取游标之后的对话（跨 epoch 也连续）。
+
+        不能用 turn_idx 当游标：开新 epoch 后轮号从 1 重新算，会漏掉新会话。
+        """
+        with self._c() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT id, session_id, turn_idx, role, content FROM turns"
+                " WHERE character_id=? AND id>? ORDER BY id LIMIT ?",
+                (cid, int(after_id), max(1, int(limit))))]
 
     def get_cursor(self, sid, cid) -> int:
         with self._c() as c:
@@ -407,15 +469,69 @@ class DB:
                 f = _fact_item(raw)
                 if not f:
                     continue
+                if self._absorb_fact(c, cid, sid, f):   # 已有同义条目：并进去，不新增
+                    continue
                 c.execute("INSERT OR IGNORE INTO durable_facts"
                           "(session_id,character_id,turn_end,fact,tags,importance,"
-                          " category,expires_at) VALUES(?,?,?,?,?,?,?,?)",
+                          " category,expires_at,speaker) VALUES(?,?,?,?,?,?,?,?,?)",
                           (sid, cid, hi, f["fact"], f["tags"], f["importance"],
-                           f["category"], f["expires_at"]))
+                           f["category"], f["expires_at"], f["speaker"]))
             c.execute("INSERT OR REPLACE INTO archive_cursor VALUES(?,?,?)", (sid, cid, hi))
             c.execute("DELETE FROM archive_failures WHERE session_id=? AND character_id=?"
                       " AND turn_start>=? AND turn_end<=?", (sid, cid, lo, hi))
         return inserted
+
+    def _absorb_fact(self, c, cid, sid, f) -> bool:
+        """写库前的保守去重：与已有事实一字不差时并进去，不再新增一行。
+
+        只挡归一化后完全相同、或相似度 ≥0.95 且标签有交集的重复；同义改写
+        交给定期合并里的后台模型判断——这里宁可漏并，也不要把不同设定并错。
+        """
+        base = str(sid).split("#")[0]
+        rows = c.execute(
+            "SELECT id, fact, tags, importance, category, expires_at, speaker"
+            " FROM durable_facts"
+            " WHERE character_id=? AND (session_id=? OR session_id LIKE ?)",
+            (cid, base, base + "#%")).fetchall()
+        core, tags = _fact_core(f["fact"]), set(_fact_tags(f["tags"]))
+        speaker = str(f.get("speaker") or "")
+        best = None
+        for r in rows:
+            if str(r["speaker"] or "") != speaker:   # 不同人的事实即使同句也不能并
+                continue
+            other = _fact_core(r["fact"])
+            if not other:
+                continue
+            if other == core:
+                score = 1.0
+            else:
+                score = difflib.SequenceMatcher(None, core, other).ratio()
+                if score < 0.95 or not (tags & set(_fact_tags(r["tags"]))):
+                    continue
+            if best is None or score > best[0]:
+                best = (score, r)
+        if best is None:
+            return False
+        r = best[1]
+        merged = sorted(tags | set(_fact_tags(r["tags"])))[:12]
+        imp = max(float(f["importance"]), float(r["importance"] or 0.5))
+        # 任一条是永久设定就按永久算；都有期限取更晚的，别把长期事实提前作废
+        exp = (None if f["expires_at"] is None or r["expires_at"] is None
+               else max(f["expires_at"], r["expires_at"]))
+        richer = len(f["fact"]) > len(r["fact"])
+        if richer:
+            try:
+                c.execute("UPDATE durable_facts SET fact=?, tags=?, importance=?,"
+                          " category=?, expires_at=? WHERE id=?",
+                          (f["fact"], json.dumps(merged, ensure_ascii=False), imp,
+                           f["category"] or r["category"], exp, r["id"]))
+            except sqlite3.IntegrityError:      # 新正文与另一行撞键：只并标签
+                c.execute("UPDATE durable_facts SET tags=?, importance=? WHERE id=?",
+                          (json.dumps(merged, ensure_ascii=False), imp, r["id"]))
+        else:
+            c.execute("UPDATE durable_facts SET tags=?, importance=? WHERE id=?",
+                      (json.dumps(merged, ensure_ascii=False), imp, r["id"]))
+        return True
 
     def list_facts(self, sid, cid, limit=12, query="", budget=1200):
         """长期事实召回：标签优先 → 正文核验 → 热力排序，命中不足按热力兜底。
@@ -426,8 +542,8 @@ class DB:
         - 兜底：一条都没命中时按热力补到 limit 条，避免「完全不检索」
         """
         with self._c() as c:
-            rows = c.execute("SELECT id, fact, tags, importance, category, expires_at"
-                             " FROM durable_facts"
+            rows = c.execute("SELECT id, fact, tags, importance, category, expires_at,"
+                             " speaker FROM durable_facts"
                              " WHERE session_id=? AND character_id=?"
                              " ORDER BY id DESC", (sid, cid)).fetchall()
         now = datetime.fromtimestamp(time.time(), timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -447,7 +563,9 @@ class DB:
                 elif any(k in r["fact"] for k in one):
                     text_hit = 1
             hit = (3.0 if tag_hit else 0.0) + text_hit
-            scored.append((hit * (0.5 + heat) if hit else 0.0, heat, r["id"], r["fact"]))
+            spk = str(r["speaker"] or "")
+            label = f"[{spk}] {r['fact']}" if spk else r["fact"]
+            scored.append((hit * (0.5 + heat) if hit else 0.0, heat, r["id"], label))
         scored.sort(reverse=True)
         picked, used = [], 0
         for score, _, _, fact in scored:
@@ -477,16 +595,16 @@ class DB:
         turn_end 记 0，让继承来的事实排在本 epoch 新事实之后（新→旧展示）。
         """
         with self._c() as c:
-            rows = c.execute("SELECT fact, tags, importance, category, expires_at"
+            rows = c.execute("SELECT fact, tags, importance, category, expires_at, speaker"
                              " FROM durable_facts"
                              " WHERE session_id=? AND character_id=?"
                              " ORDER BY id DESC LIMIT ?", (old_sid, cid, limit)).fetchall()
             for r in reversed(rows):
                 c.execute("INSERT OR IGNORE INTO durable_facts"
                           "(session_id,character_id,turn_end,fact,tags,importance,"
-                          " category,expires_at) VALUES(?,?,0,?,?,?,?,?)",
+                          " category,expires_at,speaker) VALUES(?,?,0,?,?,?,?,?,?)",
                           (sid, cid, r["fact"], r["tags"], r["importance"],
-                           r["category"], r["expires_at"]))
+                           r["category"], r["expires_at"], r["speaker"]))
 
     def fact_owners(self, cid):
         """管理员视图：按 base_sid 聚合事实数，epoch 副本只算一次。
@@ -499,7 +617,7 @@ class DB:
                 "SELECT CASE WHEN instr(session_id,'#')>0"
                 " THEN substr(session_id,1,instr(session_id,'#')-1)"
                 " ELSE session_id END AS base,"
-                " COUNT(DISTINCT fact) AS n, MAX(id) AS last_id"
+                " COUNT(DISTINCT fact || char(1) || speaker) AS n, MAX(id) AS last_id"
                 " FROM durable_facts WHERE character_id=?"
                 " GROUP BY base ORDER BY last_id DESC", (cid,)).fetchall()
 
@@ -514,31 +632,75 @@ class DB:
             where += " AND (session_id=? OR session_id LIKE ?)"
             args += [base_sid, base_sid + "#%"]
         if keyword:
-            where += " AND (fact LIKE ? OR tags LIKE ?)"
-            args += [f"%{keyword}%"] * 2
+            where += " AND (fact LIKE ? OR tags LIKE ? OR speaker LIKE ?)"
+            args += [f"%{keyword}%"] * 3
         with self._c() as c:
             total = c.execute(
-                f"SELECT COUNT(DISTINCT fact) FROM durable_facts WHERE {where}",
+                "SELECT COUNT(DISTINCT fact || char(1) || speaker)"
+                f" FROM durable_facts WHERE {where}",
                 args).fetchone()[0]
             rows = c.execute(
-                "SELECT id, session_id, fact, tags, importance, category, expires_at"
-                " FROM durable_facts WHERE id IN (SELECT MAX(id) FROM durable_facts"
-                f" WHERE {where} GROUP BY fact) ORDER BY id DESC LIMIT ? OFFSET ?",
+                "SELECT id, session_id, fact, tags, importance, category, expires_at,"
+                " speaker FROM durable_facts WHERE id IN"
+                " (SELECT MAX(id) FROM durable_facts"
+                f" WHERE {where} GROUP BY fact, speaker) ORDER BY id DESC LIMIT ? OFFSET ?",
                 args + [max(1, int(limit)), max(0, int(offset))]).fetchall()
         return rows, total
 
     def del_fact(self, fact_id):
         """删除一条事实，连同它跨 epoch 的副本。返回 (正文, 删除条数, base_sid)。"""
         with self._c() as c:
-            row = c.execute("SELECT session_id, character_id, fact FROM durable_facts"
-                            " WHERE id=?", (fact_id,)).fetchone()
+            row = c.execute("SELECT session_id, character_id, fact, speaker"
+                            " FROM durable_facts WHERE id=?", (fact_id,)).fetchone()
             if not row:
                 return "", 0, ""
             base = str(row["session_id"]).split("#")[0]
             cur = c.execute("DELETE FROM durable_facts WHERE character_id=? AND fact=?"
-                            " AND (session_id=? OR session_id LIKE ?)",
-                            (row["character_id"], row["fact"], base, base + "#%"))
+                            " AND speaker=? AND (session_id=? OR session_id LIKE ?)",
+                            (row["character_id"], row["fact"], row["speaker"],
+                             base, base + "#%"))
         return row["fact"], max(0, cur.rowcount), base
+
+    def merge_rows(self, cid, base_sid):
+        """合并用：取某会话（含 epoch 副本）的全部事实，按 id 升序。"""
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT id, session_id, fact, tags, importance, category,"
+                " expires_at, turn_end, speaker FROM durable_facts WHERE character_id=?"
+                " AND (session_id=? OR session_id LIKE ?) ORDER BY id",
+                (cid, base_sid, base_sid + "#%")).fetchall()
+        return [dict(r) for r in rows]
+
+    def apply_fact_merge(self, cid, keep_id, drop_facts, fact, tags, importance,
+                         category, expires_at):
+        """把一组重复事实并到 keep_id：改正文/标签/热力，删掉其余（含 epoch 副本）。"""
+        with self._c() as c:
+            keep = c.execute("SELECT session_id, speaker FROM durable_facts"
+                             " WHERE id=? AND character_id=?",
+                             (keep_id, cid)).fetchone()
+            if not keep:
+                return 0
+            base = str(keep["session_id"]).split("#")[0]
+            speaker = str(keep["speaker"] or "")
+            removed = 0
+            for text in drop_facts:
+                cur = c.execute(
+                    "DELETE FROM durable_facts WHERE character_id=? AND fact=?"
+                    " AND speaker=? AND (session_id=? OR session_id LIKE ?)",
+                    (cid, text, speaker, base, base + "#%"))
+                removed += max(0, cur.rowcount)
+            params = (fact, json.dumps(tags, ensure_ascii=False), float(importance),
+                      category, expires_at, keep_id, cid)
+            try:
+                c.execute("UPDATE durable_facts SET fact=?, tags=?, importance=?,"
+                          " category=?, expires_at=? WHERE id=? AND character_id=?",
+                          params)
+            except sqlite3.IntegrityError:      # 合并后的正文已存在：只并标签/热力
+                c.execute("UPDATE durable_facts SET tags=?, importance=?, category=?,"
+                          " expires_at=? WHERE id=? AND character_id=?",
+                          (params[1], params[2], params[3], params[4],
+                           keep_id, cid))
+        return removed
 
     def count_cards(self, sid, cid) -> int:
         with self._c() as c:
@@ -725,8 +887,10 @@ class DB:
 class RPContextMiddleware:
     def __init__(self, front_llm, back_llm, db, keep_recent=2, archive_batch=2,
                  max_tokens=32768, output_reserve=4096, profile="cl100k",
-                 recent_limit=6, recall_limit=2, guard_retry=1, shutdown_timeout=60):
+                 recent_limit=6, recall_limit=2, guard_retry=1, shutdown_timeout=60,
+                 social=False):
         self.front, self.back, self.db = front_llm, back_llm, db
+        self.social = bool(social)                     # 社交圈：事实按人归属
         self.keep_recent = max(1, int(keep_recent))
         self.archive_batch = max(1, int(archive_batch))
         self.shutdown_timeout = shutdown_timeout       # 优雅退出总超时（逐批冲刷共用）
@@ -1028,6 +1192,72 @@ class RPContextMiddleware:
         self.db.set_continuity(sid, cid, base_sid)   # 重开时同步 closed=0
         return sid
 
+    def merge_facts(self, base_sid, cid, apply=False, limit=160):
+        """后台模型判重并合并同一会话的长期事实。
+
+        先用数据库里的事实正文/标签喂给后台模型，让它只在「指同一件事」时分组；
+        apply=False 只返回拟合并结果（干跑），True 才真正写库。返回每组的报告：
+        {"ids": [...], "fact": "...", "removed": n}，出错抛异常交给调用方记日志。
+        """
+        rows = self.db.merge_rows(cid, base_sid)
+        if len(rows) < 2:
+            return []
+        if limit and len(rows) > limit:
+            rows = rows[-limit:]                 # 只处理最近的一批，避免 prompt 过长
+        index = {i + 1: r for i, r in enumerate(rows)}
+        lines = "\n".join(
+            f"{i}｜{r['fact']}｜{'、'.join(_fact_tags(r['tags'])) or '无'}"
+            f"｜{r['category'] or '未分类'}｜{r.get('speaker') or '通用'}"
+            for i, r in index.items())
+        reply = self.back.chat(
+            [{"role": "user", "content": MERGE_PROMPT.replace("{rows}", lines)}],
+            temperature=0.2, max_tokens=1500, json_mode=True)
+        data = parse_json(reply) or {}
+        groups = data.get("groups") if isinstance(data, dict) else None
+        used, reports = set(), []
+        for g in groups or []:
+            try:
+                ids = [int(x) for x in (g.get("ids") or [])]
+            except (TypeError, ValueError):
+                continue
+            ids = [x for x in dict.fromkeys(ids) if x in index and x not in used]
+            if len(ids) < 2:
+                continue
+            if len({str(index[i].get("speaker") or "") for i in ids}) > 1:
+                continue                         # 模型跨人合并：直接丢弃这组
+            keep = g.get("keep")
+            if keep not in ids:
+                keep = max(ids, key=lambda i: (len(index[i]["fact"]),
+                                               len(_fact_tags(index[i]["tags"]))))
+            fact = str(g.get("fact") or "").strip()[:60]
+            rich = max(ids, key=lambda i: (len(index[i]["fact"]),
+                                           len(_fact_tags(index[i]["tags"]))))
+            fact = fact or index[rich]["fact"]
+            tags = set()
+            for i in ids:
+                tags |= set(_fact_tags(index[i]["tags"]))
+            for t in g.get("tags") or []:
+                t = str(t).strip()
+                if t:
+                    tags.add(t[:8])
+            tags = sorted(tags)[:12]
+            imp = max(float(index[i]["importance"] or 0.5) for i in ids)
+            exps = [index[i]["expires_at"] for i in ids]
+            exp = None if any(x is None for x in exps) else max(exps)
+            cat = next((index[i]["category"] for i in ids
+                        if index[i]["category"] == "设定"),
+                       index[keep]["category"] or "")
+            removed = 0
+            if apply:
+                removed = self.db.apply_fact_merge(
+                    cid, index[keep]["id"],
+                    [index[i]["fact"] for i in ids if i != keep],
+                    fact, tags, imp, cat, exp)
+            used.update(ids)
+            reports.append({"ids": ids, "fact": fact, "tags": tags,
+                            "removed": removed})
+        return reports
+
     def _inherit_longterm(self, old_sid, sid, cid):
         """轮换时把真正「长期有效」的东西搬到新 epoch：
 
@@ -1171,7 +1401,8 @@ class RPContextMiddleware:
                 promise.ensure_shape(lg)
                 dialogue = "\n".join(f"{t['role']}: {t['content']}" for t in turns)
                 fields, err = summarize(self.back, dialogue,          # 一次自修复重试（决策 4）
-                                        promise.prompt_lines(lg))     # E：候选承诺 ID 清单
+                                        promise.prompt_lines(lg),      # E：候选承诺 ID 清单
+                                        social=self.social)            # 社交圈：事实带 about
         except Exception as e:
             n = self.db.record_failure(sid, cid, lo, hi, e)
             logger.warning("归档失败 sid=%s cid=%s 区间=%d-%d 第%d次：%s: %s",
