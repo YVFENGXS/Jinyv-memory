@@ -77,6 +77,13 @@ PROMPT = PROMPT.replace("__SLOT_VALUES__", _slot_values_line())
 
 REPAIR = "上一条回复不是合法的事件卡 JSON，问题：{err}。请只输出符合格式的 JSON，不要任何其他文字。"
 
+# 社交圈模式：多人共用一份记忆时，事实必须标清属于谁，否则「喜欢猫」会串人
+SOCIAL_RULE = """
+10. 这是多人社交圈：每条用户消息带「[群号]/[私聊] 昵称(QQ)：」前缀。durable_facts 每条
+    必须加 "about" 字段，填冒号前的说话人标签原词（形如「小明(12345)」，含括号里的 QQ，
+    不要带群号或「私聊」）；与具体的人无关的公共事实填 ""。不要把两个人的事实合成一条。
+"""
+
 BOUNDARIES = ("self", "player", "both")
 PRECISIONS = ("strict", "normal")
 
@@ -98,9 +105,10 @@ PROMISE_HINT = ("当前未兑现承诺（本批若兑现其中某条，resolved_
                 "都不涉及则填空数组）：\n")
 
 
-def _messages(dialogue, open_promises=()):
+def _messages(dialogue, open_promises=(), social=False):
     hint = PROMISE_HINT + "\n".join(open_promises) + "\n" if open_promises else ""
-    return [{"role": "user", "content": PROMPT.replace("{open_promises}", hint) + dialogue}]
+    prompt = PROMPT + (SOCIAL_RULE if social else "")
+    return [{"role": "user", "content": prompt.replace("{open_promises}", hint) + dialogue}]
 
 
 def parse(text):
@@ -202,7 +210,8 @@ def validate(data):
         t = CTRL.sub("", str(item.get("fact") or "")).strip()[:40]
         if not (2 <= len(t) <= 40 and WORD.search(t)):
             continue
-        if any(t == x["fact"] for x in clean_facts):
+        about = CTRL.sub("", str(item.get("about") or "")).strip()[:32]
+        if any(t == x["fact"] and about == x["about"] for x in clean_facts):
             continue
         tags = []
         for raw in item.get("tags") or []:
@@ -217,6 +226,7 @@ def validate(data):
             hours = 0.0
         clean_facts.append({
             "fact": t,
+            "about": about,
             "tags": tags[:4],
             "category": cat if cat in ("设定", "事件", "临时") else "",
             "importance": _clamp(item.get("importance", 0.5)),
@@ -244,7 +254,7 @@ def validate(data):
     return out, None
 
 
-def summarize(back_llm, dialogue, open_promises=(), max_repair=1):
+def summarize(back_llm, dialogue, open_promises=(), max_repair=1, social=False):
     """调后台模型产出事件卡字段。校验失败时回喂错误重试一次（默认 1 次）。
 
     open_promises：账本当前未兑现承诺的候选清单（"P-003 答应带伞"），
@@ -253,7 +263,7 @@ def summarize(back_llm, dialogue, open_promises=(), max_repair=1):
     返回 (fields, None) 或 (None, err)。异常（网络/限流）直接抛出，
     由调用方按归档失败处理，因为这不是格式问题，重打也没用。
     """
-    msg = _messages(dialogue, open_promises)
+    msg = _messages(dialogue, open_promises, social)
     raw = back_llm.chat(msg)
     err = None
     for attempt in range(max_repair + 1):
