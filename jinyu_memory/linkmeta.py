@@ -23,7 +23,7 @@ import uuid
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -225,6 +225,43 @@ def _page(url: str) -> tuple[dict, str]:
                  or (urlparse(str(url)).hostname or "")),
     }
     return info, parser.body()
+
+
+_SEARCH_HOSTS = ("bing.com", "google.com", "baidu.com", "sogou.com",
+                 "so.com", "yandex.com")
+_SEARCH_ENGINE = (("bing", "必应"), ("google", "谷歌"), ("baidu", "百度"),
+                  ("sogou", "搜狗"), ("so.com", "360"), ("yandex", "Yandex"))
+_SEARCH_QUERY_KEYS = ("q", "wd", "word", "query", "keyword", "text")
+
+
+def _search_note(url: str) -> str:
+    """搜索结果页只给关键词，不注入正文。
+
+    结果页正文先是筛选栏、再是一串结果标题，模型会把它当成「主人看到的
+    内容」；而服务端未登录抓到的结果和主人浏览器里的个性化结果常常不是
+    一回事，顶部的联想词更不是结果。
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in _SEARCH_HOSTS):
+        return ""
+    path = parsed.path.lower()
+    if "/search" not in path and "/imgres" not in path and path not in ("/s", "/web"):
+        return ""
+    params = parse_qs(parsed.query)
+    query = ""
+    for key in _SEARCH_QUERY_KEYS:
+        value = (params.get(key) or [""])[0].strip()
+        if value:
+            query = value[:60]
+            break
+    engine = next((name for mark, name in _SEARCH_ENGINE if mark in host), "搜索")
+    if not query:
+        return (f"（{engine}搜索结果页。服务端抓到的不是主人浏览器里那份，"
+                f"顶部的联想词和筛选栏不是结果，别当事实。）")
+    return (f"（{engine}搜索结果页，关键词「{query}」。服务端抓的是未登录版本，"
+            f"可能与主人浏览器里看到的不同；顶部联想词和筛选栏不是结果，别当事实。"
+            f"要找图或最新内容用 [[search:{query}]]。）")
 
 
 def _page_note(url: str) -> str:
@@ -547,7 +584,8 @@ def note_for(url: str, card: Optional[dict] = None) -> str:
         if hit and now - hit[0] < _CACHE_TTL:
             return hit[1]
     try:
-        note = _video_note(url) if is_video_url(url) else _page_note(url)
+        note = _search_note(url) or (
+            _video_note(url) if is_video_url(url) else _page_note(url))
     except Exception as exc:                  # noqa: BLE001
         logger.info(f"[jinyu] 链接抓取失败 host={urlparse(url).hostname}: {exc}")
         note = ""

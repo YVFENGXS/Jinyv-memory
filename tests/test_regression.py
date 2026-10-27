@@ -13,7 +13,7 @@ from pathlib import Path
 
 import embedding
 import retriever
-from rp_skeleton import (DB, RPContextMiddleware, est_tokens,
+from rp_skeleton import (DB, RPContextMiddleware, est_tokens, _to_midnight,
                          MAX_TOOL_STEPS, TOOL_RESULT_CHARS, TOOL_LABEL)
 from demo import MockFront, MockBack, PERSONA, SCRIPT
 
@@ -1115,7 +1115,11 @@ def test_time_awareness():
     msgs = mw._build_messages(PERSONA, sid, cid, upto=3, query="现在聊")
     ledger = next(m["content"] for m in msgs if "账本" in m["content"])
     assert "当前时间：" in ledger and "周" in ledger, ledger
+    assert "距零点还有" in ledger, ledger                       # 不让模型自己心算
     assert "距最近一条消息已约 45 分钟" in ledger, ledger
+    fixed = now.replace(hour=21, minute=48, second=0, microsecond=0)
+    assert _to_midnight(fixed) == "2 小时 12 分", _to_midnight(fixed)
+    assert "距零点还有" in mw._tool_now({}, sid, cid)
     by_content = {m["content"]: m["role"] for m in msgs if m["role"] != "system"}
     stamped = [c for c in by_content if c.startswith("[")]
     assert len(stamped) == 2, stamped                        # 两条 user 都带戳
