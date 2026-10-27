@@ -94,6 +94,19 @@ def _tag_model() -> str:
     return (os.environ.get("RP_TAG_MODEL") or "deepseek-flash").strip()
 
 
+def _glm_key() -> str:
+    return (os.environ.get("RP_GLM_KEY") or "").strip()
+
+
+def _glm_model() -> str:
+    return (os.environ.get("RP_GLM_MODEL") or "glm-5.3-flash").strip()
+
+
+def _glm_base() -> str:
+    return (os.environ.get("RP_GLM_BASE")
+            or "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
+
+
 def _think_off() -> bool:
     """后台判读是否关闭思考（RP_BACK_THINKING=off）：省 token，也避免输出被思考截断。"""
     return (os.environ.get("RP_BACK_THINKING") or "").strip().lower() in {
@@ -586,6 +599,7 @@ kind 也可以是 "图片"：照片、截图、聊天记录等需要认真回应
    实在认不清是谁、或只是配色发型相似时，必须填 "" 并在 desc 末尾写明「认不清是谁」，
    不要硬猜一个名字；
 3. text 必须把图中所有文字抄全，包括语气词、脏话，不要因为不雅而省略或打码；
+   但密钥、密码、手机号、身份证号这类敏感字符串一律写成 <已隐藏>，不要原样抄；
 4. suitable 仅对表情包有意义：图中文字含辱骂、人身攻击、性暗示、脏话，或者画面模糊、
    属于一次性截图/私人隐私的，填 false；
 5. tags 写情绪或使用场景（开心/无语/生气/撒娇/震惊/嫌弃 等），不要写「表情包」。"""
@@ -642,8 +656,100 @@ def _brief_text(value, limit: int = 600) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+_glm_down_until = 0.0          # GLM 失败后的冷却，避免每张图都先白等一次
+GLM_DOWN_SECONDS = 600.0       # 连不上时十分钟内直接走后台模型
+
+
+def _run_with_deadline(func, seconds: float):
+    """跑一个阻塞请求并设硬性总时限；超时返回 None（后台线程自行结束）。
+
+    httpx 的 connect 超时是按单个 IP 算的，域名解析出多个 IP 时会被成倍放大，
+    被墙的线路能拖到十几秒。这里用整体时限兜住，超时就当失败回退。
+    """
+    box = {}
+
+    def runner():
+        try:
+            box["value"] = func()
+        except Exception as exc:        # noqa: BLE001 留给调用方判断
+            box["error"] = exc
+
+    th = threading.Thread(target=runner, daemon=True)
+    th.start()
+    th.join(seconds)
+    if th.is_alive():
+        return None
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def _glm_vision(data: bytes, prompt: str, label: str) -> Optional[str]:
+    """GLM 优先判读；任何失败都返回 None，由 _vision_call 回退后台模型。"""
+    global _glm_down_until
+    key = _glm_key()
+    if not key or time.time() < _glm_down_until:
+        return None
+    import httpx
+    b64 = base64.b64encode(data).decode()
+    payload = {
+        "model": _glm_model(),
+        "temperature": 0.1,
+        "max_tokens": 4096,
+        # 5.3-flash 始终思考，只能用 low 档压低延迟（关闭会直接 400）
+        "thinking": {"type": "enabled", "level": "low"},
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url",
+             "image_url": {"url": f"data:{_mime_of(data)};base64,{b64}"}},
+        ]}],
+    }
+    url = f"{_glm_base()}/chat/completions"
+    timeout = httpx.Timeout(60.0, connect=10.0)
+
+    def post():
+        with httpx.Client(timeout=timeout) as client:
+            return client.post(url, headers={"Authorization": f"Bearer {key}"},
+                               json=payload)
+
+    try:
+        resp = _run_with_deadline(post, 75.0)
+        if resp is None:
+            raise TimeoutError("glm_total_timeout")
+    except Exception as exc:            # noqa: BLE001 连不上就回退，别拖慢聊天
+        _glm_down_until = time.time() + GLM_DOWN_SECONDS
+        logger.info("[jinyu] GLM 视觉不可用 用途=%s：%s，改用后台模型",
+                    label, type(exc).__name__)
+        return None
+    if resp.status_code != 200:
+        _glm_down_until = time.time() + (
+            600.0 if resp.status_code in (400, 401, 403, 404) else 60.0)
+        logger.info("[jinyu] GLM 视觉失败 用途=%s HTTP %s %s，改用后台模型",
+                    label, resp.status_code, _brief_text(resp.text, 160))
+        return None
+    content, finish = "", ""
+    try:
+        body = resp.json()
+        choice = (body.get("choices") or [{}])[0]
+        finish = str(choice.get("finish_reason") or "")
+        content = str((choice.get("message") or {}).get("content") or "").strip()
+    except Exception:                   # noqa: BLE001 结构不对按失败处理
+        content = ""
+    if not content or finish == "length":      # 截断的 JSON 解析不了，直接回退
+        _glm_down_until = time.time() + 60.0
+        logger.info("[jinyu] GLM 视觉空结果 用途=%s finish=%s，改用后台模型",
+                    label, finish or "-")
+        return None
+    logger.info("[jinyu] GLM 视觉出参 用途=%s 模型=%s %r",
+                label, _glm_model(), _brief_text(content))
+    return content
+
+
 def _vision_call(data: bytes, prompt: str, label: str = "图片判读") -> str:
-    """一次视觉请求：推理型模型会把预算花在思考上，截断就加倍重试。"""
+    """视觉请求：配了 GLM 就先问 GLM，失败再走后台模型。"""
+    glm = _glm_vision(data, prompt, label)
+    if glm:
+        return glm
     key = _front_key()
     if not key:
         raise RuntimeError("no_key")
@@ -1140,16 +1246,22 @@ def _is_stock(url: str, info: Optional[dict] = None) -> bool:
 
 _SEARCH_CHECK_PROMPT = """这是为聊天搜到的一张候选图，主人在找「{q}」相关的内容。
 仔细看，只输出一个 JSON：
-{{"ok":true,"kind":"照片","match":true,"desc":"30字内画面","text":"图中文字，没有就空串","why":"20字内"}}
+{"ok":true,"kind":"照片","match":true,"desc":"60字内画面","text":"图中文字，没有就空串","why":"20字内"}
 kind：照片 / 插画 / 壁纸 / 表情包 / 素材 / 其他。
 ok=true 必须同时满足：
-1. 画面主体与「{q}」对得上（要找深圳高楼，就得看得出城市高楼；
+1. 画面里能看出「{q}」要的东西（要找深圳高楼，就得看得出城市高楼；
    要找表情包，就得有对应的角色、动作、情绪或文字）；
 2. 不是图库素材样图、带水印、纯色卡、二维码、logo、图表、聊天截图；
 3. 文字不含辱骂、人身攻击、性暗示。
-match 只填 true/false：画面主体是不是「{q}」要的东西。
+图里有多个人物同框时，只要其中有一个符合就算对得上，不要因为画面主体是
+一群人就判不合格；多角色合影、群像插画都属于合格情况。
+desc 必须写具体：几个人物、各自发色和服饰、在做什么；单人也写发色、服饰、动作。
+text 里遇到密钥、密码、手机号、身份证号这类敏感字符串，用 <已隐藏> 代替，不要原样抄。
+找的是角色名（如「XX娘」）时，按发色、发型、服饰、标志物这些外观特征判断，
+不需要你认识这个角色；图里有符合外观特征的角色就匹配。
+match 只填 true/false：画面里有没有「{q}」要的东西。
 画面风格不限：实拍、二次元、插画、卡通都可以，只看内容对不对。
-拿不准填 false。"""
+确实没有符合的内容才填 false。"""
 
 
 _QUERY_GENERIC = re.compile(r"动漫表情包|二次元|表情包|动漫|卡通|可爱|搞笑|沙雕|高清|壁纸|图片")
@@ -1227,20 +1339,20 @@ def _search_variants(query: str, mode: str = "image") -> List[str]:
     return [q]
 
 
-def image_search(query: str) -> Optional[str]:
-    """图片搜索，只要直链。"""
-    return _image_search(query)[0]
+def image_search(query: str, exclude=None) -> Optional[str]:
+    """图片搜索，只要直链；exclude 里是已经发过的直链，跳过不重复。"""
+    return _image_search(query, exclude)[0]
 
 
-def image_search_info(query: str) -> tuple[Optional[str], dict]:
+def image_search_info(query: str, exclude=None) -> tuple[Optional[str], dict]:
     """图片搜索，连同视觉判读一起返回。
 
     工具调用要先知道「搜到的是什么样的图」再开口，否则前台只能瞎猜画面。
     """
-    return _image_search(query)
+    return _image_search(query, exclude)
 
 
-def _image_search(query: str) -> tuple[Optional[str], dict]:
+def _image_search(query: str, exclude=None) -> tuple[Optional[str], dict]:
     """图片搜索：先百度、失败退回必应；逐张下载 + 后台视觉校验，返回第一张合格直链。
 
     百度那个 index 页面是 JS 空壳，真正结果从 acjson 接口取；必应只取
@@ -1271,6 +1383,8 @@ def _image_search(query: str) -> tuple[Optional[str], dict]:
         if urls:
             logger.info("搜图候选 q=%r 引擎=%s 共=%d", term, engine, len(urls))
         for u in urls:
+            if exclude and u in exclude:        # 这个会话已经发过，换下一张
+                continue
             if u in seen:
                 continue
             seen.add(u)
@@ -1464,6 +1578,7 @@ def rich_hint() -> str:
 - [[search:两三个关键词]] 搜一张贴合语境的图发出来：要表情包/梗图就在末尾写
   「表情包」；主人要照片、风景、插画、原画、壁纸时按内容原样写，别加「表情包」
   和「二次元」（例如 [[search:北京 风景照]]、[[search:原神 插画]]）
+  找角色时带上发色、服饰等外观特征，别只写名字（例如 [[search:Claude娘 橙发少女 插画]]）
   本轮工具列表里如果有 search_image，要发图就调用它：它会先把画面描述返回给你，
   你按描述说话，图由插件附上；这时不要再写 [[search:...]]。只有没有这个工具时
   才用标记。
@@ -1494,8 +1609,12 @@ def rich_hint() -> str:
 不用猜图上写了什么；主人没点名、标签又确实对不上时宁可不发，也不要硬塞一个。"""
 
 
-async def build_messages(reply: str, chunk: int = 1000) -> List[Message]:
-    """把回复渲染成若干条可直接 send 的消息（文本按 chunk 切分）。"""
+async def build_messages(reply: str, chunk: int = 1000, exclude=None) -> List[Message]:
+    """把回复渲染成若干条可直接 send 的消息（文本按 chunk 切分）。
+
+    exclude 是这个会话已经发过的图片直链：命中就跳过，并把它追加进去，
+    主人说「再来一张其他的」时不会又发回同一张。
+    """
     loop = asyncio.get_running_loop()
     messages: List[Message] = []
     buf = ""
@@ -1525,9 +1644,11 @@ async def build_messages(reply: str, chunk: int = 1000) -> List[Message]:
                 if any(low.endswith(e) for e in IMG_EXT):
                     seg = MessageSegment.image(payload)
         elif kind == "search":
-            url = await loop.run_in_executor(None, image_search, payload)
+            url = await loop.run_in_executor(None, image_search, payload, exclude)
             if url:
                 seg = MessageSegment.image(url)
+                if exclude is not None:
+                    exclude.append(url)
         elif kind == "face":
             if payload.isdigit():
                 seg = MessageSegment.face(int(payload))

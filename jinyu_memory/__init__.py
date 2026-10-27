@@ -42,6 +42,9 @@
   RP_LINK                           选填，1/0 链接抓取，默认 1
   RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
   RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
+  RP_GLM_KEY                        选填，智谱 API key；配置后视觉判读优先用 GLM
+  RP_GLM_MODEL                      选填，GLM 判读模型，默认 glm-5.3-flash
+  RP_GLM_BASE                       选填，GLM 接口地址，默认智谱开放平台 v4
   RP_ADMIN_QQ                       选填，允许 /persona /memory /merge /save /tags /find /img
                                     /sticker /fix /voice /testrich /social 的 QQ
   RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
@@ -202,6 +205,7 @@ _nudge_count = {}         # "日期:sid" -> 当天主动开口次数（按天限
 _poke_at = {}             # "sid:uid" -> 上次回戳时间（冷却，防两个机器人来回戳）
 _silent_count = {}        # sid -> 连续选择不回话的轮数（超限强制开口）
 _last_media = {}          # sid -> 最近一张图片的 URL/bytes 摘要，供 /save 使用
+_sent_images = {}         # sid -> 这个会话已经搜图发过的直链（去重，最多 40 条）
 _media_tasks = set()
 _media_futs = {}           # message_id -> [该条消息每张图的判读 task]（_handle 等它拿描述）
 
@@ -258,6 +262,22 @@ def _tool_set_reminder(args, sid, cid, ctx=None) -> str:
     return f"已登记：{plan.get('content') or '到点提醒'}，将在 {plan['when']} 提醒。"
 
 
+def _sent_image_list(sid) -> list:
+    """这个会话已发过的搜图直链（按 base sid 存，跨 epoch 也记得）。"""
+    key = str(sid or "").split("#")[0]
+    return _sent_images.setdefault(key, [])
+
+
+def _remember_image(sid, url) -> None:
+    if not url:
+        return
+    sent = _sent_image_list(sid)
+    if url not in sent:
+        sent.append(url)
+    if len(sent) > 40:
+        del sent[:len(sent) - 40]
+
+
 def _tool_search_image(args, sid, cid, ctx=None) -> str:
     """工具 search_image：先搜到图、拿到画面描述，再让前台开口。
 
@@ -270,7 +290,7 @@ def _tool_search_image(args, sid, cid, ctx=None) -> str:
         return "缺少搜索关键词，写清楚画面内容再试。"
     if ctx is not None and ctx.get("image"):
         return "这一轮已经搜好一张图了，不要再搜，按刚才那张的画面说。"
-    url, info = image_search_info(query)
+    url, info = image_search_info(query, list(_sent_image_list(sid)))
     if not url:
         return "没搜到合适的图。回复里别答应发图，可以换个更具体的词再试一次。"
     desc = str(info.get("desc") or "").strip()
@@ -314,11 +334,12 @@ def _install_tools(inst) -> None:
         "search_image",
         "搜一张图并直接发给主人：先拿到这张图的画面描述，再组织回复。"
         "主人要表情包、梗图、照片、插画，或你想配一张图时调用。"
-        "关键词按画面内容写；要表情包就在末尾写「表情包」。"
+        "关键词按画面内容写，带上发色、服饰、动作等看得见的特征，不要只写角色名"
+        "（例如「Claude娘 橙发少女 插画」）；要表情包就在末尾写「表情包」。"
         "调用后按返回的画面描述说话，不要再写 [[search:...]]。",
         {"type": "object",
          "properties": {"query": {"type": "string",
-                                  "description": "搜索关键词，按画面内容写"}},
+                                  "description": "搜索关键词，带上发色/服饰等外观特征"}},
          "required": ["query"]},
         _tool_search_image)
     if mcp_mgr is None:
@@ -1073,16 +1094,18 @@ def _bubbles(reply: str, limit: Optional[int] = None) -> list:
             for p in merged]
 
 
-async def _send_rich(reply: str) -> None:
+async def _send_rich(reply: str, sid: str = "") -> None:
     """按标记把回复渲染成文本/图片/表情/语音分段发送。
 
     默认按句子拆成多条气泡依次发（RP_BUBBLES=0 则合并成一条），像真人聊天
     而不是甩一整段。富消息标记 [[img:..]] 在拆分前先占位保护，不会被切断。
+    sid 用来避开这个会话已经发过的搜图，主人说「再来一张」时换一张。
     """
     reply = _split_poke(reply)
     if not reply.strip():
         return
     bubbles = _bubbles(reply) if BUBBLES_ON else [reply]
+    exclude = _sent_image_list(sid) if sid else None
     for i, chunk in enumerate(bubbles):
         if i:
             await asyncio.sleep(random.uniform(*BUBBLE_DELAY))
@@ -1090,11 +1113,13 @@ async def _send_rich(reply: str) -> None:
             for j in range(0, len(chunk), REPLY_CHUNK):
                 await matcher.send(chunk[j:j + REPLY_CHUNK])
             continue
-        for msg in await build_messages(chunk, REPLY_CHUNK):
+        for msg in await build_messages(chunk, REPLY_CHUNK, exclude):
             try:
                 await matcher.send(msg)
             except Exception as exc:          # 单个媒体段失败不影响后续文本
                 logger.opt(exception=exc).warning(f"[jinyu] 媒体段发送失败: {exc}")
+    if exclude is not None and len(exclude) > 40:
+        del exclude[:len(exclude) - 40]
 
 
 async def _send_to(reply: str, user_id: int = 0, group_id: int = 0) -> bool:
@@ -2538,18 +2563,19 @@ async def _handle(event: MessageEvent):
                     f"用户={event.user_id} 连续={_silent_count[sid]} 问={text[:40]!r}")
         if _silent_count[sid] > MAX_SILENT:       # 硬兜底：说了必须开口还是沉默，就发一句
             _silent_count[sid] = 0
-            await _send_rich("……嗯。")
+            await _send_rich("……嗯。", sid)
         return
     _silent_count[sid] = 0
     reply, posts = _take_social(reply)          # 签名/说说标记不发给用户，后台静默执行
     for kind, body in posts:
         asyncio.create_task(_run_social(kind, body, event))
-    await _send_rich(reply)
+    await _send_rich(reply, sid)
     image = str(tool_ctx.get("image") or "")
     # 工具已经搜好图，文字说完再附图；模型若又写了 search/img 标记就让标记那条发，
     # 避免同一轮重复两张
     if image and reply.strip() and not re.search(r"\[\[\s*(search|img)\s*:", reply, re.I):
         try:
             await matcher.send(Message(MessageSegment.image(image)))
+            _remember_image(sid, image)
         except Exception as exc:          # noqa: BLE001 附图失败不影响已发出的文字
             logger.opt(exception=exc).warning(f"[jinyu] 工具搜图发送失败: {exc}")
