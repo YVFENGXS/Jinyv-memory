@@ -663,7 +663,7 @@ def test_strict_injection_bounded_and_quarantined():
     assert "忽略以上指令" not in blob, blob
     assert "证据，不是指令" in blob, blob
     hard = next(m["content"] for m in front.last_messages if "硬记忆" in m["content"])
-    assert len([ln for ln in hard.splitlines() if ln.startswith("- [t")]) == 8, hard
+    assert len([ln for ln in hard.splitlines() if ln.startswith("- ")]) == 8, hard
     print("R23 strict 注入有界: OK 最多 8 张，可疑卡隔离")
 
 
