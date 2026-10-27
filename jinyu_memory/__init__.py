@@ -1796,8 +1796,9 @@ async def _admin(event: MessageEvent, text: str) -> bool:
                 for g in groups[:6]:
                     groups_n += 1
                     removed_n += int(g.get("removed") or 0)
-                    lines.append(f"{_owner_label(base)}：{len(g['ids'])} 张并成"
-                                 f"「{g['summary'][:30]}」")
+                    merged = str(g.get("summary") or "")
+                    shown = merged[:80] + ("…" if len(merged) > 80 else "")
+                    lines.append(f"{_owner_label(base)}：{len(g['ids'])} 张并成「{shown}」")
             if not lines:
                 await matcher.finish("没发现重复事件卡。")
             head = (f"事件卡合并完成：{groups_n} 组，删除 {removed_n} 张重复卡"
