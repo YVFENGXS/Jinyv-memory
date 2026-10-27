@@ -63,6 +63,22 @@ def _mmdd(ts):
         return ""
 
 
+def _clip_sentence(text, limit):
+    """按句读收口截断：宁可短一点，也不要把话切在半个词上。"""
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    for mark in "。！？；":
+        i = head.rfind(mark)
+        if i >= limit // 2:
+            return head[:i + 1]
+    i = max(head.rfind("，"), head.rfind("、"), head.rfind(","))
+    if i >= limit // 2:
+        return head[:i + 1]
+    return head + "…"
+
+
 # 定期合并用的提示词：只判「指同一件事」，不判语义相近，宁可漏并不可错并
 MERGE_PROMPT = """你在整理同一会话的长期记忆词条，目标是去掉重复、保留信息最全的那条。
 
@@ -1365,7 +1381,7 @@ class RPContextMiddleware:
             if keep not in ids:
                 keep = max(ids, key=lambda i: (len(index[i]["fact"]),
                                                len(_fact_tags(index[i]["tags"]))))
-            fact = str(g.get("fact") or "").strip()[:160]
+            fact = _clip_sentence(g.get("fact"), 160)
             rich = max(ids, key=lambda i: (len(index[i]["fact"]),
                                            len(_fact_tags(index[i]["tags"]))))
             fact = fact or index[rich]["fact"]
@@ -1444,7 +1460,7 @@ class RPContextMiddleware:
             keep = g.get("keep")
             if keep not in ids:
                 keep = max(ids, key=lambda i: len(str(index[i]["summary"])))
-            summary = str(g.get("summary") or "").strip()[:160]
+            summary = _clip_sentence(g.get("summary"), 160)
             rich = max(ids, key=lambda i: len(str(index[i]["summary"])))
             summary = summary or retriever.clean_text(index[rich]["summary"], 160)
             lo = min(int(index[i]["turn_start"]) for i in ids)
