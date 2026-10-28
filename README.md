@@ -45,6 +45,7 @@ jinyu-memory/
 │   └── benchmark-recall.svg # 评测图表
 ├── deploy/
 │   ├── install_plugin.sh
+│   ├── install_storyboard.sh # 可选：装第三方视频分镜工具（不随仓库分发）
 │   └── qqbot.service
 ├── bot.py                   # NoneBot2 启动入口
 ├── requirements.txt
@@ -254,6 +255,15 @@ journalctl -u qqbot -f
 ```bash
 bash deploy/install_plugin.sh /path/to/your-bot
 ```
+
+视频理解可以再装一个第三方分镜工具（[dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard)，**不随本仓库分发**，脚本只按上游固定提交拉取）：
+
+```bash
+bash deploy/install_storyboard.sh     # 需要 ffmpeg；没有 Node ≥20 会自动装一份
+echo 'RP_STORYBOARD=1' >> /opt/qqbot/bot/.env
+```
+
+装好后，用户说「看看这个视频」时是**一张 9 格拼图 + 一次视觉判读**（约 384 tokens），替代原来的四帧四次判读；没装、调用失败或超时都自动回退四帧，不影响原有链路。默认目录 `/opt/qqbot/vendor/dsh-video-storyboard`，可用 `RP_STORYBOARD_DIR` 改。
 
 NapCat 与 NoneBot 的启动顺序不敏感：反了也会在约 30 秒后自动重连。但**机器重启后 NapCat 通常需要重新登录/启动**，建议用官方 Docker 镜像并加 `restart: unless-stopped`。
 
