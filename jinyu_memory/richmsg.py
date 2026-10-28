@@ -460,7 +460,58 @@ def delete_sticker(name: str) -> bool:
         store = _load_tags()
         store.pop(name, None)
         _save_tags(store)
+        meta = _load_meta()
+        if meta.pop(name, None) is not None:
+            _save_meta(meta)
     return True
+
+
+_last_sticker: Dict[str, dict] = {}   # sid -> 这个会话最后发出去的一张贴纸
+
+
+def _note_sticker(sid: str, path: Path) -> None:
+    if not sid:
+        return
+    key = str(sid).split("#")[0]
+    _last_sticker[key] = {
+        "name": path.name,
+        "tags": list(_load_tags().get(path.name) or []),
+        "at": time.time(),
+    }
+
+
+def last_sticker(sid) -> Optional[dict]:
+    """这个会话最后发出去的那张贴纸（文件名 + 标签）。"""
+    return _last_sticker.get(str(sid or "").split("#")[0])
+
+
+def forget_sticker(query: str = "", sid: str = "") -> Optional[Tuple[str, List[str]]]:
+    """按标签/文件名删一张贴纸；query 为空就删本会话最后发的那张。
+
+    一次只删一张：主人说「这张不要」时命中最近发的；说标签时优先删最近发过
+    的同标签图，避免一次清空整类标签。
+    """
+    q = (query or "").strip().lower()
+    d = sticker_dir()
+    rec = last_sticker(sid)
+    name = ""
+    if not q:
+        name = str((rec or {}).get("name") or "")
+    elif os.path.basename(q) and (d / q).is_file():
+        name = os.path.basename(q)
+    else:
+        hits = [n for n, tags in list_stickers()
+                if q in n.lower() or q in [t.lower() for t in tags]]
+        if rec and rec.get("name") in hits:
+            name = str(rec["name"])
+        elif hits:
+            name = hits[0]
+    if not name:
+        return None
+    tags = list(_load_tags().get(name) or [])
+    if not delete_sticker(name):
+        return None
+    return name, tags
 
 
 def add_tags(name: str, tags: List[str]) -> bool:
@@ -1587,6 +1638,8 @@ def rich_hint() -> str:
   才用标记。
 - [[voice:要说的话]] 用语音说
 - [[img:https://图片直链]] 只发确定真实存在的直链（不确定就用 search）
+- 撤回消息：用 recall_message 工具，target 填「你最近发出的消息」清单里的编号（如 M8），
+  后台会在你这条回复发出前撤回那条；不要写 [[recall]]，也不要没调用工具就说「已经撤回」。
 只在以下时机使用，其余时候一律纯文字：
 ①主人明确要求（"来张表情包""发张图看看""用语音说"）；
 ②主人只发来一个表情包时，可以回敬一个贴纸；
@@ -1609,14 +1662,18 @@ def rich_hint() -> str:
 会自动省略。不要凭印象提前说「库里没有这个标签」——清单很长，只是给你参考。
 没有能用的贴纸，再用 [[search:关键词 表情包]]。
 贴纸库已做过内容审核（含脏话、辱骂、擦边的图已被剔除），你按标签挑即可，
-不用猜图上写了什么；主人没点名、标签又确实对不上时宁可不发，也不要硬塞一个。"""
+不用猜图上写了什么；主人没点名、标签又确实对不上时宁可不发，也不要硬塞一个。
+主人说刚才那张不合适、以后别发，调用 delete_sticker 工具把库里那张真删掉
+（query 留空 = 本会话最后发的那张；也可以写标签或文件名），删完再说话。"""
 
 
-async def build_messages(reply: str, chunk: int = 1000, exclude=None) -> List[Message]:
+async def build_messages(reply: str, chunk: int = 1000, exclude=None,
+                         sid: str = "") -> List[Message]:
     """把回复渲染成若干条可直接 send 的消息（文本按 chunk 切分）。
 
     exclude 是这个会话已经发过的图片直链：命中就跳过，并把它追加进去，
     主人说「再来一张其他的」时不会又发回同一张。
+    sid 用来记「最后发出去的那张贴纸」，主人说这张不合适时能按会话找到它。
     """
     loop = asyncio.get_running_loop()
     messages: List[Message] = []
@@ -1668,6 +1725,7 @@ async def build_messages(reply: str, chunk: int = 1000, exclude=None) -> List[Me
                 one = image_segment(path)
                 if one is not None:
                     messages.append(Message(one))
+                    _note_sticker(sid, path)
             continue
         elif kind == "voice":
             if payload.startswith("http"):

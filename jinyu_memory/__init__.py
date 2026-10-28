@@ -41,6 +41,10 @@
   RP_ASR_BASE                       选填，接口地址，默认 https://api.siliconflow.cn/v1
   RP_LINK                           选填，1/0 链接抓取，默认 1
   RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
+  RP_STORYBOARD                     选填，1/0 开关视频分镜（第三方 dsh-video-storyboard），
+                                    默认自动：装了就用，没装走四帧
+  RP_STORYBOARD_DIR                 选填，分镜工具目录，默认 /opt/qqbot/vendor/dsh-video-storyboard
+  RP_STORYBOARD_CELLS               选填，分镜格数，默认 9（40 秒以下自动 6 格）
   RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
   RP_GLM_KEY                        选填，智谱 API key；配置后视觉判读优先用 GLM
   RP_GLM_MODEL                      选填，GLM 判读模型，默认 glm-5.3-flash
@@ -132,6 +136,7 @@ from richmsg import (                                       # noqa: E402
     download_image,
     download_image_ex,
     fix_sticker,
+    forget_sticker,
     image_segment,
     image_search,
     image_search_info,
@@ -206,6 +211,8 @@ _poke_at = {}             # "sid:uid" -> 上次回戳时间（冷却，防两个
 _silent_count = {}        # sid -> 连续选择不回话的轮数（超限强制开口）
 _last_media = {}          # sid -> 最近一张图片的 URL/bytes 摘要，供 /save 使用
 _sent_images = {}         # sid -> 这个会话已经搜图发过的直链（去重，最多 40 条）
+_sent_msgs = {}           # sid -> 发出的消息 [{label,mid,at,preview}]，撤回按编号找
+_sent_seq = {}            # sid -> 已发出的条数（M1、M2…）
 _media_tasks = set()
 _media_futs = {}           # message_id -> [该条消息每张图的判读 task]（_handle 等它拿描述）
 
@@ -278,6 +285,142 @@ def _remember_image(sid, url) -> None:
         del sent[:len(sent) - 40]
 
 
+def _sent_store(sid) -> list:
+    """这个会话发出去的消息记录（label/mid/at/preview），按基础 sid 存。"""
+    return _sent_msgs.setdefault(str(sid or "").split("#")[0], [])
+
+
+def _remember_sent(sid, result, preview: str = "") -> str:
+    """给每条发出的消息编号（M1、M2…），撤回时按编号找回具体那条。"""
+    mid = None
+    if isinstance(result, dict):
+        mid = result.get("message_id")
+        if mid is None and isinstance(result.get("data"), dict):
+            mid = result["data"].get("message_id")
+    if not mid:
+        return ""
+    key = str(sid or "").split("#")[0]
+    seq = _sent_seq.get(key, 0) + 1
+    _sent_seq[key] = seq
+    label = f"M{seq}"
+    got = _sent_store(sid)
+    got.append({"label": label, "mid": mid, "at": time.time(),
+                "preview": re.sub(r"\s+", " ", preview or "").strip()[:40]})
+    now = time.time()
+    _sent_msgs[key] = [m for m in got if now - m["at"] <= 600][-20:]
+    return label
+
+
+def _recent_sent(sid, seconds: float = 120) -> list:
+    """2 分钟内、还能撤回的消息。"""
+    now = time.time()
+    return [m for m in _sent_store(sid) if now - m["at"] <= seconds]
+
+
+def _recent_hint(sid) -> str:
+    """把最近发出的消息编号给前台，撤回时按编号指定具体某条。"""
+    items = _recent_sent(sid)[-8:]
+    if not items:
+        return ""
+    now = time.time()
+    lines = "\n".join(
+        f"- {m['label']}｜{int(now - m['at'])} 秒前｜{m['preview'] or '（无文字）'}"
+        for m in items)
+    return (f"\n\n【你最近发出的消息（2 分钟内可撤回）】\n{lines}\n"
+            "主人要你撤回时调用 recall_message 工具，target 填上面的编号（如 M8），"
+            "后台会在你这条回复发出前撤回那条。不要写 [[recall]]，"
+            "也不要没调用工具就说「已经撤回」。")
+
+
+async def _recall_label(sid: str, label: str) -> bool:
+    """按编号撤回一条自己发的消息；超过 2 分钟或找不到就放弃。"""
+    got = _sent_store(sid)
+    target = next((m for m in got if m["label"] == label), None)
+    if target is None:
+        logger.info(f"[jinyu] 撤回跳过 sid={sid} 编号={label} 找不到")
+        return False
+    if time.time() - target["at"] > 120:
+        logger.info(f"[jinyu] 撤回跳过 sid={sid} 编号={label} 已超 2 分钟")
+        return False
+    try:
+        await get_bot().delete_msg(message_id=int(target["mid"]))
+    except Exception as exc:                    # noqa: BLE001  撤回失败不影响这轮说话
+        logger.opt(exception=exc).info(f"[jinyu] 撤回失败 {label}: {exc}")
+        return False
+    got.remove(target)
+    logger.info(f"[jinyu] 已撤回 {label} sid={sid} 内容={target['preview']!r}")
+    return True
+
+
+def _tool_recall_message(args, sid, cid, ctx=None) -> str:
+    """工具 recall_message：前台挑定某条消息，后台在发送前撤回。"""
+    target = str((args or {}).get("target") or "").strip()
+    items = _recent_sent(sid)
+    if not items:
+        return "你最近 2 分钟内没有可撤回的消息，别跟主人说撤回了。"
+    pick = None
+    if target:
+        pick = next((m for m in reversed(items)
+                     if m["label"].lower() == target.lower()), None)
+        if pick is None:                       # 编号写错时按内容兜底
+            pick = next((m for m in reversed(items)
+                         if target.lower() in (m["preview"] or "").lower()), None)
+    else:
+        pick = items[-1]
+    if pick is None:
+        return "没找到这个编号的消息；按「你最近发出的消息」清单里的编号再选一次。"
+    if ctx is not None:
+        ctx["recall"] = pick["label"]
+    return (f"已标记撤回 {pick['label']}（{pick['preview'] or '无文字'}），"
+            "后台会在你这条回复发出前撤回它；接着说更正的话就行。")
+
+
+def _msg_preview(msg, chunk: str) -> str:
+    """撤回归档用的一句话摘要：文字取正文，图片/贴纸/语音只记类型。"""
+    texts = []
+    has_img = has_rec = has_face = False
+    try:
+        for seg in msg:
+            kind = getattr(seg, "type", "")
+            if kind == "text":
+                texts.append(str((seg.data or {}).get("text") or ""))
+            elif kind == "image":
+                has_img = True
+            elif kind == "record":
+                has_rec = True
+            elif kind == "face":
+                has_face = True
+    except TypeError:
+        pass
+    if has_rec:
+        return "语音"
+    if has_img:
+        return "贴纸" if "[sticker:" in chunk else "图片"
+    if has_face:
+        return "表情"
+    return "".join(texts)
+
+
+_RECALL_LEGACY = re.compile(
+    r"\[\[\s*(?:recall|撤回|收回)\s*(?:[:：]\s*\d+\s*)?\]\]", re.I)
+
+
+def _tool_delete_sticker(args, sid, cid, ctx=None) -> str:
+    """工具 delete_sticker：按聊天反馈把库里那张表情包真删掉。"""
+    ctx = ctx or {}
+    uid = str(ctx.get("user_id") or "")
+    if ADMIN and uid not in ADMIN:
+        return "只有主人能让你删表情包库里的图。"
+    query = str((args or {}).get("query") or "").strip()
+    got = forget_sticker(query, sid)
+    if not got:
+        return "没找到要删的表情包（可能已经删过，或标签对不上），别跟主人说已经删了。"
+    name, tags = got
+    logger.info(f"[jinyu] 工具删表情包 sid={sid} 文件={name} 标签={tags}")
+    tag_line = "/".join(tags) if tags else "无"
+    return f"已从表情包库删掉「{name}」（标签：{tag_line}）。可以告诉主人已经删了。"
+
+
 def _tool_search_image(args, sid, cid, ctx=None) -> str:
     """工具 search_image：先搜到图、拿到画面描述，再让前台开口。
 
@@ -342,6 +485,24 @@ def _install_tools(inst) -> None:
                                   "description": "搜索关键词，带上发色/服饰等外观特征"}},
          "required": ["query"]},
         _tool_search_image)
+    inst.register_tool(
+        "delete_sticker",
+        "从表情包库里真删掉一张图：主人说刚才发的表情包不合适、以后别发，"
+        "或明确让你删掉某张表情包时调用。query 写标签（如「贴贴」）或文件名；"
+        "留空表示删本会话最后发的那张。一次只删一张，删完再说话。",
+        {"type": "object",
+         "properties": {"query": {"type": "string",
+                                  "description": "标签或文件名；留空删最后发的那张"}}},
+        _tool_delete_sticker)
+    inst.register_tool(
+        "recall_message",
+        "撤回你自己发过的一条消息（只限 2 分钟内）。主人说「撤回」「说错了收回来」时调用："
+        "target 填提示里「你最近发出的消息」清单中的编号（如 M8），留空表示最后一条。"
+        "后台会在你这条回复发出前撤回它；不要写 [[recall]]，也不要没调用就说已经撤回。",
+        {"type": "object",
+         "properties": {"target": {"type": "string",
+                                   "description": "消息编号，如 M8；留空撤最后一条"}}},
+        _tool_recall_message)
     if mcp_mgr is None:
         return
     for spec in mcp_mgr.tool_specs():
@@ -1102,20 +1263,25 @@ async def _send_rich(reply: str, sid: str = "") -> None:
     sid 用来避开这个会话已经发过的搜图，主人说「再来一张」时换一张。
     """
     reply = _split_poke(reply)
+    if _RECALL_LEGACY.search(reply):       # 旧标记不再执行，只去掉避免当正文发出去
+        logger.info("[jinyu] 回复里出现旧 [[recall]] 标记，已忽略；撤回应调用 recall_message")
+        reply = _RECALL_LEGACY.sub("", reply)
     if not reply.strip():
         return
-    bubbles = _bubbles(reply) if BUBBLES_ON else [reply]
     exclude = _sent_image_list(sid) if sid else None
+    bubbles = _bubbles(reply) if BUBBLES_ON else [reply]
     for i, chunk in enumerate(bubbles):
         if i:
             await asyncio.sleep(random.uniform(*BUBBLE_DELAY))
         if not rich_enabled():
             for j in range(0, len(chunk), REPLY_CHUNK):
-                await matcher.send(chunk[j:j + REPLY_CHUNK])
+                piece = chunk[j:j + REPLY_CHUNK]
+                _remember_sent(sid, await matcher.send(piece), piece)
             continue
-        for msg in await build_messages(chunk, REPLY_CHUNK, exclude):
+        for msg in await build_messages(chunk, REPLY_CHUNK, exclude, sid):
             try:
-                await matcher.send(msg)
+                _remember_sent(sid, await matcher.send(msg),
+                               _msg_preview(msg, chunk))
             except Exception as exc:          # 单个媒体段失败不影响后续文本
                 logger.opt(exception=exc).warning(f"[jinyu] 媒体段发送失败: {exc}")
     if exclude is not None and len(exclude) > 40:
@@ -2526,6 +2692,9 @@ async def _handle(event: MessageEvent):
     persona = dict(PERSONA)
     if rich_enabled():
         persona["core"] = persona["core"] + rich_hint()
+    sent_hint = _recent_hint(sid)      # 2 分钟内可撤回的消息编号，供 recall_message 选
+    if sent_hint:
+        persona["core"] = persona["core"] + sent_hint
     if is_group and not SOCIAL_ON:
         persona["core"] = persona["core"] + GROUP_HINT
     persona["core"] = persona["core"] + SILENCE_HINT   # 允许沉默（[[pass]]），QQ 侧才生效
@@ -2556,6 +2725,9 @@ async def _handle(event: MessageEvent):
         except Exception as exc:                    # 生成失败不能让事件循环崩
             logger.exception(f"[jinyu] 生成失败 sid={sid}: {exc}")
             await matcher.finish("……主人，瑾瑜刚刚走神了，再说一遍好不好。")
+    recall = str(tool_ctx.get("recall") or "")
+    if recall:                          # 前台挑好了编号，后台在发这条回复前撤回
+        await _recall_label(sid, recall)
     if _is_silent(reply):
         # 这一轮真的一句话都不发；本轮已由中间件写进记忆，所以「知道发生过什么」
         _silent_count[sid] = _silent_count.get(sid, 0) + 1

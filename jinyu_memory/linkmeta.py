@@ -40,6 +40,15 @@ VIDEO_DOMAINS = ("bilibili.com", "b23.tv", "youtube.com", "youtu.be",
                  "douyin.com", "iesdouyin.com")
 FRAME_PROMPT = ("这是视频里的一帧画面。用一句中文客观描述：谁、在做什么、场景。"
                 "不要猜剧情，只描述看到的，不要输出 JSON。")
+# 第三方分镜工具（dsh-video-storyboard）：只调它的 CLI，不复制源码进本仓库。
+# 装了就用「一张拼图 + 一次视觉请求」代替「四帧 + 四次视觉请求」，没装自动走老路。
+STORYBOARD_DIR = Path(os.environ.get("RP_STORYBOARD_DIR")
+                      or "/opt/qqbot/vendor/dsh-video-storyboard")
+STORYBOARD_TIMEOUT = 90.0
+STORY_PROMPT = ("这是从视频里按时间顺序切出的分镜拼图：每格左上角有编号，格内是该时间段的画面，"
+                "底部条带是音量与切点。用中文客观描述：画面里有什么人、在做什么、"
+                "场景与镜头怎么变，按格号简述关键几格即可，不要逐格重复，不要猜剧情，"
+                "不要输出 JSON，总长不超过 250 字。")
 
 _URL_RE = re.compile(r"https?://[^\s\u3000<>\"'，。；：！？、（）【】《》「」]+", re.I)
 _BV_RE = re.compile(r"/video/(BV[0-9A-Za-z]+)")
@@ -455,6 +464,70 @@ def _frame_times(duration: int, count: int = 4) -> list[float]:
     return [duration * (i + 0.5) / count for i in range(count)]
 
 
+# ---------------------------------------------------------------- 第三方分镜
+
+def storyboard_available() -> bool:
+    """装了 node 和 dsh-video-storyboard 才算可用；RP_STORYBOARD=0 强制关闭。"""
+    if _off(os.environ.get("RP_STORYBOARD")):
+        return False
+    script = STORYBOARD_DIR / "bin" / "storyboard.mjs"
+    return bool(_tool("node")) and script.is_file()
+
+
+def _storyboard_cells(duration: int) -> int:
+    try:
+        base = int(os.environ.get("RP_STORYBOARD_CELLS") or 9)
+    except ValueError:
+        base = 9
+    base = max(4, min(16, base))
+    return 6 if duration < 40 else base
+
+
+def _storyboard_index(out: str) -> str:
+    """CLI 输出里的时间轴：每格时间范围 + 译文，压成一行方便注入。"""
+    keep = []
+    for line in (out or "").splitlines():
+        text = re.sub(r"\s+", " ", line.strip())
+        if text.startswith("cell ") or text.startswith("transcript:"):
+            keep.append(text)
+    return "；".join(keep)[:420]
+
+
+def _storyboard_note(video: Path, duration: int, tmp: Path) -> str:
+    """一张分镜拼图 + 一次视觉请求；任何失败都返回空串，交给四帧兜底。"""
+    script = STORYBOARD_DIR / "bin" / "storyboard.mjs"
+    png = tmp / "sheet.png"
+    try:
+        proc = subprocess.run(
+            [_tool("node"), str(script), str(video),
+             "--cells", str(_storyboard_cells(duration)),
+             "--text", "--out", str(png)],
+            capture_output=True, text=True, timeout=STORYBOARD_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.info(f"[jinyu] 视频分镜调用失败：{type(exc).__name__}")
+        return ""
+    if proc.returncode != 0 or not png.is_file():
+        logger.info(f"[jinyu] 视频分镜失败 rc={proc.returncode} "
+                    f"err={(proc.stderr or '')[-160:]!r}")
+        return ""
+    try:
+        vision = _vision_call(prepare_image_for_vision(png.read_bytes()),
+                              STORY_PROMPT, "视频分镜")
+    except Exception:                     # noqa: BLE001 判读失败就走四帧
+        return ""
+    vision = re.sub(r"\s+", " ", vision).strip()
+    if not vision:
+        return ""
+    grid = ""
+    hit = re.search(r'grid="([^"]+)"', proc.stdout or "")
+    if hit:
+        grid = hit.group(1)
+    logger.info(f"[jinyu] 视频分镜完成 {grid or '拼图'}")
+    index = _storyboard_index(proc.stdout)
+    return ("（视频分镜观察：" + vision[:350]
+            + ("｜时间轴：" + index if index else "") + "）")
+
+
 def _bili_download(bvid: str, cid: int, tmp: Path) -> Optional[Path]:
     """playurl 取 durl 直链再下载；腾讯云 IP 上 yt-dlp 会被 412，这条路径可用。"""
     if not bvid or not cid:
@@ -563,6 +636,11 @@ def video_frames_note(url: str) -> str:
         if video is None:
             logger.info(f"[jinyu] 视频下载失败 host={urlparse(url).hostname}")
             return ""
+        if storyboard_available():
+            one = _storyboard_note(video, duration, tmp)
+            if one:
+                return one[:720]
+            logger.info("[jinyu] 分镜不可用，回退四帧抽帧")
         notes = _frame_notes(video, duration, tmp)
         if not notes:
             return ""
