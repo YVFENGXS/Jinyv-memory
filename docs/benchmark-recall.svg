@@ -3,7 +3,7 @@
 <text x="30" y="34" font-size="19" font-weight="700" fill="#111827">Jinyv-memory 检索与回答评测</text>
 <text x="30" y="56" font-size="12.5" fill="#6b7280">DeepSeek v4-pro（thinking=off）· bge-m3 向量 · 2026-10-28 · 复现：tools/eval_memory.py</text>
 
-<text x="30" y="92" font-size="15" font-weight="600" fill="#1f2328">Holdout recall@4（小集 n=37，规模集 n=30；唯一可对外汇报的口径）</text>
+<text x="30" y="92" font-size="15" font-weight="600" fill="#1f2328">Holdout recall@4（小集 n=37，规模集 n=30）</text>
 <text x="250" y="132" font-size="13" fill="#4b5563" text-anchor="end">小集 关键词</text>
 <rect x="262" y="118" width="378.6" height="20" rx="4" fill="#9aa4b2"/>
 <text x="648.6" y="133" font-size="12.5" fill="#1f2328">0.676</text>
