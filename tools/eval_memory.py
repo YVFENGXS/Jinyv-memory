@@ -712,7 +712,7 @@ def real_ablate(db, sid, cid, upto, cases, budget=BASELINE_BUDGET):
     """真实语料上的机制消融：外部基线 / 水位线扫描 / 保密闸门 / 显著性 / 承诺通道。
 
     与合成集的 matrix_probe 区别：这里不另 seed 库，直接复用已经写好向量的真实库，
-    所以每一格都是「同一批 200 张真实卡、同一批 46 条问句」只关一个机制。
+    所以每一格都是「同一批真实卡、同一批问句」只关一个机制。
     """
     n = len(cases)
     out = {}
@@ -1036,7 +1036,7 @@ def run(real=False, out=None, corpus="small", ablate=False,
         for r in ra["baseline"]:
             print(f"  {r['mode']:<9}  {r['inject_hit']:<8} {str(r['inject_ci']):<18} "
                   f"{r['avg_tokens']:<9}  {r['sections_dropped']}")
-        print("\n水位线扫描（ours，同一批 46 问）")
+        print(f"\n水位线扫描（ours，同一批 {len(cases)} 问）")
         print("  预算     平均token  注入命中  丢段")
         for r in ra["watermark"]:
             print(f"  {r['budget']:<8} {r['avg_tokens']:<9}  {r['inject_hit']:<8}  "
