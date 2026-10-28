@@ -705,7 +705,8 @@ def _glm_vision(data: bytes, prompt: str, label: str) -> Optional[str]:
         ]}],
     }
     url = f"{_glm_base()}/chat/completions"
-    timeout = httpx.Timeout(60.0, connect=10.0)
+    # 智谱忙时整段不回包，读超时给 25 秒：正常 6~12 秒出参，超时就尽快换后台模型
+    timeout = httpx.Timeout(25.0, connect=8.0)
 
     def post():
         with httpx.Client(timeout=timeout) as client:
@@ -713,11 +714,13 @@ def _glm_vision(data: bytes, prompt: str, label: str) -> Optional[str]:
                                json=payload)
 
     try:
-        resp = _run_with_deadline(post, 75.0)
+        resp = _run_with_deadline(post, 30.0)
         if resp is None:
             raise TimeoutError("glm_total_timeout")
     except Exception as exc:            # noqa: BLE001 连不上就回退，别拖慢聊天
-        _glm_down_until = time.time() + GLM_DOWN_SECONDS
+        _glm_down_until = time.time() + (
+            120.0 if isinstance(exc, (TimeoutError, httpx.TimeoutException))
+            else GLM_DOWN_SECONDS)
         logger.info("[jinyu] GLM 视觉不可用 用途=%s：%s，改用后台模型",
                     label, type(exc).__name__)
         return None
