@@ -22,5 +22,7 @@ jobs:
           pip install -r requirements.txt
       - name: Regression suite (no API key needed)
         run: python tests/test_regression.py
+      - name: Recall gate (no API key needed)
+        run: python tools/eval_memory.py --min-recall 0.8 --min-holdout 0.7
       - name: Offline demo (no API key needed)
         run: python examples/demo.py

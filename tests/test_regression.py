@@ -8,8 +8,15 @@
         R12 停用字与追问判定 / R13 规则召回注入 strict 卡 /
         R14 同批建兑不误报 / R15 候选清单一致性 / R16 空区间单事务
 """
-import json, math, os, sqlite3, time
+import json, math, os, sqlite3, sys, time
 from pathlib import Path
+
+# 仓库结构：测试文件在 tests/，核心在 jinyu_memory/core/，示例在 examples/。
+# 不依赖外部 PYTHONPATH，保证 CI 与本地都是 `python tests/test_regression.py` 一条命令。
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (_ROOT, _ROOT / "jinyu_memory", _ROOT / "jinyu_memory" / "core", _ROOT / "examples"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import embedding
 import retriever
@@ -372,6 +379,31 @@ def test_recall_core_word_and_boundary():
     assert ids == ["E_both", "E_flag"], ids            # player 卡被挡；带标记的降权排后
     assert retriever.retrieve(db.all_cards("s1", "c1"), "今天天气不错") == []
     print("R6 钩子召回: OK 核心词命中 E_both，player 过滤，冲突降权")
+
+
+def test_player_boundary_not_in_recent_history():
+    """R6b：仅玩家知道的卡落在最近热窗时也不得进【历史事件】（热窗不经过召回）。"""
+    db = fresh("/tmp/rp_boundary_recent.db")
+    base = dict(session_id="s1", character_id="c1", turn_start=1, turn_end=2,
+                summary="掌柜私下说这月的账做了手脚", state_changes={},
+                entity_hooks=["账本"], importance=0.5, conflict_flags=[])
+    db.insert_card({**base, "event_id": "E_priv", "idempotency_key": "k1",
+                    "knowledge_boundary": "player"})
+
+    def shown():
+        msgs = mw._build_messages(PERSONA, "s1", "c1", upto=2)
+        return "\n".join(str(m.get("content") or "") for m in msgs)
+
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db)
+    text = shown()
+    assert "账做了手脚" not in text, text        # 闸门关着：热窗通道也挡住
+
+    retriever.ALLOW_PLAYER_BOUNDARY = True
+    try:
+        assert "账做了手脚" in shown()            # 开关只为证明确实是被闸门挡的
+    finally:
+        retriever.ALLOW_PLAYER_BOUNDARY = False
+    print("R6b 热窗保密: OK 仅玩家卡不进【历史事件】，闸门打开才注入")
 
 
 def test_summary_self_repair():
@@ -1152,12 +1184,14 @@ def test_migrate_stage1_db():
     db = DB(path)
     with db._c() as c:
         cols = {r["name"] for r in c.execute("PRAGMA table_info(event_cards)")}
-    for col in ("rel_hooks", "knowledge_boundary", "importance", "conflict_flags", "precision"):
+    for col in ("rel_hooks", "knowledge_boundary", "importance", "conflict_flags",
+                "precision", "mentions", "verified"):
         assert col in cols, (col, cols)
     card = db.all_cards("s1", "c1")[0]
     assert card["knowledge_boundary"] == "both" and card["importance"] == 0.5
+    assert card["mentions"] == 0 and card["verified"] == 0
     assert card["conflict_flags"] == [] and card["entity_hooks"] == ["旧伞"]
-    print("老库迁移: OK 5 列补齐，默认值可读")
+    print("老库迁移: OK 7 列补齐，默认值可读")
 
 
 class MergeAllBack:
@@ -1372,6 +1406,56 @@ def test_fuse_and_embedding_math():
     print("RRF 融合 + 嵌入数学: OK 排序 / 余弦=1 / 坏数据归零 / 关闭时降级")
 
 
+def test_salience_fields_and_tokenizer():
+    """显著性（mentions/verified）落库与排序；钩子切片改成所有二字片段。"""
+    keys = dict(retriever.core_keys("家书"))
+    assert keys["家书"] > keys.get("书", 0) > 0, keys   # 单字回退保留，但权重必须最低
+    k3 = dict(retriever.core_keys("旧油纸伞"))
+    assert "油纸" in k3 and "纸伞" in k3, k3           # 三字以上按所有二字切片，不只看尾部
+
+    db = fresh("/tmp/rp_salience.db")
+    ledger = {"mood": "平静", "location": "伞铺", "relationship": {},
+              "promises": [], "resolved": []}
+
+    def card(eid, turn, mentions=0):
+        return {"event_id": eid, "session_id": "s1", "character_id": "c1",
+                "turn_start": turn, "turn_end": turn + 1, "summary": f"伞的事{eid}",
+                "state_changes": {"mood": "平静"}, "entity_hooks": ["伞"],
+                "importance": 0.5, "mentions": mentions,
+                "idempotency_key": f"kid-{eid}"}
+
+    for eid, turn, m in (("E8", 1, 3), ("E9", 3, 0), ("E10", 5, 0)):
+        db.commit_archive(card(eid, turn, m), "s1", "c1", turn, turn + 1, ledger)
+    cards = db.all_cards("s1", "c1")
+    assert {c["event_id"]: c["mentions"] for c in cards}["E8"] == 3
+    hits = retriever.retrieve(cards, "伞", limit=3)
+    assert hits[0][1]["event_id"] == "E8", [c["event_id"] for _, c in hits]
+
+    retriever.SALIENCE_ENABLED = False
+    try:                                    # 消融后同分卡按时间新→旧，E10 反而第一
+        off = retriever.retrieve(db.all_cards("s1", "c1"), "伞", limit=3)
+        assert off[0][1]["event_id"] == "E10", [c["event_id"] for _, c in off]
+    finally:
+        retriever.SALIENCE_ENABLED = True
+
+    db.apply_card_merge("c1", "E9", ["E10"], "伞的事合并", 3, 6)
+    left = {c["event_id"]: c for c in db.all_cards("s1", "c1")}
+    assert left["E9"]["mentions"] == 1, left["E9"]["mentions"]
+
+    # 同一条事实再次出现：mentions 累加；换措辞复述（相似度 ≥0.95）才算 verified
+    fact = {"fact": "主人每天早上都要喝一碗热豆浆", "tags": ["饮食"],
+            "category": "设定", "importance": 0.7}
+    db.commit_archive(card("F1", 7), "f1", "c1", 7, 8, ledger, [fact])
+    db.commit_archive(card("F2", 9), "f1", "c1", 9, 10, ledger, [fact])
+    db.commit_archive(card("F3", 11), "f1", "c1", 11, 12, ledger,
+                      [{"fact": "主人每天早上都要喝一碗热豆浆啊", "tags": ["饮食"],
+                        "category": "设定", "importance": 0.7}])
+    with db._c() as c:
+        row = c.execute("SELECT mentions, verified FROM durable_facts").fetchone()
+    assert (row["mentions"], row["verified"]) == (2, 1), (row["mentions"], row["verified"])
+    print("显著性: OK 迁移列 / 同分 solid 优先 / 合并累加 mentions / 换措辞算 verified")
+
+
 def test_tool_roundtrip():
     """一次工具调用：模型请求 now → 工具结果以 role=tool 回填 → 二次作答。"""
     db = fresh("/tmp/rp_tool_round.db")
@@ -1459,6 +1543,7 @@ if __name__ == "__main__":
                test_isolation_and_restart,
                test_idempotency_keys_distinct, test_token_estimate_upper_bound,
                test_archive_failure_visible_and_retry, test_recall_core_word_and_boundary,
+               test_player_boundary_not_in_recent_history,
                test_summary_self_repair, test_conflict_flags_only,
                test_persona_hard_rule_regenerate,
                test_promise_lifecycle, test_promise_unmatched_keeps_open,
@@ -1480,6 +1565,7 @@ if __name__ == "__main__":
                test_retry_backoff_bounds, test_time_awareness, test_migrate_stage1_db,
                test_merge_log_and_card_crud, test_fact_merge_log_and_edit,
                test_fact_merge_verify_and_guards, test_fuse_and_embedding_math,
+               test_salience_fields_and_tokenizer,
                test_tool_roundtrip, test_tool_failure_truncate_unknown,
                test_tool_loop_cap_and_memory_query):
         fn()

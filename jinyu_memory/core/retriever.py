@@ -160,13 +160,38 @@ def recall_intent(text):
 
 
 def core_keys(term):
-    """把一个钩子词展开成 [(key, weight)]，便于命中不同粒度的提及。"""
+    """把一个钩子词展开成 [(key, weight)]，便于命中不同粒度的提及。
+
+    对照 dsh-fish 的 tokensOf（查询侧二字切片）看过：那边是「把用户的问句切碎」，
+    我们是「把已存钩子展开成可匹配的碎片」，方向相反。这里的单字回退不是噪声，
+    是「旧伞 → 伞」的核心词回退（R6 有断言），去掉会让短钩子整个召回失败，
+    所以保留；真正压噪声的是权重（单字 0.6）。
+    """
     keys = [(term, 3.0 + 0.2 * len(term))]
     if len(term) >= 3:
-        keys.append((term[-2:], 1.5))
+        for i in range(len(term) - 1):     # 三字以上按所有二字切片，不再只取尾部
+            keys.append((term[i:i + 2], 1.2))
     if len(term) >= 2 and term[-1] not in STOP_CHARS:
         keys.append((term[-1], 0.6))
     return keys
+
+
+# 别称表：钩子是抽取时的用词，追问是口语用词，两者常常零重合。
+# 这是确定性的字面补丁，不依赖模型；向量召回解决语义长尾，这里只解决「同一个东西的另一种叫法」。
+# 键是钩子原词，值是它在对话里可能出现的说法（双向写法按需补齐）。
+ALIASES = {
+    "家书": ["信", "写信", "信封"], "书信": ["信", "写信"],
+    "保密": ["口风", "守口", "不说出去", "烂在肚子里", "外传"],
+    "旧油纸伞": ["伞", "雨伞", "油纸伞"], "油纸伞": ["伞", "雨伞"],
+    "遗物": ["留下的", "遗留下来的"], "热茶": ["茶", "喝茶", "解渴"],
+    "灯会": ["看灯", "花灯"], "租钱": ["房租", "租金", "催租"],
+    "桂花糕": ["点心", "糕点"], "白鹤": ["鹤", "画的鸟"],
+}
+ALIAS_WEIGHT = 0.8       # 别称命中的权重折扣：宁可少加分，不可让泛词压过原词
+
+
+def _variants(term):
+    return [(term, 1.0)] + [(a, ALIAS_WEIGHT) for a in ALIASES.get(term, [])]
 
 
 def score_card(card, text):
@@ -176,9 +201,10 @@ def score_card(card, text):
     if isinstance(hooks, str):
         hooks = json.loads(hooks or "[]")
     for h in hooks:
-        for key, w in core_keys(h):
-            if key and key in text:
-                best = max(best, w)
+        for variant, factor in _variants(str(h)):
+            for key, w in core_keys(variant):
+                if key and key in text:
+                    best = max(best, w * factor)
     rel = card.get("rel_hooks") or []
     if isinstance(rel, str):
         try:
@@ -192,8 +218,32 @@ def score_card(card, text):
     return best
 
 
+def salience(card):
+    """显著性 = (是否稳固, 权重)：重复记录越多、被确认越多，越不容易被同分卡挤掉。
+
+    借鉴 dsh-fish 的 mentions/verified/solid：那边把「被反复提起」和「被印证过」
+    分开计数，solid 只作为排序档位，不写回正文。这里同一套语义落到事件卡：
+      mentions  同一件事被重复记录/合并进来的次数（合并时累加）
+      verified  被后续事件确认的次数（承诺被这张卡兑现、事实被再次复述）
+    关闭开关只用于评测消融（retriever.SALIENCE_ENABLED = False），线上恒开。
+    """
+    if not SALIENCE_ENABLED:
+        return 0, 0
+    try:
+        m = max(0, int(card.get("mentions") or 0))
+        v = max(0, int(card.get("verified") or 0))
+    except (TypeError, ValueError):
+        return 0, 0
+    solid = 1 if (m >= 3 or v >= 2) else 0
+    return solid, m + v
+
+
+SALIENCE_ENABLED = True      # 评测消融用；线上不要关
+ALLOW_PLAYER_BOUNDARY = False  # 仅评测消融：True 时连「玩家私有」卡也召回
+
+
 def retrieve(cards, text, limit=2, exclude_ids=()):
-    """返回 [(score, card)]，按 score → importance → turn_end 降序。"""
+    """返回 [(score, card)]，按 score → 显著性 → importance → turn_end 降序。"""
     if not text:
         return []
     skip = set(exclude_ids)
@@ -201,7 +251,8 @@ def retrieve(cards, text, limit=2, exclude_ids=()):
     for c in cards:
         if c["event_id"] in skip:
             continue
-        if (c.get("knowledge_boundary") or "both") == "player":
+        if ((c.get("knowledge_boundary") or "both") == "player"
+                and not ALLOW_PLAYER_BOUNDARY):
             continue                                  # 角色不该知道的事不注入
         s = score_card(c, text)
         if s <= 0:
@@ -209,7 +260,9 @@ def retrieve(cards, text, limit=2, exclude_ids=()):
         if c.get("conflict_flags") and STRONG_FLAGS & set(c["conflict_flags"]):
             s *= 0.5                                  # 仅强信号降权，弱信号只留日志
         scored.append((s, c))
-    scored.sort(key=lambda x: (x[0], x[1].get("importance", 0.5), x[1]["turn_end"]), reverse=True)
+    scored.sort(key=lambda x: (x[0], salience(x[1])[0], salience(x[1])[1],
+                               x[1].get("importance", 0.5), x[1]["turn_end"]),
+                reverse=True)
     return scored[:limit]
 
 
@@ -239,7 +292,8 @@ def fuse(keyword_hits, vector_hits, limit=None,
         cards[eid] = c
         scores[eid] = scores.get(eid, 0.0) + vector_weight / (FUSE_K + rank)
     out = sorted(scores.items(),
-                 key=lambda x: (x[1], cards[x[0]].get("importance", 0.5),
+                 key=lambda x: (x[1], salience(cards[x[0]])[0], salience(cards[x[0]])[1],
+                                cards[x[0]].get("importance", 0.5),
                                 cards[x[0]].get("turn_end", 0)), reverse=True)
     if limit:
         out = out[:limit]
