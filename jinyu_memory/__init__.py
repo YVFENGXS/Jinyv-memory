@@ -1026,7 +1026,8 @@ async def _voice_notes(event: MessageEvent) -> str:
 
 
 _VIDEO_INTENT = re.compile(
-    r"(看看|看一下|看下|瞅瞅|瞧瞧|讲什么|讲了什么|说了什么|内容是什么|视频里)")
+    r"(看看|看一下|看下|看这|看视频|视频|瞅瞅|瞧瞧|讲什么|讲了什么|说了什么|"
+    r"内容是什么|视频里)")
 
 
 async def _link_notes(text: str, event: MessageEvent) -> str:
@@ -2654,14 +2655,14 @@ async def _handle(event: MessageEvent):
             logger.info(f"[jinyu] 语音转写失败 user={event.user_id}")
             return ""
 
-    async def _lnote() -> str:
-        try:
-            return await _link_notes(text, event)
-        except Exception:                     # noqa: BLE001   链接失败不影响回复
-            logger.info(f"[jinyu] 链接处理失败 user={event.user_id}")
-            return ""
-    infos, quote_note, voice_note, link_note = await asyncio.gather(
-        _media(), _qnote(), _vnote(), _lnote())
+    infos, quote_note, voice_note = await asyncio.gather(
+        _media(), _qnote(), _vnote())
+    link_note = ""
+    try:
+        # 引用里也常有链接：主人回复旧消息说「再看看这个视频」时，URL 只在引文里
+        link_note = await _link_notes(text + quote_note, event)
+    except Exception:                     # noqa: BLE001   链接失败不影响回复
+        logger.info(f"[jinyu] 链接处理失败 user={event.user_id}")
     if not text:
         # 纯卡片/纯引用也可能承载全部信息，别让它变成「没看清内容」
         text = (_img_note(infos) if has_img else "") or voice_note or quote_note \
