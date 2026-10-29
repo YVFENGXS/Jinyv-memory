@@ -20,7 +20,8 @@ for _p in (_ROOT, _ROOT / "jinyu_memory", _ROOT / "jinyu_memory" / "core", _ROOT
 
 import embedding
 import retriever
-from rp_skeleton import (DB, RPContextMiddleware, est_tokens, _to_midnight,
+from rp_skeleton import (DB, RPContextMiddleware, est_tokens, _human_gap,
+                         _now_line, _stamp, _to_midnight,
                          MAX_TOOL_STEPS, TOOL_RESULT_CHARS, TOOL_LABEL)
 from demo import MockFront, MockBack, PERSONA, SCRIPT
 
@@ -1160,8 +1161,26 @@ def test_time_awareness():
     # 间隔不足 30 分钟：不加重间隔说明，时间行保持纯净
     ledger2 = next(m["content"] for m in msgs if "账本" in m["content"])
     assert ledger2.count("距最近一条消息") == 1
+    # 时长不整档取整：90 分钟不能写成「2 小时」
+    assert _human_gap(90 * 60) == "1 小时 30 分", _human_gap(90 * 60)
+    assert _human_gap(45 * 60) == "45 分钟"
+    assert _human_gap(3 * 3600 + 45 * 60) == "3 小时 45 分"
+    assert _human_gap(25 * 3600) == "1 天 1 小时"
+    # ≥2 小时：账本另起一行写上次发言的日期 + 差值；跨天要点明
+    put(4, "user", "还在吗", utc(now - timedelta(hours=3, minutes=45)))
+    msgs_long = mw._build_messages(PERSONA, sid, cid, upto=4, query="还在吗")
+    ledger_long = next(m["content"] for m in msgs_long if "账本" in m["content"])
+    assert "上次发言：" in ledger_long and "距今 3 小时 45 分" in ledger_long, ledger_long
+    assert "距最近一条消息" not in ledger_long, ledger_long       # 两档互斥
+    before = _now_line(now - timedelta(days=1, hours=1))
+    assert "（昨天）" in before and "已跨天" in before, before
+    # 消息戳带星期；≥2 小时的间隔再补「距上一条多久」
+    assert "周" in _stamp(now, now), _stamp(now, now)
+    assert "距上一条 3 小时 45 分" in _stamp(now - timedelta(hours=4), now,
+                                             3 * 3600 + 45 * 60)
+    assert "距上一条" not in _stamp(now - timedelta(hours=4), now, 45 * 60)
     mw.shutdown()
-    print("R41 时间感知: OK 当前时间锚 / 长间隔加戳 / assistant 不加戳")
+    print("R41 时间感知: OK 当前时间锚 / 长间隔加戳 / assistant 不加戳 / ≥2h 上次发言")
 
 
 def test_migrate_stage1_db():
@@ -1537,6 +1556,33 @@ def test_tool_loop_cap_and_memory_query():
     print("工具循环: OK 两步上限 / 强制收尾 / query_memory 命中词条")
 
 
+def test_dsml_tool_calls():
+    """R42：DSML 工具标记——网关把调用当正文吐出来时，能还原成调用、残缺标记必须删净。"""
+    from llm import parse_dsml_calls, strip_dsml
+    spaced = ("< | | DSML | | calls>\n"
+              "< | | DSML | | invoke name=\"qzone\">\n"
+              "< | | DSML | | parameter name=\"content\" string=\"true\">发条说说"
+              "</ | | DSML | | parameter>\n"
+              "</ | | DSML | | invoke>\n</ | | DSML | | calls>")
+    calls, cleaned = parse_dsml_calls(spaced)
+    assert calls and calls[0]["function"]["name"] == "qzone", calls
+    assert json.loads(calls[0]["function"]["arguments"])["content"] == "发条说说"
+    assert cleaned == "", cleaned
+    tight = ('<||DSML||calls><||DSML||invoke name="mcp_fetch_fetch">'
+             '<||DSML||parameter name="max_length" string="false">6000</||DSML||parameter>'
+             '<||DSML||parameter name="url" string="true">https://example.com/a.md'
+             '</||DSML||parameter></||DSML||invoke></||DSML||calls>')
+    calls2, cleaned2 = parse_dsml_calls(tight)
+    args = json.loads(calls2[0]["function"]["arguments"])
+    assert args["max_length"] == 6000 and args["url"] == "https://example.com/a.md", args
+    assert cleaned2 == "", cleaned2
+    half = ('< | | DSML | | calls>\n< | | DSML | | invoke name="qzone">\n'
+            '< | | DSML | | parameter name="content">写到一半')
+    assert strip_dsml(half) == ""            # 断在半截：标记与参数一起丢，不当正文发
+    assert strip_dsml("普通回复") == "普通回复"
+    print("DSML 工具标记: OK 还原调用 / 类型还原 / 残缺删净 / 普通文本不动")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -1567,6 +1613,6 @@ if __name__ == "__main__":
                test_fact_merge_verify_and_guards, test_fuse_and_embedding_math,
                test_salience_fields_and_tokenizer,
                test_tool_roundtrip, test_tool_failure_truncate_unknown,
-               test_tool_loop_cap_and_memory_query):
+               test_tool_loop_cap_and_memory_query, test_dsml_tool_calls):
         fn()
     print("\nall regression tests passed")

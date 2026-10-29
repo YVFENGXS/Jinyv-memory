@@ -651,6 +651,9 @@ kind 也可以是 "图片"：照片、截图、聊天记录等需要认真回应
    不要硬猜一个名字；
 3. text 必须把图中所有文字抄全，包括语气词、脏话，不要因为不雅而省略或打码；
    但密钥、密码、手机号、身份证号这类敏感字符串一律写成 <已隐藏>，不要原样抄；
+   只抄看得见的字，不要根据上下文推测、改写、润色或补全句子；看不清的字写「[不清]」；
+   文字特别多时（截图、文档、聊天记录）抄到 1500 字左右就停，末尾写「…（后略）」，
+   停在句子结尾；1500 是上限不是任务，不要为了凑字数补写或编内容；
 4. suitable 仅对表情包有意义：图中文字含辱骂、人身攻击、性暗示、脏话，或者画面模糊、
    属于一次性截图/私人隐私的，填 false；
 5. tags 写情绪或使用场景（开心/无语/生气/撒娇/震惊/嫌弃 等），不要写「表情包」。"""
@@ -658,6 +661,8 @@ kind 也可以是 "图片"：照片、截图、聊天记录等需要认真回应
 
 VISION_MAX_SIDE = 1280          # 视觉模型不需要原图分辨率，缩到这个长边足够看清文字
 VISION_JPEG_QUALITY = 85
+STICKER_TEXT_LIMIT = 60         # 表情包上的字：点睛的一两句，60 字足够
+IMAGE_TEXT_LIMIT = 1500         # 截图/文档/聊天记录：整段要读，与视觉提示词的字数上限对齐
 _VISION_RAW_LIMIT = 1_200_000   # 小于这个且非动图就原样送 PNG/JPEG，保留文字清晰度
 
 
@@ -705,6 +710,13 @@ def _brief_text(value, limit: int = 600) -> str:
     """日志用：压成一行并截断，图片 base64 永远不进日志。"""
     text = " ".join(str(value or "").split())
     return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """按用途截断图上的字，并把「被截了」明说给前台，不让它当成全文念完。"""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…（后面还有 {len(text) - limit} 字，没展开）"
 
 
 _glm_down_until = 0.0          # GLM 失败后的冷却，避免每张图都先白等一次
@@ -910,7 +922,10 @@ def analyze_image(data: bytes) -> dict:
 
     kind = "表情包" if parsed.get("kind") == "表情包" else "图片"
     desc = CTRL.sub("", str(parsed.get("desc") or "")).strip()[:60]
-    text = CTRL.sub("", str(parsed.get("text") or "")).strip()[:60]
+    # 表情包上的字是点睛的一两句，60 字够；截图/文档/聊天记录是整段要读的，
+    # 以前一律截到 60 字，长文就只能「念一半」，前台拿到的本来就是半截话。
+    text = _clip_text(CTRL.sub("", str(parsed.get("text") or "")).strip(),
+                      STICKER_TEXT_LIMIT if kind == "表情包" else IMAGE_TEXT_LIMIT)
     character = CTRL.sub("", str(parsed.get("character") or "")).strip()[:30]
     tags: List[str] = []
     for t in parsed.get("tags") or []:

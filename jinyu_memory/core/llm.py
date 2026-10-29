@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +20,78 @@ import urllib.request
 OFF_VALUES = {"off", "none", "0", "false", "no", "disabled"}
 MAX_RETRY_DELAY = 30.0
 IODUMP_CHARS = 600                     # 单条消息/输出在日志里最多展示这么多字
+OUTPUT_GROW_CAP = 4800                 # 被 finish_reason=length 截断时，最多加到这么多再认命
 logger = logging.getLogger("jinyu_memory.llm")
+
+# ---------- DSML：工具调用被服务商当正文吐出来时的兜底 ----------
+# 部分模型/网关不走标准 tool_calls，而是在正文里写
+#   < | | DSML | | calls>< | | DSML | | invoke name="x">…</…>
+# 这种标记原样发到 QQ 就是一屏乱码：能还原成工具调用就照常执行，还原不了也必须删干净。
+_PIPE = r"\|\s*\|\s*DSML\s*\|\s*\|"
+_DSML_OPEN = r"<\s*" + _PIPE + r"\s*"      # 模型常写成「< | | DSML | | invoke」，空格不能漏
+_DSML_CLOSE = r"<\s*/\s*" + _PIPE + r"\s*"
+_DSML_BLOCK_RE = re.compile(
+    _DSML_OPEN + r"(?:calls|tool_calls)\s*>(.*?)" + _DSML_CLOSE
+    + r"(?:calls|tool_calls)\s*>", re.S | re.I)
+_DSML_INVOKE_RE = re.compile(
+    _DSML_OPEN + r'invoke\s+name="([^"]*)"\s*>(.*?)' + _DSML_CLOSE + r"invoke\s*>",
+    re.S | re.I)
+_DSML_PARAM_RE = re.compile(
+    _DSML_OPEN + r"parameter\s+(.*?)>(.*?)" + _DSML_CLOSE + r"parameter\s*>",
+    re.S | re.I)
+_DSML_TAG_RE = re.compile(
+    r"(?:" + _DSML_OPEN + r"|" + _DSML_CLOSE + r")[a-zA-Z_]+\s*(?:[^>]*)?>", re.I)
+
+
+def _dsml_attr(attrs: str, key: str) -> str:
+    m = re.search(rf'{key}\s*=\s*"([^"]*)"', attrs or "")
+    return m.group(1) if m else ""
+
+
+def parse_dsml_calls(text: str):
+    """正文里的 DSML 调用 → (calls, 清干净的正文)。
+
+    有完整的 invoke 就还原成标准 tool_calls，让调用方照常执行；
+    即使解析不全，正文里的标记也会被删掉——绝不把标记发给用户。
+    """
+    raw = str(text or "")
+    if "DSML" not in raw:
+        return [], raw
+    calls = []
+    for m in _DSML_INVOKE_RE.finditer(raw):
+        name = (m.group(1) or "").strip()
+        args = {}
+        for p in _DSML_PARAM_RE.finditer(m.group(2) or ""):
+            key = _dsml_attr(p.group(1), "name")
+            if not key:
+                continue
+            val = p.group(2).strip()
+            if _dsml_attr(p.group(1), "string").lower() == "false":
+                try:                       # string="false" 是数字/布尔，还原成真实类型
+                    val = json.loads(val)
+                except ValueError:
+                    pass
+            args[key] = val
+        if name:
+            calls.append({"id": f"dsml-{len(calls)}", "type": "function",
+                          "function": {"name": name,
+                                       "arguments": json.dumps(args, ensure_ascii=False)}})
+    cleaned = _DSML_INVOKE_RE.sub("", raw)       # 整块调用（含参数值）先删干净
+    cleaned = _DSML_BLOCK_RE.sub("", cleaned)    # 再去 calls 外壳
+    dangling = re.search(_DSML_OPEN, cleaned)    # 没闭合的标记：后面半截参数全丢
+    if dangling:
+        cleaned = cleaned[:dangling.start()]
+    cleaned = _DSML_TAG_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return calls, cleaned
+
+
+def strip_dsml(text: str) -> str:
+    """只删标记、不解析：发送前的最后一道保险。"""
+    raw = str(text or "")
+    if "DSML" not in raw:
+        return raw
+    return parse_dsml_calls(raw)[1]
 
 
 def _brief(value, limit=IODUMP_CHARS):
@@ -87,7 +159,7 @@ class LLM:
             payload["thinking"] = {"type": "disabled"}
         if json_mode:                                  # 归纳体：强约束返回 JSON 对象
             payload["response_format"] = {"type": "json_object"}
-        return (self._complete(payload, max_tokens).get("content") or "").strip()
+        return strip_dsml((self._complete(payload, max_tokens).get("content") or "").strip())
 
     def chat_tools(self, messages, tools, temperature=0.7, max_tokens=1200):
         """带工具的一轮补全：返回 (content, tool_calls)。
@@ -103,8 +175,20 @@ class LLM:
         if self.thinking in OFF_VALUES:
             payload["thinking"] = {"type": "disabled"}
         message = self._complete(payload, max_tokens)
-        return ((message.get("content") or "").strip(),
-                message.get("tool_calls") or [])
+        content = ((message.get("content") or "").strip())
+        calls = message.get("tool_calls") or []
+        if not calls and content:
+            # 网关回的是正文里的 DSML 时，还原成标准调用，别让标记直接进聊天记录
+            parsed, cleaned = parse_dsml_calls(content)
+            if parsed:
+                logger.info("[jinyu] DSML 工具调用已还原 %d 个：%s",
+                            len(parsed),
+                            ", ".join(c["function"]["name"] for c in parsed))
+                return cleaned, parsed
+            if cleaned != content:
+                logger.info("[jinyu] 丢弃不完整的 DSML 标记 %d 字", len(content) - len(cleaned))
+                return cleaned, []
+        return content, calls
 
     def _complete(self, payload, max_tokens):
         """带重试的补全，返回原始 message（可能只有 tool_calls 没有 content）。"""
@@ -122,6 +206,13 @@ class LLM:
                 choice = body["choices"][0]
                 message = choice.get("message") or {}
                 content = (message.get("content") or "").strip()
+                finish = str(choice.get("finish_reason") or "")
+                # 被输出上限截断时不能当完整回答发出去（长图逐字念、长清单最容易撞上）：
+                # 加一档预算重来，到顶才认命返回。
+                if content and finish == "length" and want < OUTPUT_GROW_CAP:
+                    want = min(want * 2, OUTPUT_GROW_CAP)
+                    last = f"输出截断 finish=length，预算加到 {want}"
+                    continue
                 if content or message.get("tool_calls"):
                     self.calls += 1
                     if self.role == "back":
