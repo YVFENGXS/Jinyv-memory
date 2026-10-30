@@ -260,3 +260,51 @@ def from_env(role):
                os.environ.get(prefix + "_MODEL", default),
                thinking=os.environ.get(prefix + "_THINKING", ""),
                role=role)
+
+
+# ---------- 账户余额（DeepSeek /user/balance） ----------
+# 只给「余额快没了要提醒主人」用，不参与生成决策。自定义 RP_LLM_BASE
+# 没有这个接口时返回 None，调用方就当没查过，不报错、不阻塞对话。
+_BAL = {"at": 0.0, "value": None}
+_BAL_TTL = max(600.0, float(os.environ.get("RP_BALANCE_TTL") or 6 * 3600))
+
+
+def parse_balance(data) -> dict:
+    """把 /user/balance 的返回压成 {available, total, currency}。"""
+    data = data or {}
+    infos = data.get("balance_infos") or [{}]
+    info = infos[0] if isinstance(infos[0], dict) else {}
+    try:
+        total = float(info.get("total_balance") or 0)
+    except (TypeError, ValueError):
+        total = 0.0
+    return {"available": bool(data.get("is_available")), "total": total,
+            "currency": str(info.get("currency") or "")}
+
+
+def balance(timeout: float = 3.0) -> dict | None:
+    """查账户余额；没配 key / 接口不支持 / 网络失败都返回 None。"""
+    key = os.environ.get("RP_FRONT_KEY", "")
+    if not key:
+        return None
+    base = (os.environ.get("RP_LLM_BASE") or "https://api.deepseek.com").rstrip("/")
+    req = urllib.request.Request(base + "/user/balance",
+                                 headers={"Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+        return parse_balance(json.loads(raw))
+    except Exception as exc:                     # noqa: BLE001  查询失败不影响聊天
+        logging.getLogger("rp_memory").info("余额查询跳过：%s", exc)
+        return None
+
+
+def balance_cached() -> dict | None:
+    """带 TTL 的余额，避免每轮都打接口。"""
+    now = time.time()
+    if now - _BAL["at"] < _BAL_TTL:
+        return _BAL["value"]
+    value = balance()
+    _BAL.update({"at": now, "value": value})
+    return value
+

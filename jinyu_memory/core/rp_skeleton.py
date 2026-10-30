@@ -684,6 +684,29 @@ def _stamp(dt: datetime, now: datetime, gap=None) -> str:
     return f"[{text}]"
 
 
+def _k(n: int) -> str:
+    return f"{n / 1000:.0f}k" if n >= 1000 else str(int(n))
+
+
+def budget_line(used: int, budget: int, bal: dict | None = None,
+                alert: float = 0.0) -> str:
+    """本轮上下文水位 +（查得到时）模型账户余额；余额低于阈值就提醒喂饭。
+
+    写进【当前状态账本】末尾，让模型自己看得到还剩多少余地。
+    """
+    pct = 0.0 if budget <= 0 else min(1.0, used / budget)
+    out = (f"上下文：已用 {pct * 100:.0f}%（{_k(used)}/{_k(budget)} tokens，"
+           f"剩 {_k(max(0, budget - used))}）")
+    if bal is not None and bal.get("total") is not None:
+        money = float(bal["total"])
+        sym = "¥" if str(bal.get("currency") or "CNY") in ("", "CNY") else \
+            str(bal.get("currency")) + " "
+        out += f"\n模型账户余额：{sym}{money:.2f}"
+        if alert > 0 and money < alert:
+            out += f"（低于 {sym}{alert:.0f}，本轮记得提醒主人给你喂白米饭）"
+    return out
+
+
 def est_tokens(text: str, profile: str = "cl100k") -> int:
     """保守估算：CJK 按厂商系数，其余字符 2 个≈1 token，再加每段固定开销。
 
@@ -2920,6 +2943,7 @@ class RPContextMiddleware:
             if dt is not None:
                 prev_dt = dt
         out, dropped, level = self._fit(anchors, sections, recent, sid, cid)
+        self._annotate_budget(out)
         if dropped and turns:                          # 手术确实丢了轮次才投；level 仅用于可读
             f = max(self._floor.get((sid, cid), 0), turns[dropped - 1]["turn_idx"])
             self._floor[(sid, cid)] = f
@@ -2990,6 +3014,30 @@ class RPContextMiddleware:
         self._last_hi[(sid, cid)] = max(self._last_hi.get((sid, cid), 0), floor)
         self._q.put((sid, cid, floor))
         return True
+
+    def _annotate_budget(self, out) -> None:
+        """在状态账本尾补一行「上下文用掉多少 / 模型账户还剩多少」。
+
+        余额查询带 TTL 缓存；查不到（自定义接口/网络失败）就只写水位，
+        绝不让余额问题卡住回答。
+        """
+        if self.budget <= 0:
+            return
+        used = sum(est_tokens(str(m.get("content") or ""), self.profile) for m in out)
+        try:
+            import llm as llm_mod
+            bal = llm_mod.balance_cached()
+        except Exception:                          # noqa: BLE001 余额查不到不影响对话
+            bal = None
+        try:
+            alert = float(os.environ.get("RP_BALANCE_ALERT") or 5)
+        except (TypeError, ValueError):
+            alert = 5.0
+        line = budget_line(used, self.budget, bal, alert)
+        for m in out[:2]:
+            if "【当前状态账本】" in str(m.get("content") or ""):
+                m["content"] = str(m["content"]) + "\n" + line
+                break
 
     def _fit(self, anchors, sections, recent, sid, cid):
         """水位线调度：WARN/PRE 只观测，HARD 压缩手术，FUSE 按层级丢可选段。

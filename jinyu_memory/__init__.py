@@ -65,6 +65,9 @@
   RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
   RP_DREAM                          选填，1/0 开关每日 Dream 整理，默认 1
   RP_DREAM_AT                       选填，Dream 运行时刻 HH:MM，默认 03:30
+  RP_BALANCE_ALERT                  选填，模型账户余额低于多少元就私聊提醒主人
+                                    「喂白米饭」，默认 5，0=关闭
+  RP_BALANCE_CHECK_HOURS            选填，余额检查间隔小时数，默认 6
   RP_DREAM_SESSIONS                 选填，单次最多整理多少个会话，默认 8
   RP_GRAPH                          选填，1/0 开关图激活（一跳实体共现补位），默认 0
                                     （真实语料 A/B 无增益，默认关；多跳语料可开）
@@ -131,7 +134,7 @@ from asr import (                                            # noqa: E402
     transcribe as asr_transcribe,
 )
 import bili_live                                             # noqa: E402
-from llm import from_env, strip_dsml                           # noqa: E402
+from llm import balance as llm_balance, from_env, strip_dsml   # noqa: E402
 import dream as dream_mod                                    # noqa: E402
 import embedding                                             # noqa: E402
 from linkmeta import (                                      # noqa: E402
@@ -232,6 +235,10 @@ CARD_MERGE_MIN = max(2, int(float(os.environ.get("RP_CARD_MERGE_MIN") or 8)))
 # Dream 轻量整理：每天固定时刻收走过期临时事实 + 合并同义词条；0=关闭。
 DREAM_ON = (os.environ.get("RP_DREAM") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
+# 模型账户余额提醒：低于 RP_BALANCE_ALERT（元）就给主人私聊发一条「喂白米饭」；
+# 0 = 不提醒。检查间隔 RP_BALANCE_CHECK_HOURS（默认 6），查不到就静默跳过。
+BALANCE_ALERT = float(os.environ.get("RP_BALANCE_ALERT") or 5)
+BALANCE_CHECK_HOURS = max(1.0, float(os.environ.get("RP_BALANCE_CHECK_HOURS") or 6))
 DREAM_MAX_SESSIONS = max(1, int(float(os.environ.get("RP_DREAM_SESSIONS") or 8)))
 
 
@@ -942,6 +949,8 @@ async def _startup():
         asyncio.create_task(_social_affinity_loop())
     if DREAM_ON:
         asyncio.create_task(_dream_loop())
+    if BALANCE_ALERT > 0:
+        asyncio.create_task(_balance_loop())
     asyncio.create_task(asyncio.to_thread(sweep_tts_cache, True))   # 启动时清一次 TTS 缓存
 
 
@@ -1065,6 +1074,43 @@ async def _dream_loop():
         else:
             logger.info(f"[jinyu] Dream 完成 过期={len(stats['expired'])} "
                         f"会话={stats['sessions']} 合并组={stats['groups']}")
+
+
+async def _balance_loop():
+    """模型账户余额监控：低于 RP_BALANCE_ALERT 就给主人私聊发「喂白米饭」。
+
+    只查不买、失败静默；同一天最多提醒一次。自定义 RP_LLM_BASE 没有
+    /user/balance 接口时 llm_balance() 返回 None，这里就当没查过。
+    """
+    last_day = ""
+    delay = 60.0
+    while True:
+        await asyncio.sleep(delay)
+        delay = max(3600.0, BALANCE_CHECK_HOURS * 3600)
+        if not ADMIN:
+            continue
+        try:
+            bal = await asyncio.to_thread(llm_balance)
+        except Exception as exc:                    # noqa: BLE001 查询失败不致命
+            logger.info(f"[jinyu] 余额查询失败: {exc}")
+            continue
+        if not bal:
+            continue
+        total = float(bal.get("total") or 0)
+        if total >= BALANCE_ALERT:
+            continue
+        today = date.today().isoformat()
+        if today == last_day:
+            continue
+        last_day = today
+        text = (f"主人，我的模型账户只剩 ¥{total:.2f} 了"
+                f"（低于 ¥{BALANCE_ALERT:.0f}），记得给我喂白米饭～")
+        for uid in ADMIN:
+            try:
+                await get_bot().send_private_msg(user_id=int(uid), message=text)
+            except Exception as exc:                # noqa: BLE001 发不出去就记日志
+                logger.warning(f"[jinyu] 余额提醒发送失败 {uid}: {exc}")
+        logger.info(f"[jinyu] 已提醒主人充值：余额 ¥{total:.2f}")
 
 
 async def _vector_loop():
