@@ -46,6 +46,8 @@
   RP_BILI_CMT_DAILY                 选填，B站视频评论每天上限，默认 3（0=关闭）
   RP_BILI_CMT_GAP                   选填，两条评论最小间隔秒数，默认 600
   RP_BILI_CMT_CHARS                 选填，单条评论字数上限，默认 100
+  RP_BILI_OWNER_UID                 选填，主人B站 UID（评论里可 @主人的归属账号）
+  RP_BILI_OWNER_NAME                选填，主人B站昵称；配置后评论只放行 @主人，其余 @ 全剥掉
   RP_STORYBOARD                     选填，1/0 开关视频分镜（第三方 dsh-video-storyboard），
                                     默认自动：装了就用，没装走四帧
   RP_STORYBOARD_DIR                 选填，分镜工具目录，默认 /opt/qqbot/vendor/dsh-video-storyboard
@@ -203,6 +205,9 @@ PRIMARY_BOT = str(os.environ.get("RP_PRIMARY_BOT_ID") or "").strip()
 BILI_ON = (os.environ.get("RP_BILI_ON") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 BILI_ROOM = bili_live.resolve_room(os.environ.get("RP_BILI_ROOM") or "")
+# 主人自己的B站账号：评论默认不点名，只放行 @主人（看到好玩的可以喊一声）
+BILI_OWNER_UID = str(os.environ.get("RP_BILI_OWNER_UID") or "").strip()
+BILI_OWNER_NAME = str(os.environ.get("RP_BILI_OWNER_NAME") or "").strip()
 # 主动看B站：工具让模型自己搜/看视频；搜索类每天有次数上限，watch 走 RP_VIDEO_DAILY。
 BILI_TOOL_ON = (os.environ.get("RP_BILI_TOOL") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
@@ -588,6 +593,9 @@ def _tool_bili(args, sid, cid, ctx=None) -> str:
         return "链接抓取已关闭（RP_LINK=0），看不了B站。"
     action = str((args or {}).get("action") or "search").strip().lower()
     query = str((args or {}).get("query") or "").strip()
+    if action in ("comment", "评论", "avatar", "头像", "name", "昵称", "emotes", "表情"):
+        return ("bili 只负责 search / popular / watch；"
+                "发评论、换头像、改昵称请改用 bili_account（action=comment/avatar/name）。")
     if action in ("popular", "hot", "热门", "热门视频"):
         if not _bili_list_ok():
             return "今天翻B站翻得有点多，晚点再看。"
@@ -648,6 +656,39 @@ def _tool_bili_account(args, sid, cid, ctx=None) -> str:
         aid = int(meta.get("aid") or 0)
         if not aid:
             return "这条视频读不到 aid，评论发不了（链接可能失效或被风控）。"
+        image = str((args or {}).get("image") or "").strip()
+        data = b""
+        if image.startswith("sticker:") or image.startswith("贴纸:"):
+            tag = image.split(":", 1)[1].strip()
+            path = pick_sticker(tag) if tag else None
+            if path:
+                try:
+                    data = Path(path).read_bytes()
+                except OSError:
+                    data = b""
+            if not data and ctx and str(ctx.get("image") or "").startswith("http"):
+                data, why = download_image_ex(str(ctx["image"]))
+                if not data:
+                    return f"贴纸库里没有「{tag}」，本轮搜图也没拿到：{why}"
+            if not data:
+                return (f"贴纸库里没有「{tag}」合适的图。可以先 search_image 找一张，"
+                        "再调 comment；或者改发文字评论。")
+        elif image.startswith("http"):
+            data, why = download_image_ex(image)
+            if not data:
+                return f"图片没拿到：{why}。带图评论需要一张能下载的图。"
+        elif image:
+            return "image 只接受 http 图片链接、sticker:标签，或留空用本轮搜图。"
+        elif ctx and str(ctx.get("image") or "").startswith("http"):
+            data, why = download_image_ex(str(ctx["image"]))
+            if not data:
+                return f"本轮搜图没拿到：{why}。可以让主人发一张，或改发文字评论。"
+        if data:
+            ok, info = bili_live.post_note_comment(
+                aid, text, data, str(meta.get("bvid") or bvid), title=text)
+            if ok:
+                return f"带图评论已发（视频笔记 {info}）"
+            return info
         ok, info = bili_live.post_comment(aid, text, str(meta.get("bvid") or bvid))
         if ok:
             return f"评论已发出：{info}"
@@ -759,6 +800,7 @@ def _install_tools(inst) -> None:
             "去B站自己看视频：search 按关键词搜、popular 看当前热门、watch 看一条视频"
             "（返回标题/简介/弹幕热评/抽帧画面）。主人在 QQ 里说「去B站看看」「搜一下xx」"
             "时调用；你自己突然想看点东西、想知道B站最近流行什么时也可以主动调用。"
+            "只负责看视频；发评论、换头像、改昵称要用另一个工具 bili_account，不要用 bili。"
             "search/popular 先给候选，挑一条再 watch；watch 要下载视频，可能要几十秒，"
             "调用前先跟主人说一声要去看；watch 每天次数有限，返回里说没看成就是真没看成"
             "——不要编画面或剧情。",
@@ -772,10 +814,16 @@ def _install_tools(inst) -> None:
             _tool_bili)
         inst.register_tool(
             "bili_account",
-            "管理你自己的B站账号：status 查登录/等级/硬币、emotes 看评论区可用表情、"
-            "comment 给视频发评论、avatar 换头像、name 改昵称。"
+            f"管理你自己的B站账号：status 查登录/等级/硬币、emotes 看评论区可用表情、"
+            "comment 给视频发评论（带图走视频笔记，会公开挂在评论区）、avatar 换头像、name 改昵称。"
+            "只有主人明确说「自己配张图评论」时才可以自己选图：先试 image=sticker:标签 从贴纸库取，"
+            "没有合适标签再调 search_image，然后用本轮那张图；不要把随手搜来配聊天的图拿去发评论。"
             "发评论时正文可以带 [doge] 这类B站表情；每天最多 3 条、两条间隔 10 分钟，"
-            "别刷屏，也别在没看过的视频下硬评。只有主人明确让你改头像/昵称时才改，"
+            "别刷屏，也别在没看过的视频下硬评。"
+            + (f"看到特别好玩、想让主人也看看的视频，可以在正文里 @主人（@{BILI_OWNER_NAME}）喊一声，"
+               "只许 @主人、一条最多一次，@ 后面留一个空格；不要 @ 别人。"
+               if BILI_OWNER_NAME else "")
+            + "只有主人明确让你改头像/昵称时才改，"
             "改昵称 B站要扣 6 枚硬币；换头像用主人刚发的那张图（不用填 image）。"
             "没登录、硬币不足、接口风控时工具会返回原因，如实告诉主人，不要假装成功。"
             "写操作被风控拦下、评论发完回读不到（结果不明）、或登录身份对不上时会自动暂停，"
@@ -790,7 +838,7 @@ def _install_tools(inst) -> None:
                  "text": {"type": "string",
                           "description": "comment 用：评论正文，可带 [doge] 等B站表情"},
                  "image": {"type": "string",
-                           "description": "avatar 用：图片链接；留空则用主人刚发的那张图"},
+                           "description": "comment 用：http 图片链接、sticker:标签，留空则用本轮 search_image 的图；avatar 用：http 链接，留空用主人刚发的图"},
                  "name": {"type": "string",
                           "description": "name 用：新昵称，最多 16 个字"}},
              "required": ["action"]},
@@ -871,7 +919,8 @@ async def _startup():
     except Exception as exc:                    # noqa: BLE001  绑定库坏了不能拖垮机器人
         logger.warning(f"[jinyu] 主人绑定库初始化失败: {exc}")
     try:
-        bili_live.init(db_path.with_name("bili_auth.json"), BILI_ROOM)
+        bili_live.init(db_path.with_name("bili_auth.json"), BILI_ROOM,
+                       BILI_OWNER_UID, BILI_OWNER_NAME)
         if bili_live.ready() and BILI_ON:
             if bili_live.can_send():
                 _bili_start()
@@ -1356,7 +1405,7 @@ async def _bili_login_poll(user_id: str, key: str) -> None:
 
 
 _HELP_BILI = ("用法：/bili login 扫码登录｜/bili status｜"
-              "/bili cmt 视频链接 [内容] 发评论｜/bili emotes 看可用表情｜"
+              "/bili cmt 视频链接 [内容] 发评论（可附图或 贴纸=标签，走视频笔记）｜/bili emotes 看可用表情｜"
               "/bili avatar [图片] 换头像｜/bili name 新昵称｜"
               "/bili unlock 解除写操作暂停｜"
               "/bili room 直播间号｜/bili on|off。"
@@ -1405,11 +1454,17 @@ async def _bili_comment_draft(meta: dict) -> str:
     return bili_live.clean_comment(strip_dsml(str(draft or "")), 60)
 
 
-async def _bili_comment_cmd(arg: str, matcher) -> None:
-    """管理员发视频评论：每日限额 + 不 @ 任何人；正文可省略由模型写。"""
+async def _bili_comment_cmd(event, arg: str, matcher) -> None:
+    """管理员发视频评论：每日限额 + 不 @ 任何人；正文可省略由模型写；附图走视频笔记。"""
+    urls = _extract_image_urls(event)
+    image = urls[-1] if urls else ""
+    m = re.search(r"(?:贴纸=|sticker:)(\S+)", arg)
+    sticker_tag = m.group(1) if m else ""
+    if m:
+        arg = arg.replace(m.group(0), "").strip()
     url, bvid, body = _bili_video_ref(arg)
     if not url:
-        await matcher.send("用法：/bili cmt 视频链接 [内容]（不给内容就让瑾瑜自己想一句）")
+        await matcher.send("用法：/bili cmt 视频链接 [内容]（可附图，附图就走视频笔记；也可写 贴纸=开心 从贴纸库选图）")
         return
     ok, why = bili_live.comment_allowed()
     if not ok:
@@ -1428,6 +1483,30 @@ async def _bili_comment_cmd(arg: str, matcher) -> None:
     if not body:
         await matcher.send("没想好写什么，给个方向吧：/bili cmt 链接 内容")
         return
+    if image or sticker_tag:
+        if image:
+            data, why = await asyncio.to_thread(download_image_ex, image)
+            if not data:
+                await matcher.send(f"图片没拿到：{why}")
+                return
+        else:
+            path = pick_sticker(sticker_tag)
+            if not path:
+                await matcher.send(f"贴纸库里没有「{sticker_tag}」合适的图。")
+                return
+            try:
+                data = await asyncio.to_thread(Path(path).read_bytes)
+            except OSError:
+                await matcher.send("贴纸文件读不了，换一张或改发文字评论。")
+                return
+        sent, info = await asyncio.to_thread(
+            bili_live.post_note_comment, aid, body, data,
+            str(meta.get("bvid") or bvid))
+        if sent:
+            await matcher.send(f"已作为带图笔记发到评论区：{info}")
+        else:
+            await matcher.send(info)
+        return
     sent, info = await asyncio.to_thread(
         bili_live.post_comment, aid, body, str(meta.get("bvid") or bvid))
     if sent:
@@ -1445,7 +1524,7 @@ async def _bili_command(event, text: str, matcher) -> bool:
     cmd = (parts[1] if len(parts) > 1 else "status").lower()
     arg = " ".join(parts[2:]).strip()
     if cmd in ("cmt", "comment", "评论"):
-        await _bili_comment_cmd(arg, matcher)
+        await _bili_comment_cmd(event, arg, matcher)
         return True
     if cmd in ("emotes", "emote", "表情"):
         texts = await asyncio.to_thread(bili_live.emote_texts, 24)

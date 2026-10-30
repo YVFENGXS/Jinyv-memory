@@ -2079,7 +2079,15 @@ def test_dsml_tool_calls():
             '< | | DSML | | parameter name="content">写到一半')
     assert strip_dsml(half) == ""            # 断在半截：标记与参数一起丢，不当正文发
     assert strip_dsml("普通回复") == "普通回复"
-    print("DSML 工具标记: OK 还原调用 / 类型还原 / 残缺删净 / 普通文本不动")
+    # DeepSeek 特殊 token 用全角竖线「｜」：2026-10-30 21:54 那屏乱码就是只认半角漏的
+    wide = ('<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="bili">\n'
+            '<｜｜DSML｜｜ parameter name="action" string="true">comment'
+            '</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>')
+    calls3, cleaned3 = parse_dsml_calls(wide)
+    assert calls3 and calls3[0]["function"]["name"] == "bili", calls3
+    assert cleaned3 == "", cleaned3
+    assert strip_dsml("前情提要\n" + wide) == "前情提要"
+    print("DSML 工具标记: OK 还原调用 / 类型还原 / 残缺删净 / 全角竖线 / 普通文本不动")
 
 
 def test_video_index_cache_and_zoom():
@@ -3175,6 +3183,111 @@ def test_bili_write_guard():
     print("R72 B站写操作护栏: OK 暂停拦截 / 风控持久化 / pending / unlock / UID 核对")
 
 
+def test_bili_note_comment():
+    """R74：带图评论走视频笔记——正文序列、配图预处理、回读确认、风控暂停与 pending。"""
+    import bili_live
+    from io import BytesIO
+
+    folder = tempfile.mkdtemp(prefix="rp_bili_note_")
+    saved = (bili_live.readback_note, bili_live.nav_info)
+    try:
+        bili_live.init(Path(folder) / "bili_auth.json", "")
+        bili_live._state.update({"sessdata": "s", "bili_jct": "j", "uid": "42"})
+        assert not bili_live.paused()[0]
+
+        # 正文序列：图片在前，文字在后
+        parts = json.loads(bili_live.note_content("好看", "https://i0.hdslb.com/x.jpg", 100))
+        assert parts[0]["insert"]["imageUpload"]["url"].endswith("x.jpg")
+        assert parts[1]["insert"] == "\n" and parts[2]["insert"] == "好看"
+        assert bili_live.note_title("  看完这个视频了  ", "") == "看完这个视频了"
+
+        # 小 PNG 原样保留，不转码
+        try:
+            from PIL import Image
+            buf = BytesIO()
+            Image.new("RGB", (640, 480), (200, 100, 50)).save(buf, "PNG")
+            img, ext, why = bili_live.note_image_bytes(buf.getvalue())
+            assert img and ext == "png" and why == "", (ext, why)
+        except ImportError:
+            pass
+        assert bili_live.note_image_bytes(b"")[0] == b""
+
+        # 回读命中才记额度
+        bili_live.readback_note = lambda *a, **k: True
+        before = bili_live._cmt_today()
+        ok, note_id = bili_live._note_result(
+            {"code": 0, "data": {"note_id": "9001"}}, 8, "好看", "")
+        assert ok and note_id == "9001" and bili_live._cmt_today() == before + 1
+
+        # 风控 → 暂停并持久化
+        ok, msg = bili_live._note_result(
+            {"code": -352, "message": "风控校验失败"}, 8, "好看", "")
+        assert ok is False and "风控" in msg and "unlock" in msg
+        bili_live.init(Path(folder) / "bili_auth.json", "")
+        assert bili_live.paused()[0]
+        bili_live.unlock()
+
+        # 回读不到 → pending(kind=note) + 暂停
+        bili_live.readback_note = lambda *a, **k: False
+        ok, msg = bili_live._note_result(
+            {"code": 0, "data": {"note_id": "9002"}}, 8, "好看", "BVx")
+        assert ok is False and "结果不明" in msg
+        assert (bili_live._state.get("pending") or {}).get("kind") == "note"
+        assert bili_live.paused()[0]
+        bili_live.unlock()
+
+        # 79508 已有笔记：普通失败，不暂停
+        ok, msg = bili_live._note_result(
+            {"code": 79508, "message": "该稿件已存在笔记"}, 8, "好看", "")
+        assert ok is False and "已经有笔记" in msg and not bili_live.paused()[0]
+
+        # 暂停时带图评论入口直接拒绝，不发起网络
+        bili_live.pause("测试暂停", "test")
+        ok, msg = bili_live.post_note_comment(8, "好看", b"x")
+        assert ok is False and "暂停" in msg
+        bili_live.unlock()
+
+        # note_id 缺失 → 结果不明
+        ok, msg = bili_live._note_result({"code": 0, "data": {}}, 8, "好看", "")
+        assert ok is False
+        assert (bili_live._state.get("pending") or {}).get("kind") == "note"
+    finally:
+        bili_live.readback_note, bili_live.nav_info = saved
+        shutil.rmtree(folder, ignore_errors=True)
+    print("R74 B站带图笔记: OK 正文序列 / 配图预处理 / 回读 / 风控暂停 / pending")
+
+
+def test_bili_owner_mention():
+    """R75：评论只放行 @主人（其余 @ 全剥掉），@ 后补空格，笔记标题不挂 @。"""
+    import bili_live
+    folder = tempfile.mkdtemp(prefix="rp_bili_owner_")
+    try:
+        bili_live.init(Path(folder) / "bili_auth.json", "",
+                       "10001", "小主人")
+        assert bili_live.owner() == ("10001", "小主人")
+
+        # 主人的 @ 留下，别人的 @ 去掉，且 @ 后有一个空格
+        t = bili_live.clean_comment("这视频太乐了 @小主人 一起看 @张三 别刷屏")
+        assert "@小主人 " in t and "@张三" not in t, t
+
+        # 句尾的 @ 也补空格（B站要空格才认成提及）
+        t = bili_live.clean_comment("笑死 @小主人")
+        assert t.endswith("@小主人 "), repr(t)
+
+        # 未配置主人昵称时，所有 @ 一律剥掉（保持原规则）
+        bili_live.init(Path(folder) / "bili_auth.json", "")
+        assert "@" not in bili_live.clean_comment("@小主人 好看 @张三")
+
+        # 笔记标题不挂 @
+        bili_live.init(Path(folder) / "bili_auth.json", "", "", "小主人")
+        assert bili_live._drop_owner("@小主人 这视频太乐了") == "这视频太乐了"
+        assert bili_live.note_title(
+            bili_live._drop_owner("@小主人 这视频太乐了"), "") == "这视频太乐了"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    print("R75 B站只放行@主人: OK 主人@保留 / 他人@剥除 / 尾空格 / 标题不挂@")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -3225,7 +3338,8 @@ if __name__ == "__main__":
                test_dream_light_cleanup, test_run_state_machine,
                test_graph_one_hop, test_assoc_cache_cue_card,
                test_evidence_chain_trace, test_bili_watch_tool_helpers,
-               test_bili_account_helpers, test_bili_write_guard,
+               test_bili_account_helpers, test_bili_write_guard, test_bili_note_comment,
+               test_bili_owner_mention,
                test_chat_stores_reply_when_context_build_fails):
         fn()
     print("\nall regression tests passed")

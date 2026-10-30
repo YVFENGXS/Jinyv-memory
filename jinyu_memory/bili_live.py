@@ -50,8 +50,12 @@ _path: Optional[Path] = None
 
 
 # ---------- 配置 / 登录态 ----------
-def init(path, room: str = "") -> None:
-    """打开登录态文件；没登录过也能先起监听（匿名只读）。"""
+def init(path, room: str = "", owner_uid: str = "", owner_name: str = "") -> None:
+    """打开登录态文件；没登录过也能先起监听（匿名只读）。
+
+    owner_uid / owner_name：主人自己的B站账号。评论默认不 @ 任何人，
+    只放行 @主人本人（避免四处点名）。
+    """
     global _path, _state
     _path = Path(path).expanduser()
     _path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +88,8 @@ def init(path, room: str = "") -> None:
         "pause_at": float(data.get("pause_at") or 0),
         "pause_code": str(data.get("pause_code") or ""),
         "pending": dict(data.get("pending") or {}),
+        "owner_uid": str(owner_uid or data.get("owner_uid") or ""),
+        "owner_name": str(owner_name or data.get("owner_name") or ""),
     }
     _state["_last_send"] = 0.0
     _state["_last_cmt"] = 0.0
@@ -109,6 +115,12 @@ def ready() -> bool:
 
 def can_send() -> bool:
     return bool(_state.get("sessdata") and _state.get("bili_jct"))
+
+
+def owner() -> tuple[str, str]:
+    """主人自己的B站账号（UID, 昵称）；没配置返回两个空串。"""
+    return (str(_state.get("owner_uid") or ""),
+            str(_state.get("owner_name") or ""))
 
 
 # ---------- 写操作护栏：暂停 / 结果不明 / 身份核对 ----------
@@ -160,7 +172,7 @@ def unlock() -> str:
     if old_pause:
         parts.append(f"原暂停原因：{old_pause}")
     if old_pending:
-        parts.append(f"清掉的 pending 评论：{str(old_pending.get('text') or '')[:30]}")
+        parts.append(f"清掉的 pending：{str(old_pending.get('text') or '')[:30]}")
     if not parts:
         return "写操作本来就是通的，没有暂停或 pending。"
     return "已解除B站写操作暂停。" + "｜".join(parts)
@@ -219,8 +231,12 @@ def status() -> str:
         tail = "｜上一条评论结果不明（pending），发 /bili unlock 确认后再发"
     else:
         tail = ""
+    oid, oname = owner()
+    who = ""
+    if oname or oid:
+        who = "｜主人 " + (f"@{oname}" if oname else "") + (f"（UID {oid}）" if oid else "")
     return (f"{head}｜{login}｜今日弹幕 {_sent_today()} 条｜评论 "
-            f"{_cmt_today()}/{comment_quota()} 条｜触发词 {','.join(_names())}{tail}")
+            f"{_cmt_today()}/{comment_quota()} 条｜触发词 {','.join(_names())}{who}{tail}")
 
 
 def set_room(text: str) -> tuple[bool, str]:
@@ -648,16 +664,38 @@ def comment_allowed() -> tuple[bool, str]:
 
 
 def clean_comment(text: str, limit: int = 0) -> str:
-    """评论正文：去标记/@/换行，按字数上限截断。一条评论不点名任何人。"""
+    """评论正文：去标记/换行，按字数上限截断。
+
+    默认不 @ 任何人，只放行 @主人本人（昵称来自 RP_BILI_OWNER_NAME）。
+    B站要把「@昵称」后面留一个空格才会识别成提及，所以恢复时补空格。
+    """
     try:
         limit = limit or int(float(os.environ.get("RP_BILI_CMT_CHARS") or 100))
     except (TypeError, ValueError):
         limit = 100
     t = re.sub(r"\[\[[^\]]*\]\]", "", str(text or ""))
-    t = re.sub(r"@[^\s@]{1,24}", "", t)               # @限制：不 @ 任何人
+    name = str(_state.get("owner_name") or "").strip()
+    tok = "\x00OWNER\x00"
+    if name:
+        t = re.sub(r"@" + re.escape(name), tok, t)   # 先保护主人的 @
+    t = re.sub(r"@[^\s@]{1,24}", "", t)               # 其余 @ 一律去掉
     t = re.sub(r"[\r\n]+", " ", t)
     t = re.sub(r"[ \t]+", " ", t).strip().strip("“”\"'")
+    if name:
+        # 恢复成「@昵称 + 空格」；落在句尾时也保留这个空格，B站才认成提及
+        t = re.sub(r"\x00OWNER\x00\s*", f"@{name} ", t).strip()
+        if t.endswith("@" + name):
+            t = t + " "
     return t[:max(20, limit)]
+
+
+def _drop_owner(text: str) -> str:
+    """去掉正文里的 @主人，用于笔记标题这种短字段。"""
+    t = str(text or "")
+    name = str(_state.get("owner_name") or "").strip()
+    if name:
+        t = re.sub(r"@" + re.escape(name) + r"\s*", "", t)
+    return re.sub(r"[ \t]+", " ", t).strip()
 
 
 def readback_comment(oid: int, text: str, tries: int = 3) -> bool:
@@ -718,8 +756,8 @@ def _comment_result(d: dict, aid: int, msg: str, bvid: str) -> tuple[bool, str]:
             return False, f"评论被拦下：{reason}。写操作已暂停，发 /bili unlock 解除。"
         return False, f"评论失败：{d.get('message') or d.get('code')}"
     if not readback_comment(aid, msg):
-        _state["pending"] = {"aid": aid, "text": msg, "bvid": bvid,
-                             "at": time.time()}
+        _state["pending"] = {"kind": "comment", "aid": aid, "text": msg,
+                             "bvid": bvid, "at": time.time()}
         pause("评论回读不到，结果不明，不自动重试", "readback")
         return False, ("评论可能发出去了，但评论区回读不到，结果不明；"
                        "已记 pending 并暂停写操作，不自动重试，发 /bili unlock 人工确认。")
@@ -748,6 +786,204 @@ def post_comment(aid: int, text: str, bvid: str = "") -> tuple[bool, str]:
     if not ok:
         return False, why
     return _comment_result(_post_comment_net(aid, msg, bvid), aid, msg, bvid)
+
+
+# ---------- 带图评论：视频笔记（普通评论接口不支持图片） ----------
+NOTE_IMG_MAX = 8 * 1024 * 1024
+NOTE_IMG_LIMIT = 5 * 1024 * 1024
+
+
+def _image_ext(data: bytes) -> str:
+    if data[:8].startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return ""
+
+
+def note_image_bytes(data: bytes) -> tuple[bytes, str, str]:
+    """笔记配图预处理：B站只收 jpg/png/gif 且 ≤5MB；webp/超限自动转 JPEG。"""
+    if not data:
+        return b"", "", "图片是空的"
+    if len(data) > NOTE_IMG_MAX:
+        return b"", "", "图片超过 8MB"
+    ext = _image_ext(data)
+    if ext and len(data) <= NOTE_IMG_LIMIT:
+        return data, ext, ""
+    try:
+        from PIL import Image
+    except ImportError:
+        return (data, ext, "") if ext else (b"", "", "图片格式不支持（要 jpg/png/gif）")
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.seek(0)
+            im = im.convert("RGB")
+            w, h = im.size
+            if max(w, h) > 1600:
+                scale = 1600 / max(w, h)
+                im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            for q in (88, 78, 68):
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=q, optimize=True)
+                out = buf.getvalue()
+                if len(out) <= NOTE_IMG_LIMIT:
+                    return out, "jpg", ""
+    except (OSError, ValueError):
+        pass
+    return b"", "", "图片读不了"
+
+
+def note_content(text: str, image_url: str, width: int = 0) -> str:
+    """视频笔记正文序列：图片 + 文字（B站要求 JSON 序列字符串）。"""
+    parts = [{"insert": {"imageUpload": {"url": str(image_url or ""),
+                                        "status": "done",
+                                        "width": max(0, int(width or 0) - 2)}}},
+             {"insert": "\n"}]
+    body = str(text or "").strip()
+    if body:
+        parts.append({"insert": body})
+        parts.append({"insert": "\n"})
+    return json.dumps(parts, ensure_ascii=False)
+
+
+def note_title(text: str, fallback: str = "") -> str:
+    first = re.sub(r"\s+", " ", str(text or "")).strip()
+    return (first[:20] or str(fallback or "").strip()[:20] or "看完视频随手记")
+
+
+def upload_note_image(data: bytes) -> tuple[str, int, str]:
+    """先传图到 B站图床，拿到笔记可用的 image_url。返回 (url, width, 错误)。"""
+    img, ext, why = note_image_bytes(data)
+    if not img:
+        return "", 0, why
+    import httpx
+    csrf = _state.get("bili_jct", "")
+    _warmup()
+    mime = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif"}.get(ext, "image/jpeg")
+    try:
+        with httpx.Client(timeout=30, headers=_headers()) as c:
+            r = c.post(API + "/x/dynamic/feed/draw/upload_bfs",
+                       data={"category": "daily", "biz": "new_dyn", "csrf": csrf},
+                       files={"file_up": (f"note.{ext}", img, mime)})
+            d = r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        return "", 0, f"传图失败：{type(e).__name__}"
+    if d.get("code") != 0:
+        logger.warning("B站笔记传图失败 code=%s msg=%s", d.get("code"), d.get("message"))
+        reason = _risk_reason(d)
+        if reason:
+            pause(f"笔记传图{reason}", d.get("code"))
+            return "", 0, (f"传图被拦下：{reason}。写操作已暂停，发 /bili unlock 解除。")
+        return "", 0, f"传图失败：{d.get('message') or d.get('code')}"
+    item = d.get("data") or {}
+    url = str(item.get("image_url") or "")
+    if not url:
+        return "", 0, "传图返回没带图片地址"
+    return url, int(item.get("image_width") or 0), ""
+
+
+def _add_note_net(aid: int, title: str, summary: str, content: str,
+                  cont_len: int) -> dict:
+    """创建公开笔记并挂到评论区（auto_comment=1）；网络异常折成 dict。"""
+    import httpx
+    _warmup()
+    referer = f"https://www.bilibili.com/video/av{aid}"
+    try:
+        with httpx.Client(timeout=20, headers=_headers(referer)) as c:
+            r = c.post(API + "/x/note/add", data={
+                "oid": str(aid), "oid_type": "0", "title": title,
+                "summary": summary, "content": content, "tags": "",
+                "cls": "1", "from": "save", "cont_len": str(max(0, cont_len)),
+                "platform": "web", "publish": "1", "auto_comment": "1",
+                "csrf": _state.get("bili_jct", "")})
+            return r.json() or {}
+    except (httpx.HTTPError, ValueError) as e:
+        return {"_net": f"发笔记失败：{type(e).__name__}"}
+
+
+def readback_note(oid: int, note_id: str, text: str, tries: int = 3) -> bool:
+    """回读笔记内容，确认图片真的在正文里；读不到只代表结果不明。"""
+    import httpx
+    body = str(text or "").strip()
+    for i in range(max(1, tries)):
+        try:
+            with httpx.Client(timeout=12, headers=_headers()) as c:
+                d = c.get(API + "/x/note/info", params={
+                    "oid": str(oid), "oid_type": "0",
+                    "note_id": str(note_id)}).json()
+        except (httpx.HTTPError, ValueError):
+            d = {}
+        data = d.get("data") or {}
+        if d.get("code") == 0:
+            content = str(data.get("content") or "")
+            summary = str(data.get("summary") or "")
+            if "imageUpload" in content or (body and body[:20] in content + summary):
+                return True
+        if i < tries - 1:
+            time.sleep(0.8)
+    return False
+
+
+def _note_result(d: dict, aid: int, text: str, bvid: str) -> tuple[bool, str]:
+    """笔记接口返回 → 结果：风控暂停 / 回读核验 / 只有确认后才记额度。"""
+    if d.get("_net"):
+        return False, str(d["_net"])
+    if d.get("code") != 0:
+        logger.warning("B站笔记发送失败 aid=%s code=%s msg=%s",
+                       aid, d.get("code"), d.get("message"))
+        reason = _risk_reason(d)
+        if reason:
+            pause(f"笔记{reason}", d.get("code"))
+            return False, f"带图评论被拦下：{reason}。写操作已暂停，发 /bili unlock 解除。"
+        code = d.get("code")
+        if code == 79508:
+            return False, "这个视频已经有笔记了，B站不允许重复添加。"
+        if code == 79513:
+            return False, "这个视频不支持笔记，换个视频或改发文字评论。"
+        return False, f"发笔记失败：{d.get('message') or code}"
+    note_id = str((d.get("data") or {}).get("note_id") or "")
+    if not note_id or not readback_note(aid, note_id, text):
+        _state["pending"] = {"kind": "note", "aid": aid, "note_id": note_id,
+                             "text": text, "bvid": bvid, "at": time.time()}
+        pause("笔记回读不到，结果不明，不自动重试", "readback")
+        return False, ("带图笔记可能发出去了，但回读不到，结果不明；"
+                       "已记 pending 并暂停写操作，不自动重试，发 /bili unlock 人工确认。")
+    _state["pending"] = {}
+    _state["_last_cmt"] = time.time()
+    _state["cmt_sent"] = _cmt_today() + 1
+    _save()
+    logger.info("B站带图笔记已发送并回读确认 aid=%s note_id=%s", aid, note_id)
+    return True, note_id
+
+
+def post_note_comment(aid: int, text: str, image: bytes, bvid: str = "",
+                      title: str = "") -> tuple[bool, str]:
+    """带图评论：传图 → 建公开笔记(auto_comment=1) → 回读核验。
+
+    和普通评论共用每日额度与暂停护栏。
+    """
+    ok, why = comment_allowed()
+    if not ok:
+        return False, why
+    if not aid:
+        return False, "拿不到视频 aid，发不了带图评论"
+    if not image:
+        return False, "没拿到图片，带图评论发不了"
+    ok, why = check_account()
+    if not ok:
+        return False, why
+    url, width, why = upload_note_image(image)
+    if not url:
+        return False, why
+    body = clean_comment(text, 200)
+    # 笔记标题不挂 @：标题只有 20 字，留给人话本身
+    head = note_title(_drop_owner(title or body))
+    summary = body[:80] or head
+    content = note_content(body, url, width)
+    return _note_result(_add_note_net(aid, head, summary, content, len(body)),
+                        aid, body, bvid)
 
 
 # ---------- 账号资料：头像 / 昵称 ----------

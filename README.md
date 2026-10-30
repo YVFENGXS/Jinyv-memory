@@ -13,7 +13,7 @@
 - 时间感知：账本锚注入「当前时间/星期」，间隔 30 分钟～2 小时写「已过多久」，超过 2 小时直接写出上次发言的日期时间与差值（跨天会点明），热窗消息带日期与星期
 - 显著性排序：被反复记录（`mentions`）或被确认（`verified`）的事件卡在同分时优先
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
-- 87 项回归测试，不依赖任何 API key
+- 89 项回归测试，不依赖任何 API key
 
 ---
 
@@ -36,7 +36,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ
-├── tests/test_regression.py # 87 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
+├── tests/test_regression.py # 89 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── monitor.py           # 本地观测云服务器（SSH）
@@ -82,7 +82,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频与账号写操作护栏等 87 项场景（服务器实测 16 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记等 89 项场景（服务器实测 16 秒）。
 
 ## 评测结果（可复现）
 
@@ -151,7 +151,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 87 项回归
+python tests/test_regression.py                        # 89 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -494,6 +494,19 @@ sqlite3 /opt/qqbot/data/rp_memory.db ".backup '/opt/qqbot/backup/rp-$(date +%F).
 **归档一直失败？** 后台模型限流或返回非法 JSON。查看 `list_failures`，修复后会自动重试；期间对话不会丢。
 
 **换角色怎么办？** 改 `jinyu_memory/core/persona.py`，只保留一份人设即可（命令行与 QQ 共用）。
+
+## 致谢
+
+这个项目站在不少现成工作的肩膀上，尤其下面这些：
+
+- **dsh-bili-humanism**（B站账号接入规范，上游文档，不随仓库分发）——本仓库 B站写操作的边界直接照它来：只开白名单接口、风控命中就持久暂停、发出后回读核验、失败不自动重试、只能人工 `/bili unlock` 解除；评论带图走视频笔记也是按它的思路补的。感谢作者把「哪些能自动、哪些必须人来」写成了可执行的规则。
+- **[bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)** —— 评论、视频笔记、动态图片上传、扫码登录这些接口的字段、返回码与请求头，全部对照这份社区文档实现；没有它，这些接口只能靠抓包猜。
+- **[dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard)** —— 视频分镜（第三方组件，不随本仓库分发，脚本按上游固定提交拉取）。
+- **[NoneBot2](https://nonebot.dev/)**、**[OneBot v11](https://github.com/botuniverse/onebot-11)**、**[NapCatQQ](https://github.com/NapNeko/NapCatQQ)** —— QQ 侧接入的全部基础设施。
+- **[AstrBot](https://github.com/AstrBotDevs/AstrBot)** —— 上下文管理、重试退避、临时文件清理等工程实践的参考（未复制代码，许可证差异见下方）。
+- **DeepSeek** —— 前台与后台的模型服务。
+
+以上项目各有各的许可证；本仓库只借鉴设计思路、对照公开接口文档，未复制其源码。
 
 ## License
 
