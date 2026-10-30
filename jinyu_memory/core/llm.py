@@ -27,7 +27,8 @@ logger = logging.getLogger("jinyu_memory.llm")
 # 部分模型/网关不走标准 tool_calls，而是在正文里写
 #   < | | DSML | | calls>< | | DSML | | invoke name="x">…</…>
 # 这种标记原样发到 QQ 就是一屏乱码：能还原成工具调用就照常执行，还原不了也必须删干净。
-_PIPE = r"\|\s*\|\s*DSML\s*\|\s*\|"
+# DeepSeek 的特殊 token 用全角竖线「｜」(U+FF5C)，半角 | 也要认，否则标记会漏进聊天。
+_PIPE = r"[|｜]\s*[|｜]\s*DSML\s*[|｜]\s*[|｜]"
 _DSML_OPEN = r"<\s*" + _PIPE + r"\s*"      # 模型常写成「< | | DSML | | invoke」，空格不能漏
 _DSML_CLOSE = r"<\s*/\s*" + _PIPE + r"\s*"
 _DSML_BLOCK_RE = re.compile(
@@ -177,6 +178,8 @@ class LLM:
         message = self._complete(payload, max_tokens)
         content = ((message.get("content") or "").strip())
         calls = message.get("tool_calls") or []
+        if calls and content and "DSML" in content:
+            content = strip_dsml(content)          # 标准调用 + 正文残留标记：只留正文
         if not calls and content:
             # 网关回的是正文里的 DSML 时，还原成标准调用，别让标记直接进聊天记录
             parsed, cleaned = parse_dsml_calls(content)
