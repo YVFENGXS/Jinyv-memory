@@ -504,6 +504,7 @@ sqlite3 /opt/qqbot/data/rp_memory.db ".backup '/opt/qqbot/backup/rp-$(date +%F).
 - **[dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard)** —— 视频分镜（第三方组件，不随本仓库分发，脚本按上游固定提交拉取）。
 - **[NoneBot2](https://nonebot.dev/)**、**[OneBot v11](https://github.com/botuniverse/onebot-11)**、**[NapCatQQ](https://github.com/NapNeko/NapCatQQ)** —— QQ 侧接入的全部基础设施。
 - **[AstrBot](https://github.com/AstrBotDevs/AstrBot)** —— 上下文管理、重试退避、临时文件清理等工程实践的参考（未复制代码，许可证差异见下方）。
+- **[SeekMemory](https://github.com/NeverENG/SeekMemory)** —— 长期记忆与检索方向的参考项目，感谢作者公开分享；本仓库的分层记忆、召回评测在设计时参考过它的思路。
 - **DeepSeek** —— 前台与后台的模型服务。
 
 以上项目各有各的许可证；本仓库只借鉴设计思路、对照公开接口文档，未复制其源码。
