@@ -3311,6 +3311,18 @@ def test_budget_line():
     print("R76 上下文水位/余额提醒: OK 百分比 / 余额行 / 阈值提醒 / 解析兜底 / 写进账本")
 
 
+def test_broken_marker():
+    """R77：写坏的富消息标记不进正文，全角冒号能自动纠正。"""
+    from richmsg import split_markers
+    parts = split_markers("第一句[[face? no]]第二句 [[face:14]] 结束")
+    text = "".join(p[1] for p in parts if p[0] == "text")
+    assert "[[" not in text and "]]" not in text, text
+    assert any(p[0] == "marker" and p[1] == "face" and p[2] == "14" for p in parts)
+    fixed = [p for p in split_markers("[[face：14]]") if p[0] == "marker"]
+    assert fixed and fixed[0][2] == "14", fixed
+    print("R77 坏标记清理: OK [[face? no]] 已清除 / 全角冒号自动纠正")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -3362,7 +3374,7 @@ if __name__ == "__main__":
                test_graph_one_hop, test_assoc_cache_cue_card,
                test_evidence_chain_trace, test_bili_watch_tool_helpers,
                test_bili_account_helpers, test_bili_write_guard, test_bili_note_comment,
-               test_bili_owner_mention, test_budget_line,
+               test_bili_owner_mention, test_budget_line, test_broken_marker,
                test_chat_stores_reply_when_context_build_fails):
         fn()
     print("\nall regression tests passed")

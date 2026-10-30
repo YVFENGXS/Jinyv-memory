@@ -43,6 +43,9 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment
 logger = logging.getLogger("jinyu_memory.richmsg")
 
 MARKER_RE = re.compile(r"\[\[(img|sticker|face|voice|search):(.+?)\]\]", re.S)
+# 模型偶尔把标记写坏（如 [[face? no]]、全角冒号）：合法标记已单独切出，
+# 文本段里再出现同类前缀就整体清掉，别把半截标记当正文发出去。
+BROKEN_RE = re.compile(r"\[\[(img|sticker|face|voice|search)[^\[\]\n]{0,40}\]\]", re.S)
 CTRL = re.compile(r"[\u0000-\u001f\u202a-\u202e\u2066-\u2069]")   # 控制符/bidi 清洗
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -1624,15 +1627,16 @@ def _record_segment(path: Path) -> Optional[MessageSegment]:
 
 def split_markers(text: str) -> List[Tuple]:
     """切成 [("text", 片段) | ("marker", kind, payload)] 的扁平列表。"""
+    text = re.sub(r"\[\[(img|sticker|face|voice|search)：", r"[[\1:", str(text or ""))
     out: List[Tuple] = []
     pos = 0
     for m in MARKER_RE.finditer(text):
         if m.start() > pos:
-            out.append(("text", text[pos:m.start()]))
+            out.append(("text", BROKEN_RE.sub("", text[pos:m.start()])))
         out.append(("marker", m.group(1), m.group(2).strip()))
         pos = m.end()
     if pos < len(text):
-        out.append(("text", text[pos:]))
+        out.append(("text", BROKEN_RE.sub("", text[pos:])))
     return out
 
 

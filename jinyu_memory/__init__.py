@@ -65,8 +65,8 @@
   RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
   RP_DREAM                          选填，1/0 开关每日 Dream 整理，默认 1
   RP_DREAM_AT                       选填，Dream 运行时刻 HH:MM，默认 03:30
-  RP_BALANCE_ALERT                  选填，模型账户余额低于多少元就私聊提醒主人
-                                    「喂白米饭」，默认 5，0=关闭
+  RP_BALANCE_ALERT                  选填，模型账户余额降到多少元及以下时，
+                                    瑾瑜按人设主动私聊主人「喊饿」讨饭，默认 1，0=关闭
   RP_BALANCE_CHECK_HOURS            选填，余额检查间隔小时数，默认 6
   RP_DREAM_SESSIONS                 选填，单次最多整理多少个会话，默认 8
   RP_GRAPH                          选填，1/0 开关图激活（一跳实体共现补位），默认 0
@@ -235,9 +235,9 @@ CARD_MERGE_MIN = max(2, int(float(os.environ.get("RP_CARD_MERGE_MIN") or 8)))
 # Dream 轻量整理：每天固定时刻收走过期临时事实 + 合并同义词条；0=关闭。
 DREAM_ON = (os.environ.get("RP_DREAM") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
-# 模型账户余额提醒：低于 RP_BALANCE_ALERT（元）就给主人私聊发一条「喂白米饭」；
-# 0 = 不提醒。检查间隔 RP_BALANCE_CHECK_HOURS（默认 6），查不到就静默跳过。
-BALANCE_ALERT = float(os.environ.get("RP_BALANCE_ALERT") or 5)
+# 模型账户余额提醒：降到 RP_BALANCE_ALERT（元，默认 1）及以下时，瑾瑜会按人设
+# 主动「饿醒」私聊主人讨饭；0 = 不提醒。检查间隔 RP_BALANCE_CHECK_HOURS（默认 6）。
+BALANCE_ALERT = float(os.environ.get("RP_BALANCE_ALERT") or 1)
 BALANCE_CHECK_HOURS = max(1.0, float(os.environ.get("RP_BALANCE_CHECK_HOURS") or 6))
 DREAM_MAX_SESSIONS = max(1, int(float(os.environ.get("RP_DREAM_SESSIONS") or 8)))
 
@@ -1097,20 +1097,47 @@ async def _balance_loop():
         if not bal:
             continue
         total = float(bal.get("total") or 0)
-        if total >= BALANCE_ALERT:
+        if total > BALANCE_ALERT:
             continue
         today = date.today().isoformat()
         if today == last_day:
             continue
         last_day = today
-        text = (f"主人，我的模型账户只剩 ¥{total:.2f} 了"
-                f"（低于 ¥{BALANCE_ALERT:.0f}），记得给我喂白米饭～")
         for uid in ADMIN:
+            text = ""
+            try:
+                text = await _balance_line(int(uid), total)
+            except Exception as exc:                # noqa: BLE001 模型挂了就用兜底话术
+                logger.warning(f"[jinyu] 饿醒发言生成失败 {uid}: {exc}")
+            if not text:
+                text = (f"主人……瑾瑜饿得没力气了，模型账户只剩 ¥{total:.2f}，"
+                        "能不能喂我一点白米饭～")
             try:
                 await get_bot().send_private_msg(user_id=int(uid), message=text)
             except Exception as exc:                # noqa: BLE001 发不出去就记日志
                 logger.warning(f"[jinyu] 余额提醒发送失败 {uid}: {exc}")
-        logger.info(f"[jinyu] 已提醒主人充值：余额 ¥{total:.2f}")
+        logger.info(f"[jinyu] 余额见底 ¥{total:.2f}，已主动叫饿提醒主人")
+
+
+async def _balance_line(uid: int, money: float) -> str:
+    """让瑾瑜用自己的人设「饿醒」喊话；失败或拒答返回空串，由调用方兜底。"""
+    if mw is None:
+        return ""
+    persona = dict(PERSONA)
+    if rich_enabled():
+        persona["core"] = persona["core"] + rich_hint()
+    sid = f"qq-u{uid}"
+    lock = _locks.setdefault(sid, asyncio.Lock())
+    async with lock:
+        session_sid = await asyncio.to_thread(
+            mw.session_identity, sid, CID, EPOCH_SECONDS, flush_timeout=EPOCH_FLUSH)
+        prompt = (f"（系统事件：支撑你说话的模型账户只剩 ¥{money:.2f}，快见底了，"
+                  "你饿得没力气。请主动跟主人撒娇讨口饭吃，说一两句符合人设的话："
+                  "可以喊饿、说没力气、要白米饭；不要提余额、接口、充值、系统，"
+                  "也不要报具体金额，别问「在吗」。）")
+        reply = await asyncio.to_thread(mw.chat, prompt, persona, session_sid, CID)
+    reply = strip_dsml(reply or "").strip()
+    return "" if reply in ("[[pass]]", "") else reply
 
 
 async def _vector_loop():
