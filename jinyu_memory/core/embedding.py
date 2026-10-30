@@ -34,6 +34,8 @@ DIM = max(1, int(float(os.environ.get("RP_EMBED_DIM") or 1024)))
 BATCH = max(1, int(float(os.environ.get("RP_EMBED_BATCH") or 16)))
 TIMEOUT = max(3.0, float(os.environ.get("RP_EMBED_TIMEOUT") or 15))
 BASE = (os.environ.get("RP_EMBED_BASE") or "https://api.siliconflow.cn/v1").rstrip("/")
+RERANK_MODEL = (os.environ.get("RP_RERANK_MODEL")
+                or "BAAI/bge-reranker-v2-m3").strip()
 
 _cache = {}          # 文本 -> 归一化向量（只缓成功结果，超量淘汰最早一条）
 _fail_until = 0.0    # 熔断截止时间（time.time）
@@ -158,3 +160,32 @@ def embed_query(text):
         _fail_until = time.time() + min(600.0, 30.0 * (2 ** min(_fails, 4)))
         logger.warning("查询向量失败，本次只用钩子召回：%s", e)
         return None
+
+
+def rerank(query, documents):
+    """Cross-encoder 重排：返回 [(原序号, 相关分)]，失败返回 []（调用方保持原序）。
+
+    只对已召回的少量候选重排，不改变候选集合；任何异常都不抛给前台。
+    """
+    if not enabled() or not query or not documents:
+        return []
+    payload = json.dumps({
+        "model": RERANK_MODEL,
+        "query": str(query)[:500],
+        "documents": [str(d or "")[:1000] for d in documents],
+        "top_n": len(documents),
+        "return_documents": False,
+    }, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        BASE + "/rerank", data=payload,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key()})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            body = json.loads(r.read().decode())
+        rows = body.get("results") or []
+        return [(int(x["index"]), float(x["relevance_score"]))
+                for x in rows if isinstance(x, dict) and "index" in x]
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("重排失败，保持原序：%s: %s", type(e).__name__, e)
+        return []

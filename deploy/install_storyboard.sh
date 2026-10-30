@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO="https://github.com/SAOS-3624/dsh-video-storyboard.git"
-REF="${RP_STORYBOARD_REF:-2a6fdc6cb22190606f54a20887632ab63212a0f0}"
+REF="${RP_STORYBOARD_REF:-6ef68acd7d755f9ba494317458b13d272dda8ff5}"
 DEST="${1:-${RP_STORYBOARD_DIR:-/opt/qqbot/vendor/dsh-video-storyboard}}"
 NODE_VER="${RP_STORYBOARD_NODE:-v20.19.0}"
 OWNER="${RP_STORYBOARD_OWNER:-qqbot}"

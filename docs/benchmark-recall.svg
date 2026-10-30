@@ -1,122 +1,67 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="940" height="1580" viewBox="0 0 940 1580">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="760" viewBox="0 0 960 760">
 <rect width="100%" height="100%" fill="#ffffff"/>
-<text x="30" y="34" font-size="19" font-weight="700" fill="#111827">Jinyu-memory 检索与回答评测</text>
-<text x="30" y="56" font-size="12.5" fill="#6b7280">DeepSeek 4.1 Flash（thinking=off）· bge-m3 向量 · 2026-10-28 · 复现：tools/eval_memory.py</text>
-
-<text x="30" y="92" font-size="15" font-weight="600" fill="#1f2328">Holdout recall@4（小集 n=37，规模集 n=30）</text>
-<text x="250" y="132" font-size="13" fill="#4b5563" text-anchor="end">小集 关键词</text>
-<rect x="262" y="118" width="378.6" height="20" rx="4" fill="#9aa4b2"/>
-<text x="648.6" y="133" font-size="12.5" fill="#1f2328">0.676</text>
-<text x="250" y="162" font-size="13" fill="#4b5563" text-anchor="end">小集 +别称表</text>
-<rect x="262" y="148" width="439.0" height="20" rx="4" fill="#e0a458"/>
-<text x="709.0" y="163" font-size="12.5" fill="#1f2328">0.784</text>
-<text x="250" y="192" font-size="13" fill="#4b5563" text-anchor="end">小集 +别称表+向量</text>
-<rect x="262" y="178" width="560.0" height="20" rx="4" fill="#4c78a8"/>
-<text x="830.0" y="193" font-size="12.5" fill="#1f2328">1.000</text>
-<text x="250" y="222" font-size="13" fill="#4b5563" text-anchor="end">规模集 关键词</text>
-<rect x="262" y="208" width="298.5" height="20" rx="4" fill="#9aa4b2"/>
-<text x="568.5" y="223" font-size="12.5" fill="#1f2328">0.533</text>
-<text x="250" y="252" font-size="13" fill="#4b5563" text-anchor="end">规模集 +向量</text>
-<rect x="262" y="238" width="560.0" height="20" rx="4" fill="#4c78a8"/>
-<text x="830.0" y="253" font-size="12.5" fill="#1f2328">1.000</text>
-
-<text x="30" y="290" font-size="15" font-weight="600" fill="#1f2328">注入命中率（召回后真正进入 prompt 的比例；产品可用性）</text>
-<text x="250" y="330" font-size="13" fill="#4b5563" text-anchor="end">小集 关键词</text>
-<rect x="262" y="316" width="526.4" height="20" rx="4" fill="#9aa4b2"/>
-<text x="796.4" y="331" font-size="12.5" fill="#1f2328">0.940</text>
-<text x="250" y="360" font-size="13" fill="#4b5563" text-anchor="end">小集 +别称表</text>
-<rect x="262" y="346" width="537.6" height="20" rx="4" fill="#e0a458"/>
-<text x="807.6" y="361" font-size="12.5" fill="#1f2328">0.960</text>
-<text x="250" y="390" font-size="13" fill="#4b5563" text-anchor="end">小集 +别称表+向量</text>
-<rect x="262" y="376" width="560.0" height="20" rx="4" fill="#4c78a8"/>
-<text x="830.0" y="391" font-size="12.5" fill="#1f2328">1.000</text>
-<text x="250" y="420" font-size="13" fill="#4b5563" text-anchor="end">规模集 关键词</text>
-<rect x="262" y="406" width="448.0" height="20" rx="4" fill="#9aa4b2"/>
-<text x="718.0" y="421" font-size="12.5" fill="#1f2328">0.800</text>
-<text x="250" y="450" font-size="13" fill="#4b5563" text-anchor="end">规模集 +向量</text>
-<rect x="262" y="436" width="560.0" height="20" rx="4" fill="#4c78a8"/>
-<text x="830.0" y="451" font-size="12.5" fill="#1f2328">1.000</text>
-
-<text x="30" y="488" font-size="15" font-weight="600" fill="#1f2328">真实回答准确率（40 条事实题，6 次重跑；最低 / 0.825 / 0.850 / 最高）</text>
-<text x="250" y="528" font-size="13" fill="#4b5563" text-anchor="end">最低（运行 1）</text>
-<rect x="262" y="514" width="448.0" height="20" rx="4" fill="#7b6fd0"/>
-<text x="718.0" y="529" font-size="12.5" fill="#1f2328">0.800</text>
-<text x="250" y="558" font-size="13" fill="#4b5563" text-anchor="end">运行 3 / 4</text>
-<rect x="262" y="544" width="462.0" height="20" rx="4" fill="#7b6fd0"/>
-<text x="732.0" y="559" font-size="12.5" fill="#1f2328">0.825</text>
-<text x="250" y="588" font-size="13" fill="#4b5563" text-anchor="end">运行 5 / 6</text>
-<rect x="262" y="574" width="476.0" height="20" rx="4" fill="#7b6fd0"/>
-<text x="746.0" y="589" font-size="12.5" fill="#1f2328">0.850</text>
-<text x="250" y="618" font-size="13" fill="#4b5563" text-anchor="end">最高（运行 2）</text>
-<rect x="262" y="604" width="518.0" height="20" rx="4" fill="#7b6fd0"/>
-<text x="788.0" y="619" font-size="12.5" fill="#1f2328">0.925</text>
-<text x="250" y="648" font-size="13" fill="#4b5563" text-anchor="end">边界守护（10 题，6 次全对）</text>
-<rect x="262" y="634" width="560.0" height="20" rx="4" fill="#54a24b"/>
-<text x="830.0" y="649" font-size="12.5" fill="#1f2328">1.000</text>
-
-<text x="30" y="722" font-size="15" font-weight="600" fill="#1f2328">记忆承重度与显著性（承重度越低越好，其余越高越好）</text>
-<text x="250" y="762" font-size="13" fill="#4b5563" text-anchor="end">承重度（抽掉 top-1 卡后答错）</text>
-<rect x="262" y="748" width="186.5" height="20" rx="4" fill="#e15759"/>
-<text x="456.5" y="763" font-size="12.5" fill="#1f2328">0.333 ↓</text>
-<text x="250" y="792" font-size="13" fill="#4b5563" text-anchor="end">显著性 开（6 张同分卡）</text>
-<rect x="262" y="778" width="560.0" height="20" rx="4" fill="#4c78a8"/>
-<text x="830.0" y="793" font-size="12.5" fill="#1f2328">1.000</text>
-<text x="250" y="822" font-size="13" fill="#4b5563" text-anchor="end">显著性 关（消融）</text>
-<rect x="262" y="808" width="2.0" height="20" rx="1" fill="#9aa4b2"/>
-<text x="272.0" y="823" font-size="12.5" fill="#1f2328">0.000</text>
-
-<text x="30" y="896" font-size="15" font-weight="600" fill="#1f2328">外部基线（30 卡 / 60 问，1000 token 硬预算；条形=注入命中，右侧=平均 token）</text>
-<text x="30" y="916" font-size="11.5" fill="#9ca3af">全塞在预算内被 FUSE 整段丢弃，退化成「只用热窗」；关掉水位线才到 1.0，代价 1322 token</text>
-
-<text x="250" y="952" font-size="13" fill="#4b5563" text-anchor="end">ours 召回+结构</text>
-<rect x="262" y="938" width="448.0" height="20" rx="4" fill="#4c78a8"/>
-<text x="718.0" y="953" font-size="12.5" font-weight="600" fill="#1f2328">0.800 · 658 tok</text>
-
-<text x="250" y="982" font-size="13" fill="#4b5563" text-anchor="end">full 受水位线</text>
-<rect x="262" y="968" width="112.0" height="20" rx="4" fill="#9aa4b2"/>
-<text x="382.0" y="983" font-size="12.5" fill="#1f2328">0.200 · 556 tok</text>
-
-<text x="250" y="1012" font-size="13" fill="#4b5563" text-anchor="end">full 关水位线</text>
-<rect x="262" y="998" width="560.0" height="20" rx="4" fill="#e0a458"/>
-<text x="830.0" y="1013" font-size="12.5" fill="#1f2328">1.000 · 1322 tok</text>
-
-<text x="250" y="1042" font-size="13" fill="#4b5563" text-anchor="end">recent 只用热窗</text>
-<rect x="262" y="1028" width="112.0" height="20" rx="4" fill="#9aa4b2"/>
-<text x="382.0" y="1043" font-size="12.5" fill="#1f2328">0.200 · 556 tok</text>
-
-<text x="30" y="1086" font-size="15" font-weight="600" fill="#1f2328">机制消融（开 → 关）</text>
-<text x="250" y="1120" font-size="13" fill="#4b5563" text-anchor="end">保密闸门 · 召回通道</text>
-<text x="262" y="1120" font-size="12.5" fill="#1f2328">0/3 泄漏 → 3/3 泄漏</text>
-<text x="250" y="1146" font-size="13" fill="#4b5563" text-anchor="end">保密闸门 · 热窗通道</text>
-<text x="262" y="1146" font-size="12.5" fill="#1f2328">0/3 泄漏 → 3/3 泄漏（本轮发现并已修）</text>
-<text x="250" y="1172" font-size="13" fill="#4b5563" text-anchor="end">承诺通道 strict 段</text>
-<text x="262" y="1172" font-size="12.5" fill="#1f2328">段注入 / 3 条事实 → 无段 / 1 条</text>
-<text x="250" y="1198" font-size="13" fill="#4b5563" text-anchor="end">水位线（全量硬塞）</text>
-<text x="262" y="1198" font-size="12.5" fill="#1f2328">556 tok / 命中 0.2 → 1322 tok / 命中 1.0</text>
-
-<text x="30" y="1242" font-size="15" font-weight="600" fill="#1f2328">真实语料（线上库 275 卡；评测会话 219 卡 · 533 轮 · 45 问，bge-m3 现算）</text>
-<text x="250" y="1282" font-size="13" fill="#4b5563" text-anchor="end">召回 · 关键词</text>
-<rect x="262" y="1268" width="149.5" height="20" rx="4" fill="#9aa4b2"/>
-<text x="415.5" y="1283" font-size="12.5" fill="#1f2328">0.267 · CI [0.160, 0.410]</text>
-<text x="250" y="1312" font-size="13" fill="#4b5563" text-anchor="end">召回 · +向量</text>
-<rect x="262" y="1298" width="448.0" height="20" rx="4" fill="#4c78a8"/>
-<text x="714.0" y="1313" font-size="12.5" fill="#1f2328">0.800 · CI [0.662, 0.891]</text>
-<text x="250" y="1342" font-size="13" fill="#4b5563" text-anchor="end">注入 · 关键词</text>
-<rect x="262" y="1328" width="174.2" height="20" rx="4" fill="#9aa4b2"/>
-<text x="440.2" y="1343" font-size="12.5" fill="#1f2328">0.311 · CI [0.195, 0.457]</text>
-<text x="250" y="1372" font-size="13" fill="#4b5563" text-anchor="end">注入 · +向量</text>
-<rect x="262" y="1358" width="472.6" height="20" rx="4" fill="#4c78a8"/>
-<text x="738.6" y="1373" font-size="12.5" fill="#1f2328">0.844 · CI [0.712, 0.923]</text>
-
-<text x="30" y="1404" font-size="11.5" fill="#9ca3af">真实钩子是「主人 93% / 瑾瑜 97%」这类人设常量，含任一钩子的卡占 99.1% → 关键词分数大量并列，退化为「最近 + 重要」；两组 95%CI 不重叠。</text>
-
-<text x="30" y="1444" font-size="15" font-weight="600" fill="#1f2328">真实语料消融（同一批 219 卡 / 45 问）</text>
-<text x="250" y="1474" font-size="13" fill="#4b5563" text-anchor="end">全塞 vs 召回</text>
-<text x="262" y="1474" font-size="12.5" fill="#1f2328">全塞 20368 tok / 命中 1.000 ｜ 召回 3198 tok / 命中 0.844（贵 6.4 倍）</text>
-<text x="250" y="1498" font-size="13" fill="#4b5563" text-anchor="end">水位线拐点</text>
-<text x="262" y="1498" font-size="12.5" fill="#1f2328">8000 → 0.844 / 丢 0 段 ｜ 4000 → 0.844 / 丢 1 ｜ 2000 → 0.000 / 丢 91</text>
-<text x="250" y="1522" font-size="13" fill="#4b5563" text-anchor="end">承诺 · 显著性</text>
-<text x="262" y="1522" font-size="12.5" fill="#1f2328">strict 段覆盖 8 张 vs 1 张 ｜ 计数非零 26 张，开关与回填后都是 0.800</text>
-
-<text x="30" y="1552" font-size="11.5" fill="#9ca3af">1000 预算是死线：人设 + 状态账本 1157 tok + 热对话已 1414 tok，锚点不参与裁剪 → 注入段被整段丢弃，命中 0.844 → 0.000。</text>
-</svg>
+<g font-family="'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+<text x="30" y="38" font-size="19" font-weight="700" fill="#111827">Jinyu-memory 检索与注入评测（真实语料 + 合成语料）</text>
+<text x="30" y="60" font-size="12.5" fill="#6b7280">DeepSeek 4.1 Flash · BAAI/bge-m3 · 2026-10-30 · 线上库快照：349 张卡 / 1770 轮 / 250 条词条</text>
+<text x="30" y="79" font-size="11.5" fill="#9ca3af">真实语料问句由固定协议从真实用户消息抽取（主私聊 60 条 / 群聊 27 条），非人工挑选</text>
+<text x="30" y="116" font-size="15" font-weight="600" fill="#1f2328">recall@4：目标卡是否进入前 4（灰=纯关键词；蓝=关键词+向量）</text>
+<text x="270" y="147" font-size="12.5" fill="#4b5563" text-anchor="end">主私聊 n=60</text>
+<rect x="282" y="134" width="102.5" height="13" rx="3" fill="#9aa4b2"/>
+<text x="392.5" y="144" font-size="12" fill="#1f2328">0.183</text>
+<line x1="594.5" y1="140.5" x2="722.7" y2="140.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="594.5" y1="136.5" x2="594.5" y2="144.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="722.7" y1="136.5" x2="722.7" y2="144.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<rect x="282" y="152" width="382.5" height="13" rx="3" fill="#4c78a8"/>
+<text x="672.5" y="162" font-size="12" fill="#1f2328">0.683</text>
+<text x="270" y="193" font-size="12.5" fill="#4b5563" text-anchor="end">群聊 n=27</text>
+<rect x="282" y="180" width="290.6" height="13" rx="3" fill="#9aa4b2"/>
+<text x="580.6" y="190" font-size="12" fill="#1f2328">0.519</text>
+<line x1="660.0" y1="186.5" x2="809.0" y2="186.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="660.0" y1="182.5" x2="660.0" y2="190.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="809.0" y1="182.5" x2="809.0" y2="190.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<rect x="282" y="198" width="477.1" height="13" rx="3" fill="#4c78a8"/>
+<text x="767.1" y="208" font-size="12" fill="#1f2328">0.852</text>
+<text x="270" y="239" font-size="12.5" fill="#4b5563" text-anchor="end">合成小集 n=50</text>
+<rect x="282" y="226" width="470.4" height="13" rx="3" fill="#9aa4b2"/>
+<text x="760.4" y="236" font-size="12" fill="#1f2328">0.840</text>
+<line x1="802.2" y1="232.5" x2="842.0" y2="232.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="802.2" y1="228.5" x2="802.2" y2="236.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="842.0" y1="228.5" x2="842.0" y2="236.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<rect x="282" y="244" width="560.0" height="13" rx="3" fill="#4c78a8"/>
+<text x="850.0" y="254" font-size="12" fill="#1f2328">1.000</text>
+<text x="270" y="285" font-size="12.5" fill="#4b5563" text-anchor="end">合成规模集 n=60</text>
+<rect x="282" y="272" width="392.0" height="13" rx="3" fill="#9aa4b2"/>
+<text x="682.0" y="282" font-size="12" fill="#1f2328">0.700</text>
+<line x1="808.4" y1="278.5" x2="842.0" y2="278.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="808.4" y1="274.5" x2="808.4" y2="282.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<line x1="842.0" y1="274.5" x2="842.0" y2="282.5" stroke="#374151" stroke-width="1" opacity="0.55"/>
+<rect x="282" y="290" width="560.0" height="13" rx="3" fill="#4c78a8"/>
+<text x="850.0" y="300" font-size="12" fill="#1f2328">1.000</text>
+<text x="30" y="350" font-size="11.5" fill="#6b7280">黑线为 95% Wilson 区间；合成集与真实语料口径不同，不横向比较绝对值</text>
+<text x="30" y="392" font-size="15" font-weight="600" fill="#1f2328">原文注入率：目标卡摘要真的进入 prompt（绿=披露层开（线上）；橙=关（对照）</text>
+<text x="270" y="423" font-size="12.5" fill="#4b5563" text-anchor="end">主私聊</text>
+<rect x="282" y="410" width="382.5" height="13" rx="3" fill="#9aa4b2"/>
+<text x="672.5" y="420" font-size="12" fill="#1f2328">0.683</text>
+<rect x="282" y="428" width="392.0" height="13" rx="3" fill="#4c78a8"/>
+<text x="682.0" y="438" font-size="12" fill="#1f2328">0.700</text>
+<text x="270" y="469" font-size="12.5" fill="#4b5563" text-anchor="end">群聊</text>
+<rect x="282" y="456" width="497.8" height="13" rx="3" fill="#9aa4b2"/>
+<text x="787.8" y="466" font-size="12" fill="#1f2328">0.889</text>
+<rect x="282" y="474" width="518.6" height="13" rx="3" fill="#4c78a8"/>
+<text x="808.6" y="484" font-size="12" fill="#1f2328">0.926</text>
+<text x="270" y="515" font-size="12.5" fill="#4b5563" text-anchor="end">合成小集</text>
+<rect x="282" y="502" width="380.8" height="13" rx="3" fill="#9aa4b2"/>
+<text x="670.8" y="512" font-size="12" fill="#1f2328">0.680</text>
+<rect x="282" y="520" width="560.0" height="13" rx="3" fill="#4c78a8"/>
+<text x="850.0" y="530" font-size="12" fill="#1f2328">1.000</text>
+<text x="270" y="561" font-size="12.5" fill="#4b5563" text-anchor="end">合成规模集</text>
+<rect x="282" y="548" width="532.0" height="13" rx="3" fill="#9aa4b2"/>
+<text x="822.0" y="558" font-size="12" fill="#1f2328">0.950</text>
+<rect x="282" y="566" width="560.0" height="13" rx="3" fill="#4c78a8"/>
+<text x="850.0" y="576" font-size="12" fill="#1f2328">1.000</text>
+<text x="30" y="620" font-size="15" font-weight="600" fill="#1f2328">读数</text>
+<text x="30" y="644" font-size="12.5" fill="#374151">1. 真实语料上向量把主私聊 recall@4 从 0.183 拉到 0.683，群聊从 0.519 拉到 0.852。</text>
+<text x="30" y="666" font-size="12.5" fill="#374151">2. 注入率与 recall 的差距来自披露层：合成小集有 32% 的命中卡被降级为固定句，回答准确率随之从 0.850 掉到 0.700。</text>
+<text x="30" y="688" font-size="12.5" fill="#374151">3. 披露层在真实主私聊只影响 1/60（0.700→0.683），代价集中在「弱字面命中 + 互补向量」的合成场景。</text>
+<text x="30" y="710" font-size="11.5" fill="#9ca3af">合成规模集未跑「披露关闭 + 真实回答」，注入 0.950→1.000 为离线对照。</text>
+</g></svg>

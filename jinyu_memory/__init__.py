@@ -41,6 +41,11 @@
   RP_ASR_BASE                       选填，接口地址，默认 https://api.siliconflow.cn/v1
   RP_LINK                           选填，1/0 链接抓取，默认 1
   RP_VIDEO_DAILY                    选填，视频抽帧每日上限，默认 3（超过 3 分钟的视频不看）
+  RP_BILI_TOOL                      选填，1/0 开关「去B站看视频」工具，默认 1
+  RP_BILI_LIST_DAILY                选填，B站搜索/热门每天次数上限，默认 30
+  RP_BILI_CMT_DAILY                 选填，B站视频评论每天上限，默认 3（0=关闭）
+  RP_BILI_CMT_GAP                   选填，两条评论最小间隔秒数，默认 600
+  RP_BILI_CMT_CHARS                 选填，单条评论字数上限，默认 100
   RP_STORYBOARD                     选填，1/0 开关视频分镜（第三方 dsh-video-storyboard），
                                     默认自动：装了就用，没装走四帧
   RP_STORYBOARD_DIR                 选填，分镜工具目录，默认 /opt/qqbot/vendor/dsh-video-storyboard
@@ -49,11 +54,20 @@
   RP_GLM_KEY                        选填，智谱 API key；配置后视觉判读优先用 GLM
   RP_GLM_MODEL                      选填，GLM 判读模型，默认 glm-5.3-flash
   RP_GLM_BASE                       选填，GLM 接口地址，默认智谱开放平台 v4
+  RP_IMG_TEXT_LIMIT                 选填，视觉判读抄录图中文字的上限（字符），默认 4000
+  RP_IMG_NOTE_TEXT                  选填，OCR 注入前台的字数上限，默认 4000
   RP_ADMIN_QQ                       选填，允许 /persona /memory /merge /save /tags /find /img
                                     /sticker /fix /voice /testrich /social 的 QQ
   RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
   RP_FACT_MERGE_MIN                 选填，会话事实达到多少条才自动合并，默认 20
   RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
+  RP_DREAM                          选填，1/0 开关每日 Dream 整理，默认 1
+  RP_DREAM_AT                       选填，Dream 运行时刻 HH:MM，默认 03:30
+  RP_DREAM_SESSIONS                 选填，单次最多整理多少个会话，默认 8
+  RP_GRAPH                          选填，1/0 开关图激活（一跳实体共现补位），默认 0
+                                    （真实语料 A/B 无增益，默认关；多跳语料可开）
+  RP_ASSOC_CACHE                    选填，1/0 开关 cue→card 联想缓存，默认 1
+                                    （同一 cue 再次命中时省一次后台联想调用）
   RP_RECALL_CARDS                   选填，每轮最多注入几张召回卡，默认 4
   RP_MCP                            选填，1/0 开关 MCP 只读工具，默认 1（无 mcp.json 时不生效）
   RP_MCP_CONFIG                     选填，MCP 配置文件路径，默认插件目录下 mcp.json
@@ -77,6 +91,7 @@
   RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
 """
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -113,9 +128,16 @@ from asr import (                                            # noqa: E402
     model_name as asr_model,
     transcribe as asr_transcribe,
 )
+import bili_live                                             # noqa: E402
 from llm import from_env, strip_dsml                           # noqa: E402
+import dream as dream_mod                                    # noqa: E402
 import embedding                                             # noqa: E402
 from linkmeta import (                                      # noqa: E402
+    bili_digest,
+    bili_list_note,
+    bili_popular,
+    bili_search,
+    bili_watch_brief,
     card_info,
     card_note,
     enabled as link_enabled,
@@ -123,8 +145,11 @@ from linkmeta import (                                      # noqa: E402
     frames_available,
     is_video_url,
     note_for as link_note_for,
-    video_frames_note,
+    video_frames_info,
+    video_meta,
+    zoom_note,
 )
+import owner_gate                                           # noqa: E402
 import persona as persona_mod                               # noqa: E402
 import reminder                                             # noqa: E402
 from persona import PERSONA                                 # noqa: E402
@@ -155,8 +180,10 @@ from richmsg import (                                       # noqa: E402
     url_is_public,
 )
 from mcp_client import MCPManager, load_config              # noqa: E402
+import rp_skeleton                                            # noqa: E402
 from rp_skeleton import DB, RPContextMiddleware             # noqa: E402
 from summarizer import parse as parse_json                  # noqa: E402
+from task_supervisor import supervisor as task_supervisor   # noqa: E402
 
 CID = "jinyu"
 COOLDOWN = float(os.environ.get("RP_COOLDOWN") or 2)
@@ -167,6 +194,20 @@ BUBBLE_MAX = max(1, int(float(os.environ.get("RP_BUBBLE_MAX") or 6)))
 _BUBBLE_GAP = max(0.0, float(os.environ.get("RP_BUBBLE_DELAY") or 0.9))
 BUBBLE_DELAY = (_BUBBLE_GAP * 0.6, _BUBBLE_GAP * 1.4)   # 相邻气泡的随机间隔（秒）
 ADMIN = {x.strip() for x in (os.environ.get("RP_ADMIN_QQ") or "").split(",") if x.strip()}
+# 多账号：默认关闭，老库的 qq-g…/qq-u… 原样续用。
+# 开启后，主号（RP_PRIMARY_BOT_ID）继续用老键，其余号写 qq-g…@b<self_id>，
+# 这样两个号同群也不会互相覆盖热窗、游标和账本。
+MULTI_BOT = (os.environ.get("RP_MULTI_BOT") or "0").strip().lower() not in {
+    "0", "false", "no", "off"}
+PRIMARY_BOT = str(os.environ.get("RP_PRIMARY_BOT_ID") or "").strip()
+BILI_ON = (os.environ.get("RP_BILI_ON") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+BILI_ROOM = bili_live.resolve_room(os.environ.get("RP_BILI_ROOM") or "")
+# 主动看B站：工具让模型自己搜/看视频；搜索类每天有次数上限，watch 走 RP_VIDEO_DAILY。
+BILI_TOOL_ON = (os.environ.get("RP_BILI_TOOL") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+BILI_LIST_DAILY = max(1, int(float(os.environ.get("RP_BILI_LIST_DAILY") or 30)))
+_bili_tool_day = {"day": "", "n": 0}
 IDLE_NUDGE_MIN = float(os.environ.get("RP_IDLE_NUDGE_MINUTES") or 60)
 PROACTIVE_ON = (os.environ.get("RP_PROACTIVE") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
@@ -175,12 +216,30 @@ POKE_BACK = (os.environ.get("RP_POKE_BACK") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 POKE_COOLDOWN = max(0.0, float(os.environ.get("RP_POKE_COOLDOWN") or 30))
 MAX_SILENT = 2            # 允许连续沉默的轮数；超过后强制开口，避免对话彻底断死
-IMG_NOTE_TEXT = 600       # 长图 OCR 注入前台的上限（字符）：超过只给开头，别把整屏灌进上下文
+# 长图 OCR 注入前台的上限（字符）：默认与视觉抄录上限对齐，截图/文档才读得全；
+# 上下文紧张时可用 RP_IMG_NOTE_TEXT 调小。
+IMG_NOTE_TEXT = max(200, int(float(os.environ.get("RP_IMG_NOTE_TEXT") or 4000)))
 EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48) * 3600))
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
 FACT_MERGE_HOURS = max(0.0, float(os.environ.get("RP_FACT_MERGE_HOURS") or 6))
 FACT_MERGE_MIN = max(2, int(float(os.environ.get("RP_FACT_MERGE_MIN") or 20)))
 CARD_MERGE_MIN = max(2, int(float(os.environ.get("RP_CARD_MERGE_MIN") or 8)))
+# Dream 轻量整理：每天固定时刻收走过期临时事实 + 合并同义词条；0=关闭。
+DREAM_ON = (os.environ.get("RP_DREAM") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+DREAM_MAX_SESSIONS = max(1, int(float(os.environ.get("RP_DREAM_SESSIONS") or 8)))
+
+
+def _dream_at(raw):
+    """RP_DREAM_AT=HH:MM；写坏就退回 03:30，不让一个错配置把后台整理关掉。"""
+    try:
+        hour, minute = str(raw or "").strip().split(":", 1)
+        return max(0, min(23, int(hour))), max(0, min(59, int(minute)))
+    except (TypeError, ValueError):
+        return 3, 30
+
+
+DREAM_AT = _dream_at(os.environ.get("RP_DREAM_AT"))
 SIGN_ON = (os.environ.get("RP_SIGN") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 SIGN_GAP = max(0.0, float(os.environ.get("RP_SIGN_COOLDOWN_HOURS") or 24) * 3600)
@@ -214,6 +273,7 @@ SOCIAL_ON = False
 SOCIAL_DB: Optional[Path] = None
 SOCIAL_SID = "qq-social"
 _locks = {}
+_bili_state = {"task": None, "stop": None}   # B站弹幕监听任务（同一时间只连一条）
 _last_seen = {}
 _nudged_at = {}           # sid -> 上次闲置提醒时间（同一轮沉默只提醒一次）
 _nudge_count = {}         # "日期:sid" -> 当天主动开口次数（按天限额，防骚扰）
@@ -458,6 +518,166 @@ def _tool_search_image(args, sid, cid, ctx=None) -> str:
             "不要再输出搜图标记，否则会再发一张。")
 
 
+# 最近解析过的视频：sid -> {"path": 缓存视频, "key": 缓存 key}，供 video_zoom 重看。
+_video_refs: dict[str, dict] = {}
+_VIDEO_ZOOM_SPAN = 60.0
+
+
+def _remember_video(sid: str, path, key: str) -> None:
+    if not sid or not path:
+        return
+    if len(_video_refs) > 64:
+        _video_refs.clear()
+    _video_refs[sid] = {"path": str(path), "key": key}
+
+
+def _clock_seconds(value) -> float:
+    """from/to 接受秒数，也接受 1:05 这种写法。"""
+    text = str(value or "").strip()
+    if ":" in text:
+        parts = text.split(":")
+        total = 0.0
+        for part in parts:
+            total = total * 60 + float(part or 0)
+        return total
+    return float(text or 0)
+
+
+def _tool_video_zoom(args, sid, cid, ctx=None) -> str:
+    """工具 video_zoom：用缓存里的视频重看一小段，补足追问的画面细节。"""
+    ref = _video_refs.get(sid)
+    path = Path(str(ref.get("path") or "")) if ref else None
+    if not path or not path.is_file():
+        return ("这段视频的画面不在缓存里（可能已过期或缓存关闭）。"
+                "让主人再发一次原链接，别凭印象编画面。")
+    try:
+        from_s = _clock_seconds((args or {}).get("from"))
+        to_s = _clock_seconds((args or {}).get("to"))
+    except (TypeError, ValueError):
+        return "时间要写秒数，例如 from=63、to=95。"
+    from_s = max(0.0, from_s)
+    if to_s <= from_s:
+        return "时间范围不对：to 要大于 from。"
+    if to_s - from_s > _VIDEO_ZOOM_SPAN:
+        to_s = from_s + _VIDEO_ZOOM_SPAN
+    try:
+        cells = int((args or {}).get("cells") or 4)
+    except (TypeError, ValueError):
+        cells = 4
+    note = zoom_note(path, from_s, to_s, cells)
+    if not note:
+        return "这一段重看失败（视频文件或分镜工具不可用），先按已有画面回答，别编。"
+    logger.info(f"[jinyu] 工具重看视频 sid={sid} {from_s:.0f}-{to_s:.0f}s")
+    return note
+
+
+def _bili_list_ok() -> bool:
+    """搜索/热门每天次数上限：防止连续翻页把 B站接口刷成风控。"""
+    day = time.strftime("%Y-%m-%d")
+    if _bili_tool_day["day"] != day:
+        _bili_tool_day.update(day=day, n=0)
+    if _bili_tool_day["n"] >= BILI_LIST_DAILY:
+        return False
+    _bili_tool_day["n"] += 1
+    return True
+
+
+def _tool_bili(args, sid, cid, ctx=None) -> str:
+    """工具 bili：去B站搜索 / 看热门 / 看一条视频（元数据 + 热评 + 画面）。"""
+    if not link_enabled():
+        return "链接抓取已关闭（RP_LINK=0），看不了B站。"
+    action = str((args or {}).get("action") or "search").strip().lower()
+    query = str((args or {}).get("query") or "").strip()
+    if action in ("popular", "hot", "热门", "热门视频"):
+        if not _bili_list_ok():
+            return "今天翻B站翻得有点多，晚点再看。"
+        text = bili_list_note(bili_popular(5), "B站当前热门")
+        return (text + "\n想看哪条就再用一次 watch（query 填方括号里的 BV 号）。"
+                if text else "没拿到热门列表（B站接口可能风控了），晚点再看。")
+    if action in ("watch", "看", "视频"):
+        if not query:
+            return "watch 需要 query：B站链接或 BV 号。"
+        if query.startswith("http"):
+            url = query
+        elif "bilibili.com" in query or "b23.tv" in query:
+            url = "https://" + query.split("://", 1)[-1]
+        else:
+            url = f"https://www.bilibili.com/video/{query}"
+        unlimited = rp_skeleton.lane_principal(sid) == "owner"
+        return bili_watch_brief(url, unlimited=unlimited)
+    if not query:
+        return "search 需要 query：想看什么关键词。"
+    if not _bili_list_ok():
+        return "今天翻B站翻得有点多，晚点再看。"
+    text = bili_list_note(bili_search(query, 5), f"B站搜索「{query}」")
+    return (text + "\n想看哪条就再用一次 watch（query 填方括号里的 BV 号）。"
+            if text else "没搜到结果（可能被 B站风控拦了），换个更具体的词再试。")
+
+
+def _tool_bili_account(args, sid, cid, ctx=None) -> str:
+    """工具 bili_account：管理瑾瑜自己的B站账号（评论 / 表情 / 头像 / 昵称）。"""
+    action = str((args or {}).get("action") or "status").strip().lower()
+    if action in ("status", "me", "who", "账号", "状态"):
+        return bili_live.status()
+    if not bili_live.can_send():
+        return "B站账号还没登录：让主人在私聊发 /bili login 扫码，再来做这个。"
+    if action in ("emotes", "emoji", "表情"):
+        texts = bili_live.emote_texts(24)
+        return ("评论区能用的B站表情（直接写进评论正文）："
+                + " ".join(texts)
+                + "\n直接用 [doge] 这类写法，不要换成 QQ 表情名。")
+    if rp_skeleton.lane_principal(sid) != "owner":
+        return "这个B站账号是主人的，只有主人本人在私聊里才能让我发评论/换头像/改昵称。"
+    if action in ("comment", "评论", "留言"):
+        blocked, why = bili_live.paused()
+        if blocked:
+            return why
+        ref = str((args or {}).get("query") or "").strip()
+        text = str((args or {}).get("text") or "").strip()
+        if not ref:
+            return "comment 需要 query：B站视频链接或 BV 号。"
+        if not text:
+            return "text 必填：你想留的评论正文（可以带 [doge] 这类B站表情）。"
+        url, bvid, _ = _bili_video_ref(ref)
+        if not url:
+            return "没认出视频地址：query 要填B站链接或 BV 号。"
+        try:
+            meta = video_meta(url)
+        except Exception:                      # noqa: BLE001 读不到 aid 就发不了
+            meta = {}
+        aid = int(meta.get("aid") or 0)
+        if not aid:
+            return "这条视频读不到 aid，评论发不了（链接可能失效或被风控）。"
+        ok, info = bili_live.post_comment(aid, text, str(meta.get("bvid") or bvid))
+        if ok:
+            return f"评论已发出：{info}"
+        return info
+    if action in ("avatar", "头像", "换头像"):
+        blocked, why = bili_live.paused()
+        if blocked:
+            return why
+        image = str((args or {}).get("image") or "").strip()
+        url = image if image.startswith("http") else (_last_media.get(sid) or "")
+        if not url:
+            return "没有可用的图片：先让主人发一张图，再说「换成这个头像」。"
+        data, why = download_image_ex(url)
+        if not data:
+            return f"图片没拿到：{why}。让主人重新发一张清晰的正方形图。"
+        ok, info = bili_live.set_avatar(data)
+        return f"头像已换：{info}" if ok else info
+    if action in ("name", "昵称", "改名"):
+        blocked, why = bili_live.paused()
+        if blocked:
+            return why
+        name = str((args or {}).get("name") or "").strip()
+        if not name:
+            return "name 必填：想改成什么昵称（最多 16 个字，B站扣 6 枚硬币）。"
+        ok, info = bili_live.set_name(name)
+        return f"昵称已改：{info}" if ok else info
+    return ("bili_account 支持：status 账号状态 / emotes 可用表情 / "
+            "comment 发评论 / avatar 换头像 / name 改昵称。")
+
+
 def _mcp_handler(mgr, tool_name: str):
     """MCP 工具的同步适配器：异常交给 _run_tool 统一降级。"""
     def handler(args, sid, cid, ctx=None) -> str:
@@ -518,6 +738,63 @@ def _install_tools(inst) -> None:
          "properties": {"target": {"type": "string",
                                    "description": "消息编号，如 M8；留空撤最后一条"}}},
         _tool_recall_message)
+    inst.register_tool(
+        "video_zoom",
+        "重看刚才那条视频里的一小段：主人追问「第 63 秒发生了什么」、"
+        "或你对某段画面/台词没把握时调用。from/to 写秒数（如 63、95，也认 1:05），"
+        "一次最多 60 秒，cells 写 2~9 格（默认 4）。只对刚发过链接、还在缓存里的视频"
+        "有效；缓存过期或这个会话没发过视频时不要调用，让主人重发原链接。",
+        {"type": "object",
+         "properties": {"from": {"type": "string",
+                                 "description": "起始位置，秒数（63）或 1:05"},
+                        "to": {"type": "string",
+                               "description": "结束位置，秒数（95）或 1:35"},
+                        "cells": {"type": "integer",
+                                  "description": "拼图格数 2~9，默认 4"}},
+         "required": ["from", "to"]},
+        _tool_video_zoom)
+    if BILI_TOOL_ON:
+        inst.register_tool(
+            "bili",
+            "去B站自己看视频：search 按关键词搜、popular 看当前热门、watch 看一条视频"
+            "（返回标题/简介/弹幕热评/抽帧画面）。主人在 QQ 里说「去B站看看」「搜一下xx」"
+            "时调用；你自己突然想看点东西、想知道B站最近流行什么时也可以主动调用。"
+            "search/popular 先给候选，挑一条再 watch；watch 要下载视频，可能要几十秒，"
+            "调用前先跟主人说一声要去看；watch 每天次数有限，返回里说没看成就是真没看成"
+            "——不要编画面或剧情。",
+            {"type": "object",
+             "properties": {"action": {"type": "string",
+                                       "enum": ["search", "popular", "watch"],
+                                       "description": "search 搜关键词；popular 看热门；watch 看一条视频"},
+                            "query": {"type": "string",
+                                      "description": "search 写关键词；watch 写B站链接或 BV 号（如 BV1xx）"}},
+             "required": ["action"]},
+            _tool_bili)
+        inst.register_tool(
+            "bili_account",
+            "管理你自己的B站账号：status 查登录/等级/硬币、emotes 看评论区可用表情、"
+            "comment 给视频发评论、avatar 换头像、name 改昵称。"
+            "发评论时正文可以带 [doge] 这类B站表情；每天最多 3 条、两条间隔 10 分钟，"
+            "别刷屏，也别在没看过的视频下硬评。只有主人明确让你改头像/昵称时才改，"
+            "改昵称 B站要扣 6 枚硬币；换头像用主人刚发的那张图（不用填 image）。"
+            "没登录、硬币不足、接口风控时工具会返回原因，如实告诉主人，不要假装成功。"
+            "写操作被风控拦下、评论发完回读不到（结果不明）、或登录身份对不上时会自动暂停，"
+            "暂停后不要重试，告诉主人发 /bili unlock 人工解除。",
+            {"type": "object",
+             "properties": {
+                 "action": {"type": "string",
+                            "enum": ["status", "emotes", "comment", "avatar", "name"],
+                            "description": "status 账号状态；emotes 可用表情；comment 发评论；avatar 换头像；name 改昵称"},
+                 "query": {"type": "string",
+                           "description": "comment 用：B站视频链接或 BV 号"},
+                 "text": {"type": "string",
+                          "description": "comment 用：评论正文，可带 [doge] 等B站表情"},
+                 "image": {"type": "string",
+                           "description": "avatar 用：图片链接；留空则用主人刚发的那张图"},
+                 "name": {"type": "string",
+                          "description": "name 用：新昵称，最多 16 个字"}},
+             "required": ["action"]},
+            _tool_bili_account)
     if mcp_mgr is None:
         return
     for spec in mcp_mgr.tool_specs():
@@ -586,6 +863,26 @@ async def _startup():
         logger.info(f"[jinyu] 提醒调度就绪 db={db_path.with_name('reminders.db')}")
     except Exception as exc:                    # noqa: BLE001  提醒坏了不能拖垮机器人
         logger.warning(f"[jinyu] 提醒库初始化失败: {exc}")
+    try:
+        owner_gate.init(str(db_path.with_name("owners.db")))
+        rp_skeleton.set_principal_scope(_principal_scope)
+        logger.info(f"[jinyu] 主人绑定库就绪 db={db_path.with_name('owners.db')}"
+                    f"｜长期记忆按主人账号合并，运行状态仍按车道隔离")
+    except Exception as exc:                    # noqa: BLE001  绑定库坏了不能拖垮机器人
+        logger.warning(f"[jinyu] 主人绑定库初始化失败: {exc}")
+    try:
+        bili_live.init(db_path.with_name("bili_auth.json"), BILI_ROOM)
+        if bili_live.ready() and BILI_ON:
+            if bili_live.can_send():
+                _bili_start()
+            else:
+                logger.info("[jinyu] B站直播已配房间但未登录，私聊发 /bili login 扫码")
+        elif bili_live.room():
+            logger.info("[jinyu] B站直播已关闭（RP_BILI_ON=0）")
+        else:
+            logger.info("[jinyu] B站直播未配置房间，私聊发 /bili room 直播间号")
+    except Exception as exc:                    # noqa: BLE001  直播坏了不能拖垮机器人
+        logger.warning(f"[jinyu] B站直播初始化失败: {exc}")
     if reminder.ready():
         asyncio.create_task(_reminder_loop())
     if IDLE_NUDGE_MIN > 0:
@@ -594,6 +891,8 @@ async def _startup():
         asyncio.create_task(_fact_merge_loop())
     if SOCIAL_AFFINITY_HOURS > 0:
         asyncio.create_task(_social_affinity_loop())
+    if DREAM_ON:
+        asyncio.create_task(_dream_loop())
     asyncio.create_task(asyncio.to_thread(sweep_tts_cache, True))   # 启动时清一次 TTS 缓存
 
 
@@ -695,6 +994,30 @@ async def _fact_merge_loop():
                             "；".join(f"{len(g['ids'])}→{g['fact'][:16]}" for g in groups[:6]))
 
 
+async def _dream_loop():
+    """每天 03:30（RP_DREAM_AT）整理一次：过期临时事实退场 + 同义重复词条合并。
+
+    只跑一次、线程里跑、失败只记日志：整理是后台保养，不能拖住对话，
+    第二天同一时刻再来。当天已整理过（dream_runs 占坑）就直接跳过。
+    """
+    while True:
+        target = dream_mod.next_run(at=DREAM_AT)
+        await asyncio.sleep(max(1.0, (target - datetime.now()).total_seconds()))
+        if mw is None:
+            continue
+        try:
+            stats = await asyncio.to_thread(
+                dream_mod.run, mw, CID, False, None, FACT_MERGE_MIN, DREAM_MAX_SESSIONS)
+        except Exception as exc:                    # noqa: BLE001  整理失败不致命
+            logger.warning(f"[jinyu] Dream 整理失败，今天可补跑: {exc}")
+            continue
+        if stats.get("skipped"):
+            logger.info(f"[jinyu] Dream 跳过：{stats['skipped']}")
+        else:
+            logger.info(f"[jinyu] Dream 完成 过期={len(stats['expired'])} "
+                        f"会话={stats['sessions']} 合并组={stats['groups']}")
+
+
 async def _vector_loop():
     """后台回填事件卡向量（bge-m3）：启动先补一批，之后每 5 分钟补新卡。
 
@@ -719,7 +1042,7 @@ async def _reminder_loop():
             await asyncio.sleep(10)
             if mw is None or not reminder.ready():
                 continue
-            for row in await asyncio.to_thread(reminder.due):
+            for row in await asyncio.to_thread(reminder.claim_due):
                 await _deliver_reminder(row)
         except Exception as exc:                    # noqa: BLE001
             logger.warning(f"[jinyu] 提醒循环异常: {exc}")
@@ -752,9 +1075,10 @@ async def _deliver_reminder(row: dict) -> None:
     uid = int(row.get("user_id") or 0)
     gid = int(row.get("group_id") or 0)
     kind = str(row.get("kind") or "task")
+    token = int(row.get("lease_token") or 0)     # 认领令牌：迟到写入会被 CAS 拒绝
     if not rid or not sid or not uid:
         if rid:
-            await asyncio.to_thread(reminder.mark_failed, rid)
+            await asyncio.to_thread(reminder.mark_failed, rid, token)
         return
     content = str(row.get("text") or "").strip()
     parent = None
@@ -762,7 +1086,7 @@ async def _deliver_reminder(row: dict) -> None:
         parent = await asyncio.to_thread(reminder.get, int(row.get("ref") or 0))
         due_ts = float((parent or {}).get("due_ts") or 0.0)
         if due_ts and float((parent or {}).get("evidence_ts") or 0.0) >= due_ts:
-            await asyncio.to_thread(reminder.mark_done, rid)
+            await asyncio.to_thread(reminder.mark_closed, rid, token)
             logger.info(f"[jinyu] 复查取消 id={rid} 任务={row.get('ref')}：前台已执行")
             return
     persona = dict(PERSONA)
@@ -812,10 +1136,13 @@ async def _deliver_reminder(row: dict) -> None:
         logger.warning(f"[jinyu] 提醒发送失败 id={rid} sid={sid}: {exc}")
         ok = False
     if not ok:
-        await asyncio.to_thread(reminder.mark_failed, rid)
+        await asyncio.to_thread(reminder.mark_failed, rid, token)
         logger.warning(f"[jinyu] 提醒投递失败 id={rid} sid={sid}")
         return
-    await asyncio.to_thread(reminder.mark_done, rid)
+    if not await asyncio.to_thread(reminder.mark_sent, rid, token):
+        logger.warning(f"[jinyu] 提醒送达确认被拒（租约已过期） id={rid} sid={sid}")
+        return
+    await asyncio.to_thread(reminder.mark_checked, rid, token)
     logger.info(f"[jinyu] 提醒已发送 id={rid} sid={sid} kind={kind} "
                 f"群={gid or '私聊'} 内容={content!r}")
     if kind != "task":
@@ -876,12 +1203,315 @@ async def _shutdown():
             logger.warning(f"[jinyu] MCP 停止失败: {exc}")
 
 
+def _base_sid(sid: str) -> str:
+    """去掉车道后缀 @b<self_id> 与 epoch 后缀 #n，得到群/私聊/社交圈基键。"""
+    s = str(sid or "")
+    at = s.find("@b")
+    if at > 0:
+        s = s[:at]
+    return s.split("#")[0]
+
+
+def _bot_lane(event) -> str:
+    """多账号车道后缀。主号返回空串（继续用老键），其余号返回 @b<self_id>。"""
+    if not MULTI_BOT:
+        return ""
+    bot = str(getattr(event, "self_id", "") or "")
+    if not bot:
+        return ""
+    if not PRIMARY_BOT:                    # 没配主号：不分裂老数据，按单号处理
+        return ""
+    return "" if bot == PRIMARY_BOT else f"@b{bot}"
+
+
 def _sid(event: MessageEvent) -> str:
     if SOCIAL_ON:                          # 社交圈：所有群+私聊共用一份记忆
-        return SOCIAL_SID
-    if isinstance(event, GroupMessageEvent):
-        return f"qq-g{event.group_id}"     # 整群共享一条上下文（2026-10-25 用户需求）
-    return f"qq-u{event.user_id}"
+        base = SOCIAL_SID
+    elif isinstance(event, GroupMessageEvent):
+        base = f"qq-g{event.group_id}"     # 整群共享一条上下文（2026-10-25 用户需求）
+    else:
+        base = f"qq-u{event.user_id}"
+    return base + _bot_lane(event)
+
+
+def _principal_scope(sid: str) -> dict:
+    """真人主体合并：已验证的主人账号，长期记忆跨账号共用；其余一律只看本车道。
+
+    只合并私聊基键，且保留当前号的车道后缀；epoch 之间仍不互相读。
+    """
+    s = str(sid or "")
+    base = rp_skeleton.lane_base(s)
+    if not base.startswith("qq-u") or not owner_gate.ready():
+        return {}
+    account = base[4:]
+    if not owner_gate.is_owner("qq", account):
+        return {}
+    at = s.find("@b")
+    suffix = s[at:].split("#")[0] if at > 0 else ""       # 同号车道后缀，如 @b222
+    peers = []
+    for platform, other in owner_gate.verified_accounts("qq"):
+        if platform != "qq" or other == account:
+            continue
+        for lane in (f"qq-u{other}", f"qq-u{other}{suffix}" if suffix else ""):
+            if lane and lane not in peers:
+                peers.append(lane)
+    return {"principal": "owner", "peers": peers}
+
+
+def _bili_start() -> None:
+    """起弹幕监听；重复调用先停旧连接，保证同一时间只有一条。"""
+    if not bili_live.ready():
+        return
+    _bili_stop()
+    stop = asyncio.Event()
+    _bili_state["stop"] = stop
+    _bili_state["task"] = asyncio.create_task(_bili_loop(stop))
+    logger.info(f"[jinyu] B站弹幕监听启动 room={bili_live.room()}")
+
+
+def _bili_stop() -> None:
+    stop = _bili_state.get("stop")
+    if stop is not None:
+        stop.set()
+    task = _bili_state.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+    _bili_state["task"] = None
+    _bili_state["stop"] = None
+
+
+async def _bili_loop(stop) -> None:
+    """断线指数退避重连；配置/登录态在每轮重连时重新读取。"""
+    backoff = 3
+    while not stop.is_set():
+        try:
+            await bili_live.listen(_bili_on_danmu, stop)
+            backoff = 3
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                        # noqa: BLE001 网络故障不能拖垮机器人
+            logger.warning(f"[jinyu] B站弹幕连接中断 {type(exc).__name__}: {exc}"
+                           f"｜{backoff}s 后重连")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(60, backoff * 2)
+
+
+async def _bili_on_danmu(item) -> None:
+    """被点名才回复：记一条对话 + 以人设口吻发一条弹幕，节流内不生成。"""
+    if mw is None:
+        return
+    text = str(item.get("text") or "")
+    who = str(item.get("uid") or "")
+    if who and who == bili_live.my_uid():
+        return                                          # 自己的弹幕：不自我回复
+    if not bili_live.mentioned(text):
+        return
+    ok, why = bili_live.may_send()
+    if not ok:
+        logger.info(f"[jinyu] B站点名但暂不回复：{why}")
+        return
+    sid = f"bili-l{bili_live.room()}"
+    line = f"{item.get('uname') or item.get('uid')}：{text}"
+    try:
+        reply = await asyncio.to_thread(mw.chat, line, PERSONA, sid, CID,
+                                        speaker=str(item.get("uname") or ""))
+    except Exception as exc:                            # noqa: BLE001 单条失败不影响监听
+        logger.exception(f"[jinyu] B站弹幕生成失败 sid={sid}: {exc}")
+        return
+    sent, info = await asyncio.to_thread(bili_live.send_danmu, reply)
+    if sent:
+        logger.info(f"[jinyu] B站已回复 用户={item.get('uname')} 内容={info!r}")
+    else:
+        logger.warning(f"[jinyu] B站回复未发出：{info}")
+
+
+async def _bili_notice(user_id: str, text: str) -> None:
+    """登录结果回执只走私聊，避免群里贴凭据相关消息。"""
+    try:
+        await get_bot().send_private_msg(user_id=int(user_id), message=text)
+    except Exception as exc:                            # noqa: BLE001 通知失败不影响登录
+        logger.warning(f"[jinyu] B站登录结果通知失败：{exc}")
+
+
+async def _bili_login_poll(user_id: str, key: str) -> None:
+    """扫码后轮询 3 分钟；成功即落登录态并起监听。"""
+    seen = False
+    for _ in range(90):
+        await asyncio.sleep(2)
+        st = await asyncio.to_thread(bili_live.login_poll, key)
+        if st["state"] == "scanned" and not seen:
+            seen = True
+            await _bili_notice(user_id, st["msg"])
+        elif st["state"] == "ok":
+            await _bili_notice(user_id, st["msg"] + "。被点名时会用这个号回弹幕。")
+            if bili_live.ready() and BILI_ON:
+                _bili_start()
+            return
+        elif st["state"] == "expired":
+            await _bili_notice(user_id, st["msg"])
+            return
+
+
+_HELP_BILI = ("用法：/bili login 扫码登录｜/bili status｜"
+              "/bili cmt 视频链接 [内容] 发评论｜/bili emotes 看可用表情｜"
+              "/bili avatar [图片] 换头像｜/bili name 新昵称｜"
+              "/bili unlock 解除写操作暂停｜"
+              "/bili room 直播间号｜/bili on|off。"
+              "被点名（默认「瑾瑜」）才回弹幕；评论每日限额且不 @ 任何人；"
+              "改昵称 B站扣 6 枚硬币。")
+
+
+def _bili_video_ref(arg: str) -> tuple[str, str, str]:
+    """把「B站链接或 BV 号 + 其余文字」拆成 (url, bvid, 评论正文)。"""
+    urls = [u for u in extract_urls(arg)
+            if "bilibili.com/video/" in u or "b23.tv" in u]
+    url = urls[0] if urls else ""
+    hit = re.search(r"(BV[0-9A-Za-z]{10})", arg, re.I)
+    bvid = hit.group(1) if hit else ""
+    if not url and bvid:
+        url = f"https://www.bilibili.com/video/{bvid}"
+    body = arg
+    if urls:
+        body = body.replace(urls[0], "", 1)
+    if hit:
+        body = body.replace(hit.group(0), "", 1)
+    return url, bvid, body.strip(" 　:：")
+
+
+async def _bili_comment_draft(meta: dict) -> str:
+    """没给正文时，按视频资料与弹幕/热评让前台自己想一句短评。"""
+    if mw is None:
+        return ""
+    digest = ""
+    try:
+        digest = await asyncio.to_thread(bili_digest, meta)
+    except Exception:                           # noqa: BLE001 抓不到就只按标题写
+        digest = ""
+    ctx = (f"标题={meta.get('title') or ''}\n作者={meta.get('author') or ''}\n"
+           f"简介={meta.get('desc') or ''}\n{digest}")
+    msgs = [
+        {"role": "system", "content": "你在给B站视频写一条观众评论：中文，不超过60字，"
+                                      "口语化，不@任何人，不写动作/标签，只输出评论正文。"},
+        {"role": "user", "content": ctx[:1500]},
+    ]
+    try:
+        draft = await asyncio.to_thread(mw.front.chat, msgs)
+    except Exception as exc:                    # noqa: BLE001 生成失败让用户自己给内容
+        logger.info(f"[jinyu] B站评论草稿生成失败: {exc}")
+        return ""
+    return bili_live.clean_comment(strip_dsml(str(draft or "")), 60)
+
+
+async def _bili_comment_cmd(arg: str, matcher) -> None:
+    """管理员发视频评论：每日限额 + 不 @ 任何人；正文可省略由模型写。"""
+    url, bvid, body = _bili_video_ref(arg)
+    if not url:
+        await matcher.send("用法：/bili cmt 视频链接 [内容]（不给内容就让瑾瑜自己想一句）")
+        return
+    ok, why = bili_live.comment_allowed()
+    if not ok:
+        await matcher.send(why)
+        return
+    try:
+        meta = await asyncio.to_thread(video_meta, url)
+    except Exception:                           # noqa: BLE001 读不到就当拿不到 aid
+        meta = {}
+    aid = int(meta.get("aid") or 0)
+    if not aid:
+        await matcher.send("这条视频读不到 aid，发不了评论。")
+        return
+    if not body:
+        body = await _bili_comment_draft(meta)
+    if not body:
+        await matcher.send("没想好写什么，给个方向吧：/bili cmt 链接 内容")
+        return
+    sent, info = await asyncio.to_thread(
+        bili_live.post_comment, aid, body, str(meta.get("bvid") or bvid))
+    if sent:
+        await matcher.send(f"已在评论区留言：{info}")
+    else:
+        await matcher.send(info)
+
+
+async def _bili_command(event, text: str, matcher) -> bool:
+    """管理员 /bili 指令；处理过返回 True。"""
+    if str(event.user_id) not in ADMIN:
+        await matcher.send("这个指令只有主人能用。")
+        return True
+    parts = text.split()
+    cmd = (parts[1] if len(parts) > 1 else "status").lower()
+    arg = " ".join(parts[2:]).strip()
+    if cmd in ("cmt", "comment", "评论"):
+        await _bili_comment_cmd(arg, matcher)
+        return True
+    if cmd in ("emotes", "emote", "表情"):
+        texts = await asyncio.to_thread(bili_live.emote_texts, 24)
+        await matcher.send("评论区可用表情（直接写进评论正文）：\n" + " ".join(texts))
+        return True
+    if cmd in ("avatar", "头像", "换头像"):
+        urls = _extract_image_urls(event)
+        url = urls[-1] if urls else (arg if arg.startswith("http") else "")
+        if not url:
+            await matcher.send("把图和数据发在同一条消息里：/bili avatar（附一张图）")
+            return True
+        data, why = await asyncio.to_thread(download_image_ex, url)
+        if not data:
+            await matcher.send(f"图片没拿到：{why}")
+            return True
+        ok, msg = await asyncio.to_thread(bili_live.set_avatar, data)
+        await matcher.send(("头像已换：" + msg) if ok else msg)
+        return True
+    if cmd in ("name", "nick", "昵称", "改名"):
+        if not arg:
+            await matcher.send("用法：/bili name 新昵称（最多16字，B站扣6硬币）")
+            return True
+        ok, msg = await asyncio.to_thread(bili_live.set_name, arg)
+        await matcher.send(("昵称已改：" + msg) if ok else msg)
+        return True
+    if cmd in ("login", "扫码"):
+        if isinstance(event, GroupMessageEvent):
+            await matcher.send("扫码登录请在私聊里发 /bili login。")
+            return True
+        qr = await asyncio.to_thread(bili_live.login_begin)
+        if qr.get("error"):
+            await matcher.send(str(qr["error"]))
+            return True
+        png = bili_live.qr_png(qr["url"])
+        if png:
+            await matcher.send(MessageSegment.image(
+                "base64://" + base64.b64encode(png).decode()))
+        else:
+            await matcher.send("用 B站 App 打开这个链接确认登录：\n" + str(qr["url"]))
+        asyncio.create_task(_bili_login_poll(str(event.user_id), str(qr["key"])))
+        return True
+    if cmd == "room":
+        ok, msg = bili_live.set_room(arg)
+        if ok and bili_live.can_send() and BILI_ON:
+            _bili_start()
+            msg += " 已开始监听。"
+        elif ok:
+            msg += " 还没登录，先 /bili login 扫码。"
+        await matcher.send(msg)
+        return True
+    if cmd in ("on", "off"):
+        bili_live.set_on(cmd == "on")
+        if cmd == "on" and bili_live.can_send():
+            _bili_start()
+        elif cmd == "off":
+            _bili_stop()
+        await matcher.send(bili_live.status())
+        return True
+    if cmd in ("unlock", "解除", "恢复"):
+        await matcher.send(bili_live.unlock())
+        return True
+    if cmd in ("status", "who"):
+        await matcher.send(bili_live.status())
+        return True
+    await matcher.send(_HELP_BILI)
+    return True
 
 
 _group_names: dict = {}      # (群号:qq) -> 群内显示名缓存（群名片优先，运行中学习）
@@ -1140,13 +1770,14 @@ async def _link_notes(text: str, event: MessageEvent) -> str:
             logger.info(f"[jinyu] 链接已注入 host={host} chars={len(note)}")
         if is_video_url(url) and frames_available():
             try:
-                extra = await asyncio.wait_for(
-                    asyncio.to_thread(video_frames_note, url,
-                                      str(event.user_id) in ADMIN), timeout=180)
+                extra, video_path, key = await asyncio.wait_for(
+                    asyncio.to_thread(video_frames_info, url,
+                                      str(event.user_id) in ADMIN), timeout=300)
             except Exception:                 # noqa: BLE001  抽帧失败不影响回复
-                extra = ""
+                extra, video_path, key = "", None, ""
             if extra:
                 notes.append(extra)
+                _remember_video(_sid(event), video_path, key)
     return "".join(notes)
 
 
@@ -1823,7 +2454,8 @@ async def _on_poke(event) -> None:
     if mw is None:
         return
     gid = getattr(event, "group_id", None)
-    sid = SOCIAL_SID if SOCIAL_ON else (f"qq-g{gid}" if gid else f"qq-u{uid}")
+    sid = (SOCIAL_SID if SOCIAL_ON else (f"qq-g{gid}" if gid else f"qq-u{uid}")) \
+        + _bot_lane(event)
     key = f"{sid}:{uid}"
     loop = asyncio.get_running_loop()
     now = loop.time()
@@ -1864,7 +2496,8 @@ async def _on_poke(event) -> None:
             reply = await asyncio.to_thread(
                 mw.chat, text, persona, session_sid, CID,
                 (lambda r: _strip_speaker_prefix(r, label))
-                if (is_group or SOCIAL_ON) else None)
+                if (is_group or SOCIAL_ON) else None,
+                speaker=label)
         except Exception as exc:                     # noqa: BLE001
             logger.exception(f"[jinyu] 戳一戳回复失败 sid={sid}: {exc}")
     if reply:
@@ -1910,13 +2543,15 @@ def _persona_report(event: MessageEvent) -> str:
 
 def _owner_label(base: str) -> str:
     """qq-u123456 -> 私聊 123456；qq-g789 -> 群 789；qq-social -> 社交圈（全局）。"""
-    b = str(base or "")
+    b = _base_sid(base)
     if b == SOCIAL_SID:
         return "社交圈（全局）"
     if b.startswith("qq-g"):
         return f"群 {b[4:]}"
     if b.startswith("qq-u"):
         return f"私聊 {b[4:]}"
+    if b.startswith("bili-l"):
+        return f"B站直播间 {b[6:]}"
     return b or "未知会话"
 
 
@@ -2697,6 +3332,19 @@ async def _handle(event: MessageEvent):
             _media_futs.pop(str(event.message_id), None)
             await matcher.finish(reply)
             return
+    if text.startswith("/") and owner_gate.ready():
+        reply = await asyncio.to_thread(
+            owner_gate.handle_command, text, "qq", str(event.user_id),
+            is_group, str(event.user_id) in ADMIN)
+        if reply is not None:                     # None = 不是 /owner
+            _media_futs.pop(str(event.message_id), None)
+            await matcher.finish(reply)
+            return
+    if text.startswith("/bili"):
+        if await _bili_command(event, text, matcher):
+            _media_futs.pop(str(event.message_id), None)
+            await matcher.finish()
+            return
     if await _admin(event, text):
         _media_futs.pop(str(event.message_id), None)
         return
@@ -2708,6 +3356,9 @@ async def _handle(event: MessageEvent):
         _media_futs.pop(str(event.message_id), None)    # 丢弃的消息不能把视觉任务挂在全局表里
         return
     _last_seen[cd_key] = now
+    # 同 lane 新消息取消旧生成：旧答还没发出去就让位；已经发过的一条不动
+    run = task_supervisor.begin(sid)
+    await task_supervisor.preempt(sid)
 
     # P1：提醒交给模型自己判断（调 set_reminder），正则只在没有工具能力时兜底。
     # 旧行为是正则先拦：命中就替模型登记并直接回复，模型根本没看到这句话，
@@ -2808,7 +3459,7 @@ async def _handle(event: MessageEvent):
             reply = await asyncio.to_thread(
                 mw.chat, text, persona, session_sid, CID,
                 (lambda r: _strip_speaker_prefix(r, speaker)) if speaker else None,
-                tool_ctx)
+                tool_ctx, speaker=speaker)
             logger.info(f"[jinyu] 前台生成 sid={session_sid} "
                         f"群={getattr(event, 'group_id', None) or '私聊'} "
                         f"用户={event.user_id} "
@@ -2816,8 +3467,15 @@ async def _handle(event: MessageEvent):
         except Exception as exc:                    # 生成失败不能让事件循环崩
             logger.exception(f"[jinyu] 生成失败 sid={sid}: {exc}")
             await matcher.finish("……主人，瑾瑜刚刚走神了，再说一遍好不好。")
+    if run is not None and run.cancelled_before_send():
+        # 协作取消：生成期间被新消息顶掉、且一条都没发出 → 这一轮整轮作废，
+        # 宁可少说一句也不让旧答盖住新问（记忆已落库，不算丢事）。
+        logger.info(f"[jinyu] 旧生成已被新消息取代，丢弃本轮 sid={sid} "
+                    f"run={run.snapshot()}")
+        return
     recall = str(tool_ctx.get("recall") or "")
     if recall:                          # 前台挑好了编号，后台在发这条回复前撤回
+        task_supervisor.mark_sent(sid)      # 撤消息是不可逆动作，之后不再允许取消
         await _recall_label(sid, recall)
     if _is_silent(reply):
         # 这一轮真的一句话都不发；本轮已由中间件写进记忆，所以「知道发生过什么」
@@ -2826,12 +3484,14 @@ async def _handle(event: MessageEvent):
                     f"用户={event.user_id} 连续={_silent_count[sid]} 问={text[:40]!r}")
         if _silent_count[sid] > MAX_SILENT:       # 硬兜底：说了必须开口还是沉默，就发一句
             _silent_count[sid] = 0
+            task_supervisor.mark_sent(sid)
             await _send_rich("……嗯。", sid)
         return
     _silent_count[sid] = 0
     reply, posts = _take_social(reply)          # 签名/说说标记不发给用户，后台静默执行
     for kind, body in posts:
         asyncio.create_task(_run_social(kind, body, event))
+    task_supervisor.mark_sent(sid)              # 从第一条气泡开始就是不可回滚边界
     await _send_rich(reply, sid)
     image = str(tool_ctx.get("image") or "")
     # 工具已经搜好图，文字说完再附图；模型若又写了 search/img 标记就让标记那条发，

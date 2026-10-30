@@ -43,14 +43,28 @@ PROMPT = """你是角色扮演记忆整理员。只输出一个 JSON 对象，�
    不要写"我/他/她"。同 subject+slot 出现不同取值时只留较晚的一条。
 9. durable_facts：值得长期记住的稳定事实，0-3 条，每条是一个对象：
    {"fact":"≤30 字的陈述句","tags":["2-4 个检索标签"],
-    "category":"设定|事件|临时","importance":0~1,"ttl_hours":数字或 null}
+    "category":"设定|事件|临时","importance":0~1,"ttl_hours":数字或 null,
+    "emotion":0~1,"authority":0~1}
    - 设定：宠物/重要物品的名字与归属、主人的稳定偏好与设定、明确说「记住」的内容；
      importance ≥0.8，ttl_hours 填 null（永久有效）
    - 事件：三天后仍值得记得的经历；importance 0.4~0.7，ttl_hours 填 null
    - 临时：只在当下成立的临时状态（反复发送失败、正在忙之类）；
      importance ≤0.3，ttl_hours 填预计有效小时数（1~48）
    - tags 写以后会用来找它的名词（如 ["猫","团子","宠物"]），不要写情绪词
+   - emotion：这条事实承载的情感强度。平常告知 0.3；明确的高兴 / 难过 / 生气 /
+     害怕 / 珍视 0.8~1.0；拿不准填 0.5。
+   - authority：这条事实的来源权威。主人明确说出的设定 / 偏好 / 承诺 0.9~1.0；
+     角色自己的观察或推测 0.4~0.6；普通对话里的事实 0.7；拿不准填 0.7。
    不算：情绪、一次性的口气、本次对话才出现的临时指代。
+10. subject：这张卡是「关于谁」的，只能取 "主人"、"角色"，或 entity_hooks 里的一个原词；
+    判断不出就填空字符串。subject 不是「谁在说话」，不要把动作主语填进来。
+11. durable_facts 每条再加 "speaker"：这条事实是谁提供/经历的，同样只能取
+    "主人"、"角色" 或 entity_hooks 里的一个原词；不确定填空字符串。
+12. durable_facts 和 claims 只写「世界里发生了什么」，不写「谁知道 / 谁不知道」的系统状态。
+    角色自己「不知道、没记住、翻不出来、记忆里没有、没听说过某个词」是这次检索的结果，
+    不是世界事实；写进长期记忆会让下一轮把「查不到」当成已确认的结论。这类内容
+    一律不写进 durable_facts 或 claims。「知情」槽位只写对话里明确建立的知道 / 保密关系，
+    拿不准对方是否知情就留空，不要用「不知道」占位。
 
 输出格式：
 {"summary":"一句话：谁因为什么做了什么",
@@ -58,9 +72,10 @@ PROMPT = """你是角色扮演记忆整理员。只输出一个 JSON 对象，�
                   "pending_promises":["..."],"resolved_promises":["P-003"],
                   "claims":[{"subject":"旧伞","slot":"归属","value":"主人"}]},
  "durable_facts":[{"fact":"主人养了一只猫，叫团子","tags":["猫","团子","宠物"],
-                   "category":"设定","importance":0.9,"ttl_hours":null}],
+                   "category":"设定","importance":0.9,"ttl_hours":null,
+                   "emotion":0.8,"authority":0.9,"speaker":"主人"}],
  "entity_hooks":["..."],"rel_hooks":["..."],"knowledge_boundary":"both",
- "importance":0.5,"precision":"normal","confidence":0.8}
+ "subject":"主人","importance":0.5,"precision":"normal","confidence":0.8}
 
 {open_promises}
 对话片段：
@@ -79,13 +94,15 @@ REPAIR = "上一条回复不是合法的事件卡 JSON，问题：{err}。请只
 
 # 社交圈模式：多人共用一份记忆时，事实必须标清属于谁，否则「喜欢猫」会串人
 SOCIAL_RULE = """
-10. 这是多人社交圈：每条用户消息带「[群号]/[私聊] 昵称(QQ)：」前缀。durable_facts 每条
+13. 这是多人社交圈：每条用户消息带「[群号]/[私聊] 昵称(QQ)：」前缀。durable_facts 每条
     必须加 "about" 字段，填冒号前的说话人标签原词（形如「小明(12345)」，含括号里的 QQ，
     不要带群号或「私聊」）；与具体的人无关的公共事实填 ""。不要把两个人的事实合成一条。
 """
 
 BOUNDARIES = ("self", "player", "both")
 PRECISIONS = ("strict", "normal")
+# 主体档位：卡/事实「关于谁」。这两个是固定世界视角，其余只能来自 entity_hooks。
+SUBJECT_ROLES = ("主人", "角色")
 
 # 封闭 claims 词表：槽位由代码定死，subject 必须来自 entity_hooks。
 # 好处是同一事实在两次摘要里必然落在同一个 key 上，矛盾才可能被确定性检出。
@@ -100,6 +117,14 @@ _LEAD_OBJ = re.compile(r"^(那|这|该|一)?(把|个|只|件|位|张|间|条)?")
 
 WORD = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]")          # 至少一个实义字符，排除「。。。」「???」
 CTRL = re.compile(r"[\u0000-\u001f\u202a-\u202e\u2066-\u2069]")   # ChatGPT Q1：控制符/bidi
+
+# 防污染：这些词都是「这次没翻到」的检索状态，不是世界里发生的事。
+# 线上出现过「瑾瑜的记忆里没有『鲸八股』这个词」落进 durable_facts（#361），
+# 下一轮就把它当成已确认结论。检索词类不看主语，一律丢；普通否定只在角色自己身上丢
+# （「主人还不知道真相」可以是剧情事实，不能一刀切）。
+SELF_MISS = re.compile(r"(记忆(里|中)?(没有|没|不存在)|脑子里没有|翻不出来|没翻到|查不到|"
+                       r"想不起来|没记住|没印象|没听说过)")
+SELF_UNKNOWN = re.compile(r"(不知道|不记得)")
 
 PROMISE_HINT = ("当前未兑现承诺（本批若兑现其中某条，resolved_promises 只填它的 ID；"
                 "都不涉及则填空数组）：\n")
@@ -152,6 +177,16 @@ def _terms(values, limit):
     return out[:limit]
 
 
+def _subject(raw, hooks):
+    """主体归一：只接受两个固定世界视角或本卡已有的钩子，其余一律空。
+
+    不猜、不模糊匹配：写不出可核验的主体就当没有，避免把「他」这类代词落库后
+    在跨会话里被误当成某个具体的人。
+    """
+    s = _LEAD_OBJ.sub("", CTRL.sub("", str(raw or "")).strip()).strip("的")[:6]
+    return s if (s in SUBJECT_ROLES or s in hooks) else ""
+
+
 def validate(data):
     """返回 (fields, None) 或 (None, 错误原因)。错误原因会回喂模型做自修复。"""
     if not isinstance(data, dict):
@@ -181,6 +216,7 @@ def validate(data):
             return None, f"{key}_not_list"
     # claims：跨会话矛盾消解的唯一确定性依据。槽位走封闭词表，subject 必须与
     # entity_hooks 同名，否则丢弃该条（不整卡判失败，避免一条噪声卡住整批）。
+    card_subject = _subject(data.get("subject"), hooks)
     claims = sc.get("claims")
     if claims is not None and not isinstance(claims, list):
         return None, "claims_not_list"
@@ -204,11 +240,15 @@ def validate(data):
     facts = data.get("durable_facts")
     if facts is not None and not isinstance(facts, list):
         return None, "durable_facts_not_list"
-    clean_facts = []
+    clean_facts, blank = [], []
     for f in facts or []:
         item = f if isinstance(f, dict) else {"fact": f}
         t = CTRL.sub("", str(item.get("fact") or "")).strip()[:40]
         if not (2 <= len(t) <= 40 and WORD.search(t)):
+            continue
+        spk = _subject(item.get("speaker"), hooks)
+        if SELF_MISS.search(t) or (SELF_UNKNOWN.search(t) and "角色" in (spk, card_subject)):
+            blank.append(t)            # 检索状态不是世界事实：丢弃，并记账供下面清 claims
             continue
         about = CTRL.sub("", str(item.get("about") or "")).strip()[:32]
         if any(t == x["fact"] and about == x["about"] for x in clean_facts):
@@ -227,12 +267,25 @@ def validate(data):
         clean_facts.append({
             "fact": t,
             "about": about,
+            "speaker": spk,
             "tags": tags[:4],
             "category": cat if cat in ("设定", "事件", "临时") else "",
             "importance": _clamp(item.get("importance", 0.5)),
+            # 四因子里的 E / A：模型没写或写坏时退回默认值（中等情感、归档摘要权威），
+            # 与老行默认值一致，不会因为这一批模型偷懒就打乱原有排序。
+            "emotion": _clamp(item.get("emotion", 0.5)),
+            "authority": _clamp(item.get("authority", 0.7), default=0.7),
             "ttl_hours": round(max(0.0, min(72.0, hours)), 2) or None})
-    if clean_facts:
-        data["durable_facts"] = clean_facts[:3]
+    # 过滤后为空也要覆写：留着原列表等于让被丢弃的事实从 out 里原样漏出去。
+    data["durable_facts"] = clean_facts[:3]
+    # 同一条对话常常同时写着「记忆里没有X」和 claim「X·知情=不知道」：
+    # 前者已判为检索状态，后者同样是这次没翻到的产物，一起清掉（#361 / E-e9deb63a）。
+    if blank and sc.get("claims"):
+        sc["claims"] = [cl for cl in sc["claims"]
+                        if not (cl["slot"] == "知情" and cl["value"] == "不知道"
+                                and any(cl["subject"] in b for b in blank))]
+        if not sc["claims"]:
+            sc.pop("claims", None)
     # ChatGPT Q1：所有会进账本/前台的字符串先清控制符并截断
     for key in ("pending_promises", "resolved_promises"):
         if isinstance(sc.get(key), list):
@@ -245,6 +298,7 @@ def validate(data):
         "entity_hooks": hooks,
         "rel_hooks": rel,
         "knowledge_boundary": boundary,
+        "subject": card_subject,
         "importance": _clamp(data.get("importance", 0.5)),
         "precision": precision if precision in PRECISIONS else "normal",
         "confidence": _clamp(data.get("confidence", 0.8), default=0.8),
