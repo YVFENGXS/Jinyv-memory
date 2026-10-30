@@ -3288,6 +3288,29 @@ def test_bili_owner_mention():
     print("R75 B站只放行@主人: OK 主人@保留 / 他人@剥除 / 尾空格 / 标题不挂@")
 
 
+def test_budget_line():
+    """R76：上下文水位行 / 余额行 / 低余额提醒 / 余额解析。"""
+    from llm import parse_balance
+    from rp_skeleton import budget_line
+    assert budget_line(24000, 64000) == "上下文：已用 38%（24k/64k tokens，剩 40k）"
+    low = budget_line(24000, 64000, {"total": 8.2, "currency": "CNY"}, 10)
+    assert "模型账户余额：¥8.20" in low and "喂白米饭" in low
+    ok = budget_line(1000, 64000, {"total": 50, "currency": "CNY"}, 10)
+    assert "喂白米饭" not in ok and "¥50.00" in ok
+    assert parse_balance({"is_available": True,
+                          "balance_infos": [{"currency": "CNY",
+                                             "total_balance": "12.34"}]})["total"] == 12.34
+    assert parse_balance({})["total"] == 0.0          # 接口抽风：按 0 处理，不崩
+
+    class _Fake:                                       # 只借方法，不建整条中间件
+        budget, profile = 64000, "cl100k"
+    _Fake._annotate_budget = RPContextMiddleware._annotate_budget
+    out = [{"role": "system", "content": "【当前状态账本】\n时间：…"}]
+    _Fake()._annotate_budget(out)
+    assert "上下文：已用" in out[0]["content"], out[0]["content"]
+    print("R76 上下文水位/余额提醒: OK 百分比 / 余额行 / 阈值提醒 / 解析兜底 / 写进账本")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -3339,7 +3362,7 @@ if __name__ == "__main__":
                test_graph_one_hop, test_assoc_cache_cue_card,
                test_evidence_chain_trace, test_bili_watch_tool_helpers,
                test_bili_account_helpers, test_bili_write_guard, test_bili_note_comment,
-               test_bili_owner_mention,
+               test_bili_owner_mention, test_budget_line,
                test_chat_stores_reply_when_context_build_fails):
         fn()
     print("\nall regression tests passed")
