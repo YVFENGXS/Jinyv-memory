@@ -13,7 +13,7 @@
 - 时间感知：账本锚注入「当前时间/星期」，间隔 30 分钟～2 小时写「已过多久」，超过 2 小时直接写出上次发言的日期时间与差值（跨天会点明），热窗消息带日期与星期
 - 显著性排序：被反复记录（`mentions`）或被确认（`verified`）的事件卡在同分时优先
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
-- 90 项回归测试，不依赖任何 API key
+- 91 项回归测试，不依赖任何 API key
 
 ---
 
@@ -36,7 +36,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ
-├── tests/test_regression.py # 90 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
+├── tests/test_regression.py # 91 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── monitor.py           # 本地观测云服务器（SSH）
@@ -82,7 +82,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒等 90 项场景（服务器实测 16 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒等 91 项场景（服务器实测 16 秒）。
 
 ## 评测结果（可复现）
 
@@ -151,7 +151,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 90 项回归
+python tests/test_regression.py                        # 91 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融

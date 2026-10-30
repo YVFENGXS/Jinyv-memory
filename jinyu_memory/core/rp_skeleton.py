@@ -3030,9 +3030,9 @@ class RPContextMiddleware:
         except Exception:                          # noqa: BLE001 余额查不到不影响对话
             bal = None
         try:
-            alert = float(os.environ.get("RP_BALANCE_ALERT") or 5)
+            alert = float(os.environ.get("RP_BALANCE_ALERT") or 1)
         except (TypeError, ValueError):
-            alert = 5.0
+            alert = 1.0
         line = budget_line(used, self.budget, bal, alert)
         for m in out[:2]:
             if "【当前状态账本】" in str(m.get("content") or ""):
