@@ -639,6 +639,11 @@ def _mime_of(data: bytes) -> str:
     return "image/png"
 
 
+STICKER_TEXT_LIMIT = 60         # 表情包上的字：点睛的一两句，60 字足够
+# 截图/文档/聊天记录：整段要读。默认 4000 字，可用 RP_IMG_TEXT_LIMIT 调大；
+# 视觉提示词里的抄录上限也用它，避免「模型抄全了、代码又截掉」。
+IMAGE_TEXT_LIMIT = max(400, _env_int("RP_IMG_TEXT_LIMIT", 4000))
+
 _VISION_PROMPT = """这是QQ聊天里收到的一张图。仔细看，只输出一个 JSON 对象，不要任何解释：
 {"kind":"表情包","character":"图中主要角色的名字","desc":"30字内写清画面：谁/什么、在做什么、什么表情","text":"图里可见的文字，逐字原样抄下来，没有就空字符串","tags":["3到6个中文短标签"],"suitable":true}
 kind 也可以是 "图片"：照片、截图、聊天记录等需要认真回应的实拍内容，此时 tags 给 []。
@@ -657,12 +662,11 @@ kind 也可以是 "图片"：照片、截图、聊天记录等需要认真回应
 4. suitable 仅对表情包有意义：图中文字含辱骂、人身攻击、性暗示、脏话，或者画面模糊、
    属于一次性截图/私人隐私的，填 false；
 5. tags 写情绪或使用场景（开心/无语/生气/撒娇/震惊/嫌弃 等），不要写「表情包」。"""
+_VISION_PROMPT = _VISION_PROMPT.replace("1500", str(IMAGE_TEXT_LIMIT))
 
 
 VISION_MAX_SIDE = 1280          # 视觉模型不需要原图分辨率，缩到这个长边足够看清文字
 VISION_JPEG_QUALITY = 85
-STICKER_TEXT_LIMIT = 60         # 表情包上的字：点睛的一两句，60 字足够
-IMAGE_TEXT_LIMIT = 1500         # 截图/文档/聊天记录：整段要读，与视觉提示词的字数上限对齐
 _VISION_RAW_LIMIT = 1_200_000   # 小于这个且非动图就原样送 PNG/JPEG，保留文字清晰度
 
 

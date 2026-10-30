@@ -40,6 +40,27 @@ from demo import MockBack, MockFront, PERSONA
 
 SID, CID = "eval", "shenqingwu"
 
+_BACK = None
+
+
+def mk_back():
+    """默认 MockBack，保证同一批用例离线可复现；RP_EVAL_BACK=real 才用真后台。
+
+    真后台用于测量「查询分解 / 概念改写 / 后台联想」这些依赖模型的功能；
+    没有 RP_BACK_KEY 时自动退回 MockBack，不会把评测跑挂。
+    """
+    global _BACK
+    if _BACK is None:
+        key = os.environ.get("RP_BACK_KEY") or ""
+        real = (os.environ.get("RP_EVAL_BACK") or "").lower() in ("real", "1", "true")
+        if real and key:
+            from llm import LLM
+            _BACK = LLM(key, os.environ.get("RP_BACK_MODEL") or "deepseek-flash",
+                        os.environ.get("RP_BACK_BASE") or None)
+        else:
+            _BACK = MockBack()
+    return _BACK
+
 
 def wilson(k, n, z=1.96):
     """比例指标的 95% 置信区间（Wilson）。n 小时必须给区间，别只报点估计。"""
@@ -537,7 +558,7 @@ def baseline_probe(budget=BASELINE_BUDGET):
         tmp = Path(tempfile.mkdtemp(prefix=f"jinyu-base-{label}-")) / "b.db"
         db = DB(str(tmp))
         seed(db, SCALE_CARDS, "eval-base")
-        mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+        mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                                  max_tokens=budget, output_reserve=0, keep_recent=4)
         saved_mode, saved_wm = rp.INJECT_MODE, rp.WATERMARK_ON
         rp.INJECT_MODE, rp.WATERMARK_ON = mode, cut
@@ -589,7 +610,7 @@ def matrix_probe(budget=BASELINE_BUDGET):
         tmp = Path(tempfile.mkdtemp(prefix=f"jinyu-mx-guard-{where}-")) / "g.db"
         db = DB(str(tmp))
         seed(db, cards, "mx-guard")
-        mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+        mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                                  max_tokens=64000, keep_recent=4)
         for flag in (False, True):
             retriever.ALLOW_PLAYER_BOUNDARY = flag
@@ -605,7 +626,7 @@ def matrix_probe(budget=BASELINE_BUDGET):
     tmp = Path(tempfile.mkdtemp(prefix="jinyu-mx-strict-")) / "s.db"
     db = DB(str(tmp))
     seed(db, CARDS, SID)
-    mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+    mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                              max_tokens=64000, keep_recent=4)
     q = "你答应过我的事还记得吗"
     res = {}
@@ -629,7 +650,7 @@ def matrix_probe(budget=BASELINE_BUDGET):
     try:
         for flag in (True, False):
             rp.WATERMARK_ON = flag
-            mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+            mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                                      max_tokens=budget, output_reserve=0, keep_recent=4)
             hit = tok = 0
             for q, _gt, snippet, _l in SCALE_CASES:
@@ -669,19 +690,37 @@ def strip_card(msgs, summary):
     return out if dropped else None
 
 
-def load_questions(path):
+def load_questions(path, db_path="", sid="", context_turns=0):
     """真实语料问句：每行一条 JSON {"q":..., "gt":event_id, "snippet":..., "layer":...}。
 
     gt/snippet 必须人工标注（写问句时不能先看召回结果，否则就是自己考自己）。
+    context_turns > 0 时，用提问前 N 条用户消息拼成检索输入，模拟线上热窗；
+    问句行需要带 "turn"（该消息的 turn_idx）；没有 turn 的行保持原样。
     """
     rows = []
+    con = None
+    if context_turns > 0 and db_path:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         d = json.loads(line)
-        rows.append((str(d["q"]), str(d.get("gt") or ""),
+        q = str(d["q"])
+        if con is not None and d.get("turn") is not None:
+            hist = con.execute(
+                "select content from turns where session_id=? and role='user' "
+                "and turn_idx < ? order by turn_idx desc limit ?",
+                (str(d.get("sid") or sid), int(d["turn"]), int(context_turns))).fetchall()
+            hist = [re.sub(r"\s+", " ", re.sub(r"\[CQ:[^\]]+\]", "", str(r[0]))).strip()
+                    for r in hist][::-1]
+            hist = [h for h in hist if h and len(h) <= 120]
+            if hist:
+                q = " / ".join(hist + [q])
+        rows.append((q, str(d.get("gt") or ""),
                      str(d.get("snippet") or ""), str(d.get("layer") or "holdout")))
+    if con is not None:
+        con.close()
     return rows
 
 
@@ -732,7 +771,7 @@ def real_ablate(db, sid, cid, upto, cases, budget=BASELINE_BUDGET):
         saved = (rp.INJECT_MODE, rp.WATERMARK_ON)
         rp.INJECT_MODE, rp.WATERMARK_ON = mode, cut
         try:
-            mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+            mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                                      max_tokens=budget, output_reserve=0, keep_recent=4)
             hit, tok = measure(mw)
         finally:
@@ -745,7 +784,7 @@ def real_ablate(db, sid, cid, upto, cases, budget=BASELINE_BUDGET):
     # 2) 水位线扫描：200 张真实卡在哪一档预算开始被裁、裁掉多少命中
     sweep = []
     for b in (1000, 2000, 4000, 8000, 26000):
-        mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+        mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                                  max_tokens=b, output_reserve=0, keep_recent=4)
         hit, tok = measure(mw)
         sweep.append({"budget": b, "avg_tokens": int(tok / n),
@@ -767,7 +806,7 @@ def real_ablate(db, sid, cid, upto, cases, budget=BASELINE_BUDGET):
     guard["potential_exposure_turns"] = exposed
     guard["potential_rate"] = round(exposed / max(1, upto), 3)
     # 实跑一遍：闸门开/关各构造一次末轮 prompt，确认注入段里有没有私有卡
-    mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+    mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                              max_tokens=64000, keep_recent=4)
     real_hit = {}
     for flag in (False, True):
@@ -841,7 +880,7 @@ def real_ablate(db, sid, cid, upto, cases, budget=BASELINE_BUDGET):
 
 
 def run(real=False, out=None, corpus="small", ablate=False,
-        cards_db="", questions="", sid="", cid=""):
+        cards_db="", questions="", sid="", cid="", context_turns=0):
     cid = cid or CID
     external = bool(cards_db)
     scale = corpus == "scale"
@@ -851,7 +890,7 @@ def run(real=False, out=None, corpus="small", ablate=False,
             raise SystemExit("--cards-db 需要同时给 --questions（人工标注问句 JSONL）")
         corpus = "db"
         cards = []
-        cases = load_questions(questions)
+        cases = load_questions(questions, cards_db, sid, context_turns)
         sid = sid or "eval"
         tmp = Path(tempfile.mkdtemp(prefix="jinyu-ext-")) / "ext.db"
         copy_db(cards_db, str(tmp))            # 只读副本：绝不写回线上库
@@ -874,7 +913,7 @@ def run(real=False, out=None, corpus="small", ablate=False,
         db = DB(str(tmp))
         seed(db, cards, sid)
 
-    mw = RPContextMiddleware(MockFront("eval"), MockBack(), db,
+    mw = RPContextMiddleware(MockFront("eval"), mk_back(), db,
                              max_tokens=64000, keep_recent=4)
 
     use_vec = bool(embedding.enabled())
@@ -1122,6 +1161,9 @@ def run(real=False, out=None, corpus="small", ablate=False,
 
 
 def main():
+    # 阶段 2/3：披露层消融入口。默认关（线上行为），设 RP_DISC_ON=1 才开。
+    if (os.environ.get("RP_DISC_ON") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        rp.disclosure.DISCLOSURE_ENABLED = True
     ap = argparse.ArgumentParser()
     ap.add_argument("--real", action="store_true", help="调用前台模型量回答准确率")
     ap.add_argument("--out", default="", help="指标 JSON 输出路径")
@@ -1139,10 +1181,12 @@ def main():
                     help="真实语料问句 JSONL：{q,gt,snippet,layer}")
     ap.add_argument("--sid", default="", help="真实语料：只评这一个 session")
     ap.add_argument("--cid", default="", help="真实语料：角色 id")
+    ap.add_argument("--context-turns", type=int, default=0,
+                    help="真实语料：问句前拼 N 条用户消息（模拟线上热窗；问句行需带 turn）")
     args = ap.parse_args()
     result = run(real=args.real, out=args.out, corpus=args.corpus, ablate=args.ablate,
                  cards_db=args.cards_db, questions=args.questions,
-                 sid=args.sid, cid=args.cid)
+                 sid=args.sid, cid=args.cid, context_turns=args.context_turns)
     hold = result["layers"].get("holdout") or {}
     holdout = hold.get("recall@4_used") or 0.0
     bad = []

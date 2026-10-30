@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import calendar
 import json
+import os
 import re
+import socket
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -25,6 +28,20 @@ MIN_DELAY = 10
 MAX_DELAY = 7 * 86400
 MAX_TEXT = 120
 MAX_ATTEMPTS = 3
+
+# 五态：scheduled → claimed → sent → checked → closed
+# 崩溃恢复靠租约：claimed 超过 LEASE_SECONDS 未收口，允许别的进程重抢；
+# attempts 在抢锁时 +1，抢满 MAX_ATTEMPTS 后由 sweep 直接收口，杜绝无限重试。
+STATUS_SCHEDULED = "scheduled"
+STATUS_CLAIMED = "claimed"
+STATUS_SENT = "sent"
+STATUS_CHECKED = "checked"
+STATUS_CLOSED = "closed"
+LEASE_SECONDS = 900
+STALE_SENT_SECONDS = 6 * 3600
+RETRY_BACKOFF = 30
+_ACTIVE = (STATUS_SCHEDULED, STATUS_CLAIMED, STATUS_SENT, STATUS_CHECKED)
+_CLAIMANT = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
 
 _CLEAN = re.compile(r"[\u0000-\u001f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
 _UNIT = {"秒": 1, "分钟": 60, "分": 60, "小时": 3600, "钟头": 3600, "天": 86400}
@@ -64,12 +81,21 @@ _conn: Optional[sqlite3.Connection] = None
 _lock = threading.Lock()
 
 # 老库补列：kind（task 正常提醒 / check 后台复查）、ref（复查指向的任务）、
-# repeat（重复规则 JSON）、evidence_ts（前台确实执行过的时间）
+# repeat（重复规则 JSON）、evidence_ts（前台确实执行过的时间）、
+# 以及 P0-2 的五态与租约字段（status / claim_ts / claim_by / lease_until /
+# lease_token / sent_ts / checked_ts）
 _EXTRA_COLUMNS = {
     "kind": "TEXT NOT NULL DEFAULT 'task'",
     "ref": "INTEGER NOT NULL DEFAULT 0",
     "repeat": "TEXT NOT NULL DEFAULT ''",
     "evidence_ts": "REAL NOT NULL DEFAULT 0",
+    "status": "TEXT NOT NULL DEFAULT 'scheduled'",
+    "claim_ts": "REAL NOT NULL DEFAULT 0",
+    "claim_by": "TEXT NOT NULL DEFAULT ''",
+    "lease_until": "REAL NOT NULL DEFAULT 0",
+    "lease_token": "INTEGER NOT NULL DEFAULT 0",
+    "sent_ts": "REAL NOT NULL DEFAULT 0",
+    "checked_ts": "REAL NOT NULL DEFAULT 0",
 }
 
 
@@ -78,6 +104,9 @@ def _migrate(con: sqlite3.Connection) -> None:
     for name, ddl in _EXTRA_COLUMNS.items():
         if name not in have:
             con.execute(f"ALTER TABLE reminders ADD COLUMN {name} {ddl}")
+    # 老库按 done 回填终态：done=1 已投递、done=2 已放弃，一律归 closed
+    con.execute("UPDATE reminders SET status='closed'"
+                " WHERE status='scheduled' AND done != 0")
 
 
 def init(path: str) -> None:
@@ -88,9 +117,10 @@ def init(path: str) -> None:
     with _lock:
         if _conn is not None:
             _conn.close()
-        con = sqlite3.connect(str(p), check_same_thread=False)
+        con = sqlite3.connect(str(p), timeout=10.0, check_same_thread=False)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=10000")
         con.execute("""CREATE TABLE IF NOT EXISTS reminders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sid TEXT NOT NULL,
@@ -104,6 +134,8 @@ def init(path: str) -> None:
         _migrate(con)
         con.execute("CREATE INDEX IF NOT EXISTS idx_reminders_due "
                     "ON reminders(done, due_ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_reminders_lease "
+                    "ON reminders(status, lease_until)")
         con.commit()
         con.execute("DELETE FROM reminders WHERE done != 0 AND due_ts < ?",
                     (time.time() - 7 * 86400,))
@@ -471,11 +503,89 @@ def cancel(user_id: int, arg: str) -> str:
 
 
 def due(now: Optional[float] = None, limit: int = 10) -> list[dict]:
+    """兼容读：只看还没被认领的到期任务；投递请走 claim_due。"""
     with _lock:
         rows = _db().execute(
-            "SELECT * FROM reminders WHERE done = 0 AND due_ts <= ? "
-            "ORDER BY due_ts LIMIT ?", (now or time.time(), limit)).fetchall()
+            "SELECT * FROM reminders WHERE done = 0 AND due_ts <= ?"
+            " AND status = 'scheduled' ORDER BY due_ts LIMIT ?",
+            (now or time.time(), limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+def _sweep(con: sqlite3.Connection, now: float) -> list[dict]:
+    """恢复悬挂态：sent 久未收口视为已完成；重试额度用完的直接收口。"""
+    recovered = []
+    rows = con.execute(
+        "SELECT * FROM reminders WHERE done = 0 AND status = 'sent'"
+        " AND sent_ts <= ?", (now - STALE_SENT_SECONDS,)).fetchall()
+    for r in rows:
+        cur = con.execute(
+            "UPDATE reminders SET status = 'closed', done = 1, checked_ts = ?"
+            " WHERE id = ? AND status = 'sent' AND done = 0", (now, r["id"]))
+        if cur.rowcount and str(r["kind"]) == "task":
+            recovered.append(dict(r))
+    rows = con.execute(
+        "SELECT * FROM reminders WHERE done = 0 AND attempts >= ?"
+        " AND (status = 'scheduled' OR (status = 'claimed' AND lease_until <= ?))",
+        (MAX_ATTEMPTS, now)).fetchall()
+    for r in rows:
+        cur = con.execute(
+            "UPDATE reminders SET status = 'closed', done = 2, checked_ts = ?"
+            " WHERE id = ? AND done = 0 AND attempts >= ?"
+            " AND (status = 'scheduled' OR (status = 'claimed' AND lease_until <= ?))",
+            (now, r["id"], MAX_ATTEMPTS, now))
+        if cur.rowcount and str(r["kind"]) == "task":
+            recovered.append(dict(r))
+    return recovered
+
+
+def claim_due(now: Optional[float] = None, limit: int = 10,
+              claimant: Optional[str] = None) -> list[dict]:
+    """原子认领到期提醒：scheduled（或租约已过期的 claimed）→ claimed。
+
+    认领时 attempts+1 并签发单调 lease_token；之后 mark_sent / mark_checked /
+    mark_failed 都要带同一个 token，过期进程的迟到写入会被 CAS 拒绝。
+    返回的每行带 lease_token，投递方原样传回。
+    """
+    now = time.time() if now is None else float(now)
+    who = claimant or _CLAIMANT
+    claimed, next_rows = [], []
+    with _lock:
+        con = _db()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            next_rows = _sweep(con, now)
+            rows = con.execute(
+                "SELECT * FROM reminders WHERE done = 0 AND due_ts <= ?"
+                " AND attempts < ?"
+                " AND (status = 'scheduled'"
+                "      OR (status = 'claimed' AND lease_until <= ?))"
+                " ORDER BY due_ts LIMIT ?",
+                (now, MAX_ATTEMPTS, now, limit)).fetchall()
+            for r in rows:
+                cur = con.execute(
+                    "UPDATE reminders SET status = 'claimed', claim_ts = ?,"
+                    " claim_by = ?, lease_until = ?, lease_token = lease_token + 1,"
+                    " attempts = attempts + 1"
+                    " WHERE id = ? AND lease_token = ? AND attempts < ?"
+                    " AND (status = 'scheduled'"
+                    "      OR (status = 'claimed' AND lease_until <= ?))",
+                    (now, who, now + LEASE_SECONDS, r["id"], r["lease_token"],
+                     MAX_ATTEMPTS, now))
+                if not cur.rowcount:
+                    continue
+                got = dict(r)
+                got["status"] = STATUS_CLAIMED
+                got["lease_token"] = int(r["lease_token"]) + 1
+                got["claim_by"] = who
+                claimed.append(got)
+            for r in next_rows:
+                _schedule_next(con, r)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+    return claimed
 
 
 def get(rid: int) -> Optional[dict]:
@@ -486,7 +596,10 @@ def get(rid: int) -> Optional[dict]:
 
 
 def _schedule_next(con: sqlite3.Connection, row: dict) -> int:
-    """重复任务投递后登记下一次；同名同点已存在就不再插。"""
+    """重复任务投递后登记下一次；同名同点已存在就不再插。
+
+    不在这里 commit：由调用方的 CAS 事务统一提交，保证「收口 + 排下一次」原子。
+    """
     rep = _load_repeat(row.get("repeat"))
     if not rep:
         return 0
@@ -505,36 +618,109 @@ def _schedule_next(con: sqlite3.Connection, row: dict) -> int:
         "kind, repeat) VALUES (?, ?, ?, ?, ?, ?, 'task', ?)",
         (row.get("sid"), row.get("user_id"), int(row.get("group_id") or 0), nxt,
          row.get("text") or "", time.time(), row.get("repeat") or ""))
-    con.commit()
     return int(cur.lastrowid or 0)
 
 
-def mark_done(rid: int) -> None:
-    with _lock:
-        con = _db()
-        row = con.execute("SELECT * FROM reminders WHERE id = ?",
-                          (rid,)).fetchone()
-        con.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
-        con.commit()
-        if row and str(row["kind"]) == "task":
-            _schedule_next(con, dict(row))
+def mark_sent(rid: int, token: int) -> bool:
+    """claimed → sent：只有仍持有同一 lease_token 的进程才能确认送达。
 
-
-def mark_failed(rid: int) -> None:
-    """发送失败：累计次数，3 次后放弃，避免一条坏提醒卡住队列。
-
-    重复任务放弃这次之后仍然登记下一次，否则每天的任务失败三次就永久停了。
+    重复调用幂等：已经不是 claimed（或 token 过期）时返回 False，不再改状态。
     """
     with _lock:
         con = _db()
-        con.execute("UPDATE reminders SET attempts = attempts + 1 WHERE id = ?", (rid,))
-        row = con.execute("SELECT * FROM reminders WHERE id = ? AND attempts >= ?",
-                          (rid, MAX_ATTEMPTS)).fetchone()
-        if row:
-            con.execute("UPDATE reminders SET done = 2 WHERE id = ?", (rid,))
+        cur = con.execute(
+            "UPDATE reminders SET status = 'sent', sent_ts = ?"
+            " WHERE id = ? AND status = 'claimed' AND lease_token = ?",
+            (time.time(), rid, int(token)))
         con.commit()
-        if row and str(row["kind"]) == "task":
-            _schedule_next(con, dict(row))
+        return bool(cur.rowcount)
+
+
+def mark_checked(rid: int, token: Optional[int] = None) -> bool:
+    """sent → checked：投递完成收口；重复任务只在这里登记下一次，保证只排一次。"""
+    now = time.time()
+    with _lock:
+        con = _db()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            row = con.execute("SELECT * FROM reminders WHERE id = ?", (rid,)).fetchone()
+            if not row or str(row["status"]) in (STATUS_CHECKED, STATUS_CLOSED):
+                con.rollback()
+                return False
+            sql = ("UPDATE reminders SET status = 'checked', done = 1, checked_ts = ?"
+                   " WHERE id = ? AND status IN ('claimed', 'sent')")
+            args: list = [now, rid]
+            if token is not None:
+                sql += " AND lease_token = ?"
+                args.append(int(token))
+            cur = con.execute(sql, args)
+            if cur.rowcount and str(row["kind"]) == "task":
+                _schedule_next(con, dict(row))
+            con.commit()
+            return bool(cur.rowcount)
+        except Exception:
+            con.rollback()
+            raise
+
+
+def mark_closed(rid: int, token: Optional[int] = None) -> bool:
+    """任意活动态 → closed：取消复查、无效行、人工收口都用它（不排下一次）。"""
+    with _lock:
+        con = _db()
+        sql = ("UPDATE reminders SET status = 'closed', done = 1, checked_ts = ?"
+               " WHERE id = ? AND done = 0")
+        args: list = [time.time(), rid]
+        if token is not None:
+            sql += " AND lease_token = ?"
+            args.append(int(token))
+        cur = con.execute(sql, args)
+        con.commit()
+        return bool(cur.rowcount)
+
+
+def mark_done(rid: int) -> bool:
+    """兼容旧调用：已送达的走 checked 收口，其余直接 closed。"""
+    row = get(rid)
+    if row and str(row.get("status")) == STATUS_SENT:
+        return mark_checked(rid)
+    return mark_closed(rid)
+
+
+def mark_failed(rid: int, token: Optional[int] = None) -> bool:
+    """发送失败：重试额度未用完退回 scheduled 并退避；用完则 closed（重复任务照旧排下一次）。
+
+    attempts 已在 claim 时 +1，这里只读不增，避免同一次失败被算两遍。
+    """
+    now = time.time()
+    with _lock:
+        con = _db()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            row = con.execute("SELECT * FROM reminders WHERE id = ?", (rid,)).fetchone()
+            if not row or str(row["status"]) in (STATUS_CHECKED, STATUS_CLOSED) \
+                    or int(row["done"] or 0):
+                con.rollback()
+                return False
+            attempts = int(row["attempts"] or 0)
+            if attempts >= MAX_ATTEMPTS:
+                cur = con.execute(
+                    "UPDATE reminders SET status = 'closed', done = 2, checked_ts = ?"
+                    " WHERE id = ? AND done = 0", (now, rid))
+                if cur.rowcount and str(row["kind"]) == "task":
+                    _schedule_next(con, dict(row))
+            else:
+                sql = ("UPDATE reminders SET status = 'scheduled', lease_until = 0,"
+                       " due_ts = ? WHERE id = ? AND done = 0")
+                args: list = [now + min(300.0, RETRY_BACKOFF * attempts), rid]
+                if token is not None:
+                    sql += " AND lease_token = ?"
+                    args.append(int(token))
+                cur = con.execute(sql, args)
+            con.commit()
+            return bool(cur.rowcount)
+        except Exception:
+            con.rollback()
+            raise
 
 
 def add_check(task_id: int, delay: float = 120.0) -> int:

@@ -9,8 +9,11 @@
 - 带强冲突标记的卡降权，但不排除（决策 2：只标注不拦截；弱信号不动召回）
 """
 import json
+import os
 import re
 from datetime import datetime, timezone
+
+import gate
 
 STOP_CHARS = set("人的了是个这那我你他她它一不有在上下来说时里面地得着过又很就都也还只把被给和与住吧呢啊"
                  "子儿头们么之其此某每另点数化")
@@ -189,22 +192,32 @@ ALIASES = {
 }
 ALIAS_WEIGHT = 0.8       # 别称命中的权重折扣：宁可少加分，不可让泛词压过原词
 
+# 泛钩子屏蔽：只屏蔽完全相同的钩子词，不做子串屏蔽。
+# 例：屏蔽「瑾瑜」后，「陆瑾瑜」这种包含它的复合钩子仍然正常计分。
+# 线上默认不屏蔽；评测时用 RP_HOOK_MUTE=主人,瑾瑜 观察「人人都会提」的词影响多大。
+HOOK_MUTE = {h.strip() for h in (os.environ.get("RP_HOOK_MUTE") or "")
+             .replace("，", ",").split(",") if h.strip()}
+
 
 def _variants(term):
     return [(term, 1.0)] + [(a, ALIAS_WEIGHT) for a in ALIASES.get(term, [])]
 
 
-def score_card(card, text):
-    """实体钩子优先；关系钩子只认整串命中，避免把抽象短语拆成噪声碎片。"""
-    best = 0.0
+def _best_entry(card, text):
+    """返回 (最高钩子分, 命中的钩子/别称)；分用于排序，cue 用于召回留痕。"""
+    best, cue = 0.0, ""
     hooks = card.get("entity_hooks") or []
     if isinstance(hooks, str):
         hooks = json.loads(hooks or "[]")
     for h in hooks:
+        if str(h) in HOOK_MUTE:        # 泛钩子不参与打分；复合钩子（陆瑾瑜）照常
+            continue
         for variant, factor in _variants(str(h)):
             for key, w in core_keys(variant):
                 if key and key in text:
-                    best = max(best, w * factor)
+                    val = w * factor
+                    if val > best:
+                        best, cue = val, key
     rel = card.get("rel_hooks") or []
     if isinstance(rel, str):
         try:
@@ -213,9 +226,19 @@ def score_card(card, text):
             rel = []
     for h in rel:
         h = str(h or "").strip()
-        if len(h) >= 2 and h in text:
-            best = max(best, 1.2)          # 低于实体钩子：关系模式只是辅助信号
-    return best
+        if len(h) >= 2 and h in text and 1.2 > best:
+            best, cue = 1.2, h          # 低于实体钩子：关系模式只是辅助信号
+    return best, cue
+
+
+def score_card(card, text):
+    """实体钩子优先；关系钩子只认整串命中，避免把抽象短语拆成噪声碎片。"""
+    return _best_entry(card, text)[0]
+
+
+def match_cue(card, text):
+    """命中的钩子/别称；只用于召回留痕（解释「为什么想起这个」）。"""
+    return _best_entry(card, text)[1]
 
 
 def salience(card):
@@ -246,8 +269,10 @@ def retrieve(cards, text, limit=2, exclude_ids=()):
     """返回 [(score, card)]，按 score → 显著性 → importance → turn_end 降序。"""
     if not text:
         return []
+    if gate.CLOCK_SHORTCUT and gate.is_clock_query(text):
+        return []                       # 纯问时间：不检索，别把无关旧事拉进上下文
     skip = set(exclude_ids)
-    scored = []
+    scored, exempt = [], set()
     for c in cards:
         if c["event_id"] in skip:
             continue
@@ -259,11 +284,117 @@ def retrieve(cards, text, limit=2, exclude_ids=()):
             continue
         if c.get("conflict_flags") and STRONG_FLAGS & set(c["conflict_flags"]):
             s *= 0.5                                  # 仅强信号降权，弱信号只留日志
+            exempt.add(c["event_id"])                 # 降过权就豁免相对闸门，别变成排除
         scored.append((s, c))
     scored.sort(key=lambda x: (x[0], salience(x[1])[0], salience(x[1])[1],
                                x[1].get("importance", 0.5), x[1]["turn_end"]),
                 reverse=True)
-    return scored[:limit]
+    scored = gate.apply(scored, exempt)  # 相对闸门：最高分很弱时不硬凑 top-N
+    return activate(scored, cards, text, limit)   # P2：一跳实体共现，分低于种子
+
+
+# ---------- P2 图激活（一跳） ----------
+# 从「本轮已命中」的卡出发，沿实体钩子走一跳，把共享同一个具体实体的邻居卡补进候选。
+# 三条边界防止它变成第二条召回通道：
+#   1) 邻居分 = 种子分 × GRAPH_FACTOR（恒低于种子）→ 只会占第 2~N 位，永远挤不掉
+#      top-1；单轮最多补 GRAPH_MAX 张；
+#   2) 只在门控打开时激活（多跳线索或字面很弱），普通闲聊不付这份算力；
+#   3) 只认「具体」实体钩子：短于 2 字、人人都有（主人/瑾瑜）、或出现在超过
+#      GRAPH_DF_MAX 比例卡片里的泛钩子，都不当作连线依据。
+# 只做一跳（GRAPH_HOPS 固定 1，不给多跳留开关）：一跳是「同一个东西」，两跳就变成
+# 「甲认识乙、乙认识丙」的噪声。线上默认关：真实语料 A/B 里 recall@4 与 MRR 都在噪声内
+# 不动（失败的是语义缺口，不是缺连线），留开关给将来多跳语料复用；RP_GRAPH=1 打开。
+GRAPH_ON = (os.environ.get("RP_GRAPH") or "0").strip().lower() in {
+    "1", "true", "yes", "on"}
+GRAPH_MAX = 2                   # 单轮最多补几张邻居卡
+GRAPH_FACTOR = 0.55             # 邻居基准分相对种子的比例（永远低于种子）
+GRAPH_HOPS = 1                  # 语义固定：只做一跳
+GRAPH_SEEDS = 2                 # 只用已命中的前两张卡当种子
+GRAPH_DF_MAX = 0.03             # 出现频率超过这个比例算泛钩子
+GRAPH_GENERIC = {"主人", "瑾瑜", "我", "你", "他", "她"}
+# 多跳线索：需要把两件事/两个人串起来时，单独一次字面命中往往不够。
+GRAPH_CUE = re.compile(
+    r"和|跟|与|一起|那个|那件|那次|上次|之前|后来|然后|因为|所以|还有|另外|"
+    r"同时|之间|认识|关系|为什么|怎么")
+GRAPH_WEAK_TOP = 1.2            # 最高分低于此值算「字面很弱」，也考虑激活
+
+
+def _entity_hooks(card):
+    hooks = card.get("entity_hooks") or []
+    if isinstance(hooks, str):
+        try:
+            hooks = json.loads(hooks or "[]")
+        except (TypeError, ValueError):
+            hooks = []
+    return [str(h).strip() for h in hooks if str(h).strip()]
+
+
+def _hook_df(cards):
+    """钩子 → 文档频次：用来把「人人都有」的泛钩子从连线依据里剔掉。"""
+    df = {}
+    for c in cards:
+        for h in set(_entity_hooks(c)):
+            df[h] = df.get(h, 0) + 1
+    return df
+
+
+def _specific_hook(h, df, cut):
+    return len(h) >= 2 and h not in GRAPH_GENERIC and df.get(h, 0) < cut
+
+
+def graph_gate(text, scored):
+    """这一轮要不要开激活：像在问关系/经过（多跳线索），或字面命中很弱。"""
+    if not GRAPH_ON or not scored or GRAPH_HOPS < 1:
+        return False
+    q = str(text or "").strip()
+    if len(q) < 4:
+        return False
+    top = float(scored[0][0] or 0.0)
+    return bool(GRAPH_CUE.search(q)) or top < GRAPH_WEAK_TOP
+
+
+def activate(scored, cards, text, limit=None):
+    """一跳实体共现激活：返回「已命中卡 + 邻居卡」，与种子一起按分数重排。
+
+    邻居分恒低于种子，因此只能占第 2 位以后；邻居不再当种子扩散（不做多跳）；
+    玩家私有卡与非具体钩子不参与连线。
+    """
+    if not graph_gate(text, scored):
+        return scored
+    have = {c["event_id"] for _, c in scored}
+    df = _hook_df(cards)
+    cut = max(8, int(len(cards) * GRAPH_DF_MAX))
+    seed_hooks = {}
+    for s, c in scored[:GRAPH_SEEDS]:
+        for h in _entity_hooks(c):
+            if _specific_hook(h, df, cut):
+                seed_hooks.setdefault(h, float(s or 0.0))
+    if not seed_hooks:
+        return scored
+    cand = []
+    for c in cards:
+        eid = c["event_id"]
+        if eid in have:
+            continue
+        if (c.get("knowledge_boundary") or "both") == "player":
+            continue                   # 角色不该知道的事，不因共现被捞进来
+        if suspicious(c.get("summary")):
+            continue
+        shared = [h for h in _entity_hooks(c) if h in seed_hooks]
+        if not shared:
+            continue
+        score = max(seed_hooks[h] for h in shared) * GRAPH_FACTOR
+        if len(shared) >= 2:           # 共享两个以上具体实体：同一段关系的概率更高
+            score += 0.05 * min(len(shared) - 1, 3)
+        cand.append((score, c))
+    cand.sort(key=lambda x: (x[0], x[1].get("importance", 0.5),
+                             x[1].get("turn_end", 0)), reverse=True)
+    # 邻居与已命中卡一起按分数重排：分恒低于种子，所以只可能占 2~N 位；
+    # 同分时 importance/turn_end 兜底，保证排序确定。
+    out = scored + cand[:GRAPH_MAX]
+    out.sort(key=lambda x: (x[0], x[1].get("importance", 0.5),
+                            x[1].get("turn_end", 0)), reverse=True)
+    return out[:limit] if limit else out
 
 
 # 融合权重：向量为主、钩子补充。100 条真实探针实测 1:1 RRF 的 R@4 只有 0.760，
