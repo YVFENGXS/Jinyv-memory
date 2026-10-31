@@ -1756,7 +1756,9 @@ def _reply_segments(raw) -> list:
 async def _reply_bits(bot, raw) -> list:
     """把一条被引用消息渲染成人话：文字原样、图片判读、卡片摘要、语音转写。"""
     bits = []
-    for s in _reply_segments(raw):
+    segs = _reply_segments(raw)
+    hint = _caption_from_segs(segs)      # 被引用消息里附带的文字，同样只作弱线索
+    for s in segs:
         stype, sdata = s.type, dict(s.data or {})
         if stype == "text" and str(sdata.get("text") or "").strip():
             bits.append(f"「{str(sdata['text']).strip()[:120]}」")
@@ -1770,7 +1772,7 @@ async def _reply_bits(bot, raw) -> list:
                 bits.append("（引用的图片没拉到）")
                 continue
             try:
-                info = await asyncio.wait_for(classify_image_bytes(data), timeout=20)
+                info = await asyncio.wait_for(classify_image_bytes(data, hint), timeout=20)
                 d = _img_note([info]).strip("（）")
                 bits.append(d or "一张图片")
             except Exception:                 # noqa: BLE001
@@ -1938,6 +1940,28 @@ async def _link_notes(text: str, event: MessageEvent) -> str:
 capture = on_message(priority=1, block=False)
 
 
+_CAPTION_NOISE = re.compile(r"\[(?:图片|表情|动画表情|视频|语音|文件)\]")
+
+
+def _caption_from_segs(segs) -> str:
+    """同条消息里附带的文字，作为视觉判断的弱线索（可能图文不符）。
+
+    QQ 里表情包常带「[图片]」占位前缀，先剥掉；只留真正写下的字，最多 200 字。
+    """
+    parts = []
+    for s in segs or []:
+        try:
+            if s.type != "text":
+                continue
+            t = str((s.data or {}).get("text") or "")
+        except Exception:                     # noqa: BLE001 段结构异常不影响判读
+            continue
+        t = _CAPTION_NOISE.sub("", t)
+        if t.strip():
+            parts.append(t.strip())
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()[:200]
+
+
 def _extract_image_urls(event: MessageEvent) -> list:
     """消息里所有图片/商城表情的直链（可能为空列表）。"""
     urls = []
@@ -1961,9 +1985,10 @@ async def _capture(event: MessageEvent):
     sid = _sid(event)
     _last_media[sid] = urls[-1]
     is_admin = str(event.user_id) in ADMIN
+    hint = _caption_from_segs(event.message)
     tasks = []
     for u in urls:                        # 一条消息里所有图都处理
-        task = asyncio.create_task(_process_image(u, sid, is_admin))
+        task = asyncio.create_task(_process_image(u, sid, is_admin, hint))
         _media_tasks.add(task)
         task.add_done_callback(_media_tasks.discard)
         tasks.append(task)
@@ -1971,7 +1996,8 @@ async def _capture(event: MessageEvent):
         _media_futs[str(event.message_id)] = tasks
 
 
-async def _process_image(url: str, sid: str, is_admin: bool) -> Optional[dict]:
+async def _process_image(url: str, sid: str, is_admin: bool,
+                         hint: str = "") -> Optional[dict]:
     """下载 → 视觉判读 → 可用表情包入库 / 其余只留描述。失败只记日志。"""
     try:
         loop = asyncio.get_running_loop()
@@ -1979,7 +2005,7 @@ async def _process_image(url: str, sid: str, is_admin: bool) -> Optional[dict]:
         if data is None:
             logger.info(f"[jinyu] 图片下载失败 sid={sid}：{why}")
             return None
-        info = await classify_image_bytes(data)
+        info = await classify_image_bytes(data, hint)
         if info.get("err"):
             logger.warning(f"[jinyu] 视觉判读失败 sid={sid}: {info['err']}")
         if info.get("kind") == "表情包":
