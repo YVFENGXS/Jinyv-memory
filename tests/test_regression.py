@@ -3323,6 +3323,20 @@ def test_broken_marker():
     print("R77 坏标记清理: OK [[face? no]] 已清除 / 全角冒号自动纠正")
 
 
+def test_vision_hint():
+    """R78：随图文字只作弱线索，并参与缓存键；空提示保持原提示词。"""
+    from richmsg import _vision_key, vision_prompt
+    base = vision_prompt("")
+    assert "发送者随图附带" not in base
+    hinted = vision_prompt("  开心 [图片] 这是猫  ")
+    assert "发送者随图附带" in hinted and "开心" in hinted
+    assert "可能与图不符" in hinted or "和图完全无关" in hinted
+    assert "不能因为" in hinted and "改变你实际看到的内容" in hinted
+    assert _vision_key(b"img", "") != _vision_key(b"img", "猫")
+    assert _vision_key(b"img", "") == _vision_key(b"img", "")
+    print("R78 随图文字弱线索: OK 提示词追加 / 图文不符警告 / 缓存分键")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -3375,6 +3389,7 @@ if __name__ == "__main__":
                test_evidence_chain_trace, test_bili_watch_tool_helpers,
                test_bili_account_helpers, test_bili_write_guard, test_bili_note_comment,
                test_bili_owner_mention, test_budget_line, test_broken_marker,
+               test_vision_hint,
                test_chat_stores_reply_when_context_build_fails):
         fn()
     print("\nall regression tests passed")
