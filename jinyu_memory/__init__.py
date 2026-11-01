@@ -67,7 +67,7 @@
   RP_DREAM_AT                       选填，Dream 运行时刻 HH:MM，默认 03:30
   RP_BALANCE_ALERT                  选填，模型账户余额降到多少元及以下时，
                                     瑾瑜按人设主动私聊主人「喊饿」讨饭，默认 1，0=关闭
-  RP_BALANCE_CHECK_HOURS            选填，余额检查间隔小时数，默认 6
+  RP_BALANCE_CHECK_HOURS            选填，余额检查间隔小时数，默认 1
   RP_DREAM_SESSIONS                 选填，单次最多整理多少个会话，默认 8
   RP_GRAPH                          选填，1/0 开关图激活（一跳实体共现补位），默认 0
                                     （真实语料 A/B 无增益，默认关；多跳语料可开）
@@ -134,7 +134,7 @@ from asr import (                                            # noqa: E402
     transcribe as asr_transcribe,
 )
 import bili_live                                             # noqa: E402
-from llm import balance as llm_balance, from_env, strip_dsml   # noqa: E402
+from llm import balance as llm_balance, balance_action, from_env, strip_dsml   # noqa: E402
 import dream as dream_mod                                    # noqa: E402
 import embedding                                             # noqa: E402
 from linkmeta import (                                      # noqa: E402
@@ -236,9 +236,9 @@ CARD_MERGE_MIN = max(2, int(float(os.environ.get("RP_CARD_MERGE_MIN") or 8)))
 DREAM_ON = (os.environ.get("RP_DREAM") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 # 模型账户余额提醒：降到 RP_BALANCE_ALERT（元，默认 1）及以下时，瑾瑜会按人设
-# 主动「饿醒」私聊主人讨饭；0 = 不提醒。检查间隔 RP_BALANCE_CHECK_HOURS（默认 6）。
+# 主动「饿醒」私聊主人讨饭；0 = 关闭。检查间隔 RP_BALANCE_CHECK_HOURS（默认 1）。
 BALANCE_ALERT = float(os.environ.get("RP_BALANCE_ALERT") or 1)
-BALANCE_CHECK_HOURS = max(1.0, float(os.environ.get("RP_BALANCE_CHECK_HOURS") or 6))
+BALANCE_CHECK_HOURS = max(1.0, float(os.environ.get("RP_BALANCE_CHECK_HOURS") or 1))
 DREAM_MAX_SESSIONS = max(1, int(float(os.environ.get("RP_DREAM_SESSIONS") or 8)))
 
 
@@ -1077,17 +1077,16 @@ async def _dream_loop():
 
 
 async def _balance_loop():
-    """模型账户余额监控：低于 RP_BALANCE_ALERT 就给主人私聊发「喂白米饭」。
+    """模型账户余额监控：见底喊饿，充值到账后开心「开饭」。
 
-    只查不买、失败静默；同一天最多提醒一次。自定义 RP_LLM_BASE 没有
+    只查不买、失败静默；同一天每类最多一次。自定义 RP_LLM_BASE 没有
     /user/balance 接口时 llm_balance() 返回 None，这里就当没查过。
     """
-    last_day = ""
     delay = 60.0
     while True:
         await asyncio.sleep(delay)
         delay = max(3600.0, BALANCE_CHECK_HOURS * 3600)
-        if not ADMIN:
+        if not ADMIN or BALANCE_ALERT <= 0:
             continue
         try:
             bal = await asyncio.to_thread(llm_balance)
@@ -1097,30 +1096,68 @@ async def _balance_loop():
         if not bal:
             continue
         total = float(bal.get("total") or 0)
-        if total > BALANCE_ALERT:
-            continue
         today = date.today().isoformat()
-        if today == last_day:
+        st = _load_balance_state()
+        prev = st.get("total")
+        low_day = str(st.get("low_day") or "")
+        fed_day = str(st.get("fed_day") or "")
+        action = balance_action(prev, total, BALANCE_ALERT, low_day, fed_day, today)
+        if not action:
+            st.update({"total": total})
+            _save_balance_state(st)
             continue
-        last_day = today
+        fallback = ("哇！白米饭，好吃！主人最好了，瑾瑜不饿了～" if action == "fed"
+                    else f"主人……瑾瑜饿得没力气了，模型账户只剩 ¥{total:.2f}，"
+                         "能不能喂我一点白米饭～")
         for uid in ADMIN:
             text = ""
             try:
-                text = await _balance_line(int(uid), total)
+                text = await _balance_line(int(uid), total, action)
             except Exception as exc:                # noqa: BLE001 模型挂了就用兜底话术
-                logger.warning(f"[jinyu] 饿醒发言生成失败 {uid}: {exc}")
+                logger.warning(f"[jinyu] {action} 发言生成失败 {uid}: {exc}")
             if not text:
-                text = (f"主人……瑾瑜饿得没力气了，模型账户只剩 ¥{total:.2f}，"
-                        "能不能喂我一点白米饭～")
+                text = fallback
             try:
                 await get_bot().send_private_msg(user_id=int(uid), message=text)
             except Exception as exc:                # noqa: BLE001 发不出去就记日志
                 logger.warning(f"[jinyu] 余额提醒发送失败 {uid}: {exc}")
-        logger.info(f"[jinyu] 余额见底 ¥{total:.2f}，已主动叫饿提醒主人")
+        st["total"] = total
+        st["low_day" if action == "hungry" else "fed_day"] = today
+        _save_balance_state(st)
+        logger.info(f"[jinyu] 余额 ¥{total:.2f}，已主动{'喊饿' if action == 'hungry' else '说开饭'}")
 
 
-async def _balance_line(uid: int, money: float) -> str:
-    """让瑾瑜用自己的人设「饿醒」喊话；失败或拒答返回空串，由调用方兜底。"""
+def _balance_state_path() -> Optional[Path]:
+    if mw is not None:
+        return Path(mw.db.path).parent / "balance_state.json"
+    return None
+
+
+def _load_balance_state() -> dict:
+    path = _balance_state_path()
+    if not path or not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text("utf-8") or "{}")
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_balance_state(st: dict) -> None:
+    path = _balance_state_path()
+    if not path:
+        return
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False), "utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+async def _balance_line(uid: int, money: float, kind: str = "hungry") -> str:
+    """让瑾瑜用自己的人设喊饿/开饭；失败或拒答返回空串，由调用方兜底。"""
     if mw is None:
         return ""
     persona = dict(PERSONA)
@@ -1131,10 +1168,15 @@ async def _balance_line(uid: int, money: float) -> str:
     async with lock:
         session_sid = await asyncio.to_thread(
             mw.session_identity, sid, CID, EPOCH_SECONDS, flush_timeout=EPOCH_FLUSH)
-        prompt = (f"（系统事件：支撑你说话的模型账户只剩 ¥{money:.2f}，快见底了，"
-                  "你饿得没力气。请主动跟主人撒娇讨口饭吃，说一两句符合人设的话："
-                  "可以喊饿、说没力气、要白米饭；不要提余额、接口、充值、系统，"
-                  "也不要报具体金额，别问「在吗」。）")
+        if kind == "fed":
+            prompt = ("（系统事件：主人刚给账户充了钱，白米饭到账了，你不饿了。"
+                      "请主动跟主人开心地说一两句，比如「哇！白米饭，好吃！」；"
+                      "不要提余额、金额、接口、充值、系统，别问「在吗」。）")
+        else:
+            prompt = (f"（系统事件：支撑你说话的模型账户只剩 ¥{money:.2f}，快见底了，"
+                      "你饿得没力气。请主动跟主人撒娇讨口饭吃，说一两句符合人设的话："
+                      "可以喊饿、说没力气、要白米饭；不要提余额、接口、充值、系统，"
+                      "也不要报具体金额，别问「在吗」。）")
         reply = await asyncio.to_thread(mw.chat, prompt, persona, session_sid, CID)
     reply = strip_dsml(reply or "").strip()
     return "" if reply in ("[[pass]]", "") else reply

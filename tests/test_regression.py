@@ -3337,6 +3337,79 @@ def test_vision_hint():
     print("R78 随图文字弱线索: OK 提示词追加 / 图文不符警告 / 缓存分键")
 
 
+def test_balance_action():
+    """R79：充值回血说「开饭」，见底喊饿，同一天各限一次，首次查询不说话。"""
+    from llm import balance_action
+    day = "2026-10-31"
+    assert balance_action(None, 10, 1, "", "", day) == ""
+    assert balance_action(0.8, 10, 1, "", "", day) == "fed"
+    assert balance_action(6.0, 20, 1, "", "", day) == "fed"
+    assert balance_action(20, 6, 1, "", "", day) == ""
+    assert balance_action(0.5, 0.5, 1, "", "", day) == "hungry"
+    assert balance_action(0.5, 0.5, 1, day, "", day) == ""
+    assert balance_action(6.0, 20, 1, "", day, day) == ""
+    assert balance_action(0.8, 10, 0, "", "", day) == ""
+    print("R79 余额动作: OK 充值开饭 / 见底喊饿 / 同日限一次 / 首次静默")
+
+
+def test_host_api():
+    """R80：JinyuHost 不依赖 NoneBot，能写入对话、补词条、只读召回。"""
+    from host import JinyuHost
+
+    class _Front:
+        def chat(self, messages, **kw):
+            return "好。"
+
+    class _Back:
+        def chat(self, messages, **kw):
+            return json.dumps({"summary": "测试", "state_changes": {},
+                               "entity_hooks": []}, ensure_ascii=False)
+
+    path = tempfile.mktemp(suffix=".db")
+    host = JinyuHost(db_path=path, sid="host-test",
+                     front_llm=_Front(), back_llm=_Back())
+    try:
+        assert host.chat("") == ""
+        assert host.chat("你好") != ""
+        conn = sqlite3.connect(path)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM turns WHERE session_id='host-test'"
+                             ).fetchone()[0]
+        finally:
+            conn.close()
+        assert n >= 2, n
+        fid = host.remember("主人喜欢蓝色", speaker="主人")
+        assert fid > 0
+        data = host.recall("蓝色")
+        assert any("蓝色" in str(f.get("text") or "") for f in data["facts"]), data
+        assert set(data) == {"facts", "cards"}
+        assert host.new_session("host-test-2") == "host-test-2"
+    finally:
+        host.close()
+        for suffix in ("", "-wal", "-shm"):
+            p = path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+    print("R80 宿主 API: OK chat 落库 / remember 写词条 / recall 只读 / 换会话")
+
+
+def test_host_http_helpers():
+    """R81：HTTP 服务的 Bearer 校验与 session 名清洗。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("jinyu_serve",
+                                                  _ROOT / "tools" / "serve.py")
+    serve = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(serve)
+    assert serve.authed("Bearer abc", "abc")
+    assert not serve.authed("Bearer abd", "abc")
+    assert not serve.authed("", "abc")
+    assert not serve.authed("Bearer abc", "")
+    assert serve.session_name(" host main ") == "hostmain"
+    assert serve.session_name("") == "host-main"
+    assert serve.session_name("a" * 100) == "a" * 64
+    print("R81 HTTP 宿主: OK token 常量比较 / session 清洗 / 默认会话")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -3389,7 +3462,8 @@ if __name__ == "__main__":
                test_evidence_chain_trace, test_bili_watch_tool_helpers,
                test_bili_account_helpers, test_bili_write_guard, test_bili_note_comment,
                test_bili_owner_mention, test_budget_line, test_broken_marker,
-               test_vision_hint,
+               test_vision_hint, test_balance_action, test_host_api,
+               test_host_http_helpers,
                test_chat_stores_reply_when_context_build_fails):
         fn()
     print("\nall regression tests passed")

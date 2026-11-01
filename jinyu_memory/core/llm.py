@@ -308,3 +308,24 @@ def balance_cached() -> dict | None:
     _BAL.update({"at": now, "value": value})
     return value
 
+
+def balance_action(prev, total, alert, low_day, fed_day, today) -> str:
+    """余额变化该做什么：fed=充值到账，hungry=见底，''=不说话。
+
+    「充值」只看余额上涨且重新回到阈值以上；两类动作同一天各限一次，
+    避免接口抖动或反复查询造成刷屏。
+    """
+    try:
+        total = float(total or 0)
+        alert = float(alert or 0)
+    except (TypeError, ValueError):
+        return ""
+    if alert <= 0:                     # RP_BALANCE_ALERT=0：整套提醒关闭
+        return ""
+    if (prev is not None and total > float(prev) + 0.01 and total > alert
+            and fed_day != today):
+        return "fed"
+    if total <= alert and low_day != today:
+        return "hungry"
+    return ""
+

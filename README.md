@@ -1,4 +1,4 @@
-﻿﻿﻿﻿# Jinyu Memory
+﻿﻿﻿# Jinyu Memory
 
 一套给 QQ 角色扮演机器人用的**分层记忆中间件**：把「最近聊了什么」「半个月前发生过什么」「必须一直记住的设定」分开存，并在 token 预算内按优先级拼进上下文。
 
@@ -13,7 +13,7 @@
 - 时间感知：账本锚注入「当前时间/星期」，间隔 30 分钟～2 小时写「已过多久」，超过 2 小时直接写出上次发言的日期时间与差值（跨天会点明），热窗消息带日期与星期
 - 显著性排序：被反复记录（`mentions`）或被确认（`verified`）的事件卡在同分时优先
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
-- 92 项回归测试，不依赖任何 API key
+- 95 项回归测试，不依赖任何 API key
 
 ---
 
@@ -32,13 +32,15 @@ jinyu-memory/
 │       ├── conflict.py      #     跨会话矛盾消解
 │       ├── persona.py       #     人设单源（换成你自己的角色）
 │       ├── persona_guard.py #     人设硬规则校验/重生成
+│       ├── host.py          #     框架中立宿主：chat / remember / recall
 │       └── llm.py           #     OpenAI 兼容 HTTP 客户端 + 退避
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
-│   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ
-├── tests/test_regression.py # 92 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
+│   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ（走 JinyuHost）
+├── tests/test_regression.py # 95 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
+│   ├── serve.py             # 宿主 HTTP 服务：/chat /remember /recall（零依赖）
 │   ├── monitor.py           # 本地观测云服务器（SSH）
 │   └── check_health.py      # 只读健康检查
 ├── docs/
@@ -82,7 +84,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒等 92 项场景（服务器实测 16 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入等 95 项场景（服务器实测 18 秒）。
 
 ## 评测结果（可复现）
 
@@ -151,7 +153,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 92 项回归
+python tests/test_regression.py                        # 95 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -183,6 +185,40 @@ $env:RP_FRONT_KEY="sk-..."; $env:RP_BACK_KEY="sk-..."; python examples\chat_cli.
 输入 `/new` 开新会话（同 continuity，跨会话记忆生效），`/quit` 退出并冲刷尾部归档。
 
 默认请求 `https://api.deepseek.com`，用 `RP_LLM_BASE` / `RP_FRONT_MODEL` / `RP_BACK_MODEL` 可换成任何 OpenAI 兼容服务。
+
+### 其它框架：JinyuHost 与 HTTP 写入通道
+
+`core/` 不导入 NoneBot / OneBot，接入别的框架不需要装 QQ 适配器。`host.py` 是统一入口：`chat()` 走完整记忆链路，`remember()` 直接补长期词条，`recall()` 只读召回，`close()` 冲刷归档。
+
+同进程（dsh 等 Python 宿主）：
+
+```python
+import sys
+sys.path.insert(0, "jinyu_memory/core")
+from host import JinyuHost
+
+host = JinyuHost(db_path="data/rp_memory.db", sid="dsh-main")  # continuity 默认 jinyu-main
+print(host.chat("今天看到一条蓝色大肥鱼"))   # 写入并生成回复
+host.remember("主人喜欢蓝色", speaker="主人")  # 直接写长期词条，返回 id
+print(host.recall("蓝色"))                   # {"facts":[...], "cards":[...]}
+host.close()
+```
+
+跨进程 / 跨语言（零依赖 HTTP 服务）：
+
+```powershell
+$env:RP_HOST_TOKEN="一组随机串"; $env:RP_FRONT_KEY="sk-..."; $env:RP_BACK_KEY="sk-..."
+python tools\serve.py --port 8710 --db data\rp_memory.db
+```
+
+| 接口 | 作用 |
+|---|---|
+| `GET /health` | 存活检查（不校验令牌） |
+| `POST /chat` `{"text","session"}` | 写入一轮对话，返回 `{"reply","session"}` |
+| `POST /remember` `{"text","speaker","session"}` | 直接写长期词条，返回 `{"ok","id"}` |
+| `GET /recall?q=&session=&limit=` | 只读召回 `{"facts":[...],"cards":[...]}` |
+
+除 `/health` 都要 `Authorization: Bearer <RP_HOST_TOKEN>`；默认只监听 `127.0.0.1:8710`，同一个 `session` 串行。`/remember`、`/recall` 不需要模型密钥；`/chat` 缺 `RP_FRONT_KEY` / `RP_BACK_KEY` 会直接返回 503，不会写出半条记忆。
 
 ## 三、接 QQ：本地完整部署
 
