@@ -56,6 +56,12 @@ E:\Jinyv-plugins/                     # 单一插件 git 仓库（main）
 | dsh 改造版 | 用户 zip，无已知远程 | `$DSH_HOME/plugins/jinyu-memory-dsh` | 源码不复制、不改动 |
 | 第三方分镜 | `https://github.com/SAOS-3624/dsh-video-storyboard` | `var/vendor/dsh-video-storyboard` | 独立安装，固定 ref |
 
+插件仓库远程尚不存在。在 GitHub 创建空仓库后执行：
+
+```powershell
+git -C E:\Jinyv-plugins push -u origin main
+```
+
 ## 二、本轮完成情况
 
 | 项 | 状态 |
