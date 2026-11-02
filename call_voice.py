@@ -14,11 +14,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
 import re
-import shutil
 import time
 from pathlib import Path
 
@@ -163,6 +163,23 @@ def split_sentences(text: str, first_limit: int = 40) -> tuple[str, str]:
     return text[:first_limit].strip(), text[first_limit:].strip()
 
 
+_TTS_LOCKS = {}                 # cache key -> asyncio.Lock，同一句话只合成一次
+TTS_CACHE_MAX = max(20, int(float(os.environ.get("RP_TTS_CACHE_MAX") or 300)))
+
+
+def _trim_tts_cache(cache: Path, keep: int = TTS_CACHE_MAX):
+    """按最后修改时间保留最近 keep 个 mp3，避免缓存无限增长。"""
+    try:
+        files = sorted(cache.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in files[keep:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 async def tts_bytes(text: str) -> dict:
     """文本 → {"audio": bytes|None, "mode": "real"|"off", "ms": int}。"""
     started = time.perf_counter()
@@ -181,23 +198,32 @@ async def tts_bytes(text: str) -> dict:
         cache.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(f"{tts_voice()}|{text}".encode()).hexdigest()[:16]
     out = cache / f"{key}.mp3"
-    if out.exists() and out.stat().st_size > 512:
+    lock = _TTS_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _TTS_LOCKS[key] = lock
+    async with lock:
+        if out.exists() and out.stat().st_size > 512:
+            try:
+                data = await asyncio.to_thread(out.read_bytes)
+                return {"audio": data, "mode": "real", "ms": _ms(started)}
+            except OSError:
+                pass
+        # 每次用独立临时文件，避免并发请求互相覆盖；最后原子替换
+        tmp = cache / f"{key}.{os.getpid()}.{time.time_ns()}.tmp"
         try:
-            return {"audio": out.read_bytes(), "mode": "real", "ms": _ms(started)}
-        except OSError:
-            pass
-    tmp = out.with_suffix(".tmp")
-    try:
-        await edge_tts.Communicate(text, tts_voice()).save(str(tmp))
-        if tmp.exists() and tmp.stat().st_size > 512:
-            shutil.move(str(tmp), str(out))
-            return {"audio": out.read_bytes(), "mode": "real", "ms": _ms(started)}
-    except Exception as exc:                    # noqa: BLE001
-        logger.warning("[call] tts 失败: %s", exc)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return {"audio": None, "mode": "off", "ms": _ms(started),
-                "error": f"语音合成失败：{type(exc).__name__}"}
+            await edge_tts.Communicate(text, tts_voice()).save(str(tmp))
+            if tmp.exists() and tmp.stat().st_size > 512:
+                await asyncio.to_thread(os.replace, str(tmp), str(out))
+                data = await asyncio.to_thread(out.read_bytes)
+                await asyncio.to_thread(_trim_tts_cache, cache)
+                return {"audio": data, "mode": "real", "ms": _ms(started)}
+        except Exception as exc:                    # noqa: BLE001
+            logger.warning("[call] tts 失败: %s", exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return {"audio": None, "mode": "off", "ms": _ms(started),
+                    "error": f"语音合成失败：{type(exc).__name__}"}
     return {"audio": None, "mode": "off", "ms": _ms(started), "error": "语音合成无输出"}

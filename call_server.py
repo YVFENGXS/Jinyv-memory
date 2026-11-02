@@ -26,9 +26,11 @@
 import asyncio
 import base64
 import binascii
+import hmac
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -82,12 +84,22 @@ HOST = _cli("--host", os.environ.get("RP_CALL_HOST", "127.0.0.1"))
 PORT = int(_cli("--port", os.environ.get("RP_CALL_PORT", "8790")))
 DB_PATH = os.environ.get("RP_DB", str(ROOT / "desktop_memory.db"))
 CID = "jinyu"
-BASE_SESSION = (os.environ.get("RP_SESSION") or "qq-u3521544885").strip()
+BASE_SESSION = (os.environ.get("RP_SESSION") or "").strip()
+if not BASE_SESSION:
+    raise SystemExit("[call] 缺少 RP_SESSION：写要与 QQ 共用哪个会话（如 qq-u10001 / qq-g100001）")
 # 设了 RP_HOST_BASE + RP_HOST_TOKEN 就走 QQ 进程里的宿主接口，本进程不再碰 SQLite
 HOST_BASE = (os.environ.get("RP_HOST_BASE") or "").rstrip("/")
 HOST_TOKEN = (os.environ.get("RP_HOST_TOKEN") or "").strip()
+# 明确用 RP_DB 又没配宿主接口 = 两个进程直连同一个库，归档游标会互抢。
+# 独立本地库联调时设 RP_ALLOW_LOCAL_DB=1 显式放行。
+ALLOW_LOCAL_DB = (os.environ.get("RP_ALLOW_LOCAL_DB") or "").strip().lower() in {
+    "1", "true", "yes"}
 # 跨窗口推送：QQ/桌宠经本机 POST /call/say 让瑾瑜在通话里说一句
 WIN_TOKEN = str(os.environ.get("RP_WIN_TOKEN") or "").strip()
+# 通话页自身接口的令牌：启动时随机生成，通过 SameSite=Strict Cookie 发给同源页面。
+# 跨站页面发来的「简单请求」不会带这个 Cookie，读不到也放不进去。
+CALL_TOKEN = (os.environ.get("RP_CALL_TOKEN") or secrets.token_urlsafe(32)).strip()
+MAX_BODY_BYTES = max(1, int(float(os.environ.get("RP_CALL_BODY_MAX_MB") or 24))) * 1024 * 1024
 # 正在用的通话页会话（10 分钟内有过请求）；跨窗口 say 只发给这些会话
 LIVE = {}
 # sid -> [{text, stage, ts}]，前端轮询 /call/inbox 取走并播放
@@ -106,7 +118,7 @@ PASS_RE = re.compile(r"\[\[\s*pass\s*\]\]", re.I)
 def window_authed(host, supplied):
     """跨窗口端点鉴权：配了 RP_WIN_TOKEN 就比 token，否则只收本机回环。"""
     if WIN_TOKEN:
-        return supplied == WIN_TOKEN
+        return hmac.compare_digest(str(supplied or ""), WIN_TOKEN)
     return host in ("127.0.0.1", "::1")
 
 
@@ -116,6 +128,15 @@ def _prune():
         if now - at > LIVE_TTL:
             LIVE.pop(key, None)
             INBOX.pop(key, None)
+            lock = SESSION_LOCKS.get(key)
+            if lock is not None and not lock.locked():
+                SESSION_LOCKS.pop(key, None)
+            STAGE_STATE.pop(key, None)
+            READINGS.pop(key, None)
+            RECENT.pop(key, None)
+            LAST_USER.pop(key, None)
+            LAST_PROACTIVE.pop(key, None)
+            LAST_SAY.pop(key, None)
     for key, at in list(INBOX_READY.items()):
         if now - at > READY_TTL:
             INBOX_READY.pop(key, None)
@@ -141,6 +162,13 @@ def host_configured() -> bool:
     return bool(HOST_BASE and HOST_TOKEN)
 
 
+if not host_configured() and os.environ.get("RP_DB") and not ALLOW_LOCAL_DB:
+    raise SystemExit(
+        "[call] 检测到 RP_DB 但没有 RP_HOST_BASE / RP_HOST_TOKEN："
+        "通话进程不能直接读写 QQ 主库（同一个库只能有一个归档进程）。"
+        "请改配宿主接口；确实要用独立本地库联调时设 RP_ALLOW_LOCAL_DB=1。")
+
+
 EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48) * 3600))
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
 
@@ -153,7 +181,17 @@ VISION_LOCK = asyncio.Semaphore(1) # M3 单并发：读屏与回答都串行
 
 MAX_AUDIO_BYTES = max(1, int(float(os.environ.get("RP_CALL_AUDIO_MAX_MB") or 12))) * 1024 * 1024
 MAX_CALL_TEXT = 600
-CALL_LOCK = asyncio.Semaphore(1)   # M1 单并发：一次只处理一轮，避免多标签页抢麦
+# 同一个 session 的「取 session + MW.chat」必须串行，否则 max_turn+1 会撞号丢记忆；
+# 不同 session 之间可以并行。
+SESSION_LOCKS = {}                 # sid -> asyncio.Lock
+
+
+def session_lock(sid):
+    lock = SESSION_LOCKS.get(sid)
+    if lock is None:
+        lock = asyncio.Lock()
+        SESSION_LOCKS[sid] = lock
+    return lock
 
 # ---- 主动开口：AI 看着画面自己决定要不要说一句（不写共享记忆） ----
 RECENT = {}                        # sid -> [{"role","content","ts"}]，通话里的近几轮
@@ -230,6 +268,22 @@ def head_text_of(spec):
     if (spec or {}).get("nod"):
         parts.append("正在点头")
     return "、".join(parts) or "头正对着主人"
+
+
+HEAD_PHRASES = {
+    "头向右转", "头向左转", "头微微抬起", "头低着",
+    "头向右歪", "头向左歪", "正在点头", "头正对着你",
+}
+
+
+def valid_head_text(raw):
+    """前端上报的头姿只能是已知词组，避免任意文本混进提示词。"""
+    parts = []
+    for part in str(raw or "").replace("，", "、").split("、"):
+        part = part.strip()[:16]
+        if part in HEAD_PHRASES and part not in parts:
+            parts.append(part)
+    return "、".join(parts[:5])
 
 
 def stage_state_note(sid):
@@ -531,11 +585,11 @@ async def answer_locked(sid, question, reading, mode="screen"):
               + stage_state_note(sid)
               + stage_brief() + "\n" + "主人问：" + question)
     if host_configured():
-        async with VISION_LOCK:
+        async with session_lock(sid):
             return await host_chat(prompt, question, source), "remote"
     if MW is None:
         return fallback_answer(question, reading), "local"
-    async with VISION_LOCK:
+    async with session_lock(sid):
         async def run():
             chat_sid = session_for_chat()
             return await asyncio.to_thread(MW.chat, prompt, PERSONA, chat_sid, CID,
@@ -674,7 +728,7 @@ def latest_view_reading(sid, view, max_age=PROACTIVE_MAX_AGE):
 
 async def proactive_reply(sid, view):
     """看着当前画面决定说不说；返回 (text, stage, reason)。"""
-    if CALL_LOCK.locked():
+    if session_lock(sid).locked():
         return "", {}, "busy"
     reading, age = latest_view_reading(sid, view)
     if not reading:
@@ -724,7 +778,7 @@ async def voice_reply(text, sid="", view=""):
               + VOICE_STYLE + stage_brief() + "\n主人说：" + text)
     if host_configured():
         try:
-            async with CALL_LOCK:
+            async with session_lock(sid):
                 reply = await host_chat(prompt, text, "video")
         except Exception as exc:              # noqa: BLE001
             print(f"[call] host error: {type(exc).__name__}: {exc}")
@@ -733,10 +787,9 @@ async def voice_reply(text, sid="", view=""):
     if MW is None:
         return mock_reply(text), "mock"
     try:
-        async with CALL_LOCK:
-            chat_sid = session_for_chat()
-
+        async with session_lock(sid):
             def run():
+                chat_sid = session_for_chat()
                 return MW.chat(prompt, PERSONA, chat_sid, CID,
                                store_input=text, source="video")
 
@@ -769,6 +822,48 @@ APP.add_middleware(
 
 def err(status, message):
     return JSONResponse({"ok": False, "error": message}, status_code=status)
+
+
+# 页面接口统一鉴权：同源页面拿到的 SameSite=Strict Cookie，跨站请求带不上。
+# /call/say 例外，它走 RP_WIN_TOKEN（Bearer），给 QQ/桌宠用。
+GUARD_PREFIXES = ("/call/", "/vision/", "/stage/")
+GUARD_EXEMPT = ("/call/say",)
+
+
+def guarded_path(path):
+    return path.startswith(GUARD_PREFIXES) and path not in GUARD_EXEMPT
+
+
+def supplied_token(request):
+    return (request.headers.get("x-rp-token") or request.cookies.get("rp_call") or "").strip()
+
+
+@APP.middleware("http")
+async def call_guard(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if guarded_path(path):
+        site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+        if site and site not in ("same-origin", "none"):
+            return err(403, "cross-site request blocked")
+        token = supplied_token(request)
+        if not (token and hmac.compare_digest(token, CALL_TOKEN)):
+            return err(401, "unauthorized")
+        if request.method == "POST":
+            ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return err(415, "content-type must be application/json")
+            raw_len = (request.headers.get("content-length") or "").strip()
+            if raw_len.isdigit() and int(raw_len) > MAX_BODY_BYTES:
+                return err(413, "请求体太大")
+    response = await call_next(request)
+    if request.method == "GET" and path in ("/", "/index.html"):
+        # 重启后令牌会变：旧 Cookie 也要换掉，否则页面会一直 401 到 Cookie 过期。
+        if request.cookies.get("rp_call") != CALL_TOKEN:
+            response.set_cookie("rp_call", CALL_TOKEN, max_age=86400,
+                                httponly=True, samesite="strict", path="/")
+    return response
 
 
 @APP.get("/health")
@@ -876,11 +971,15 @@ async def stage_state(request: Request):
     names = []
     for item in body.get("expressions") or []:
         name = str(item or "").strip()[:16]
-        if name and name not in names:
+        if name in STAGE_EXPRESSIONS and name not in names:
             names.append(name)
     names = names[:12]
     motion = str(body.get("motion") or "").strip()[:24]
-    head = str(body.get("head") or "").strip()[:32]
+    # 动作名只认服务端清单；前端可能带「（保持中）」后缀，去掉后再校验
+    base_motion = motion.replace("（保持中）", "").strip()
+    if base_motion not in STAGE_MOTIONS:
+        motion = ""
+    head = valid_head_text(body.get("head"))
     STAGE_STATE[sid] = {"expressions": names, "motion": motion, "head": head, "ts": time.time()}
     return {"ok": True, "session": sid, "state": STAGE_STATE[sid]}
 
@@ -1003,6 +1102,12 @@ async def call_say(request: Request):
     remote = (request.client.host if request.client else "") or ""
     if not window_authed(remote, supplied):
         return err(401, "unauthorized")
+    site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        return err(403, "cross-site request blocked")
+    ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype != "application/json":
+        return err(415, "content-type must be application/json")
     try:
         body = await request.json()
     except Exception:                     # noqa: BLE001
@@ -1015,6 +1120,8 @@ async def call_say(request: Request):
     targets = live_sessions()
     wanted = str(body.get("session") or "").strip()[:64]
     if wanted:
+        if wanted not in LIVE:
+            return err(404, "通话窗口不在线")
         targets = [wanted]
     if not targets:
         return err(503, "现在没有在用的通话窗口")
