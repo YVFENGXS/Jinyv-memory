@@ -6,6 +6,6 @@ reply_cooldown_seconds = 0
 # auto = 装了 nonebot 就接消息入口，没装则降级为工具/钩子
 nonebot = "auto"
 # 插件实现：E:/Jinyv-plugins/qqbot（远程待确认）
-# 旧能力迁移过渡：只读指向旧包目录；留空 = 不启用 legacy 桥
-# 这是本机只读引用，不是源码副本；物理改写后再移除
-legacy_source_dir = "E:/rp_memory_project/jinyu-memory/jinyu_memory"
+# 能力实现已在插件仓库 qqbot/features/；不再依赖旧目录。
+# 仅在需要旧 __init__.py 的主动话题/命令逻辑时，才配置回退目录。
+legacy_source_dir = ""

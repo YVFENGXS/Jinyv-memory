@@ -1,6 +1,6 @@
 # 内置插件目录（当前不参与扫描）
 
-插件实现已迁到独立仓库，默认搜索路径由 `config/core.toml` 的
+插件实现已迁到单一外部仓库 `E:\Jinyv-plugins`，默认搜索路径由 `config/core.toml` 的
 `[plugins].search_paths` 指定：
 
 ```toml

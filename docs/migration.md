@@ -7,7 +7,7 @@
 3. 外围模块先做适配层，再逐模块替换；每搬一个都用旧行为对照。
 4. 第三方/改造版源码不直接入库：保留独立安装脚本或外部仓库。
 5. 不复制第三方完整表结构与命名，只吸收行为级机制。
-6. 插件实现不进主仓库：每个插件是 `E:\Jinyv-plugins\<name>` 下的独立 git 仓库，
+6. 插件实现不进主仓库：统一放在单一插件仓库 `E:\Jinyv-plugins` 的子目录，
    主仓库只保留 core、契约、加载器、配置与测试。
 7. 本轮执行环境的安全策略禁止把旧 QQ 实现整块复制进新仓库，因此 qqbot 旧能力
    先提供 `legacy_bridge.py` 只读引用；物理迁移需用户明确授权。
@@ -16,9 +16,10 @@
 
 | 本地路径 | 角色 | 远程地址 | 状态 |
 |---|---|---|---|
-| `E:\Jinyv-plugins\qqbot` | QQ 适配层 + legacy 只读桥 | 待确认（建议 `.../Jinyv-qqbot`） | 已建仓库并提交 |
-| `E:\Jinyv-plugins\desktop-pet` | 桌宠服务端适配层 | 待确认（建议 `.../Jinyv-plugin-desktop-pet`） | 已建仓库并提交 |
-| `E:\Jinyv-plugins\video-call` | 视频通话适配层 | 待确认（建议 `.../Jinyv-plugin-video-call`） | 已建仓库并提交 |
+| `E:\Jinyv-plugins` | 单一插件仓库（main） | `https://github.com/YVFENGXS/jinyv-plugins` | 本地已建；远程尚不存在 |
+| `E:\Jinyv-plugins\qqbot` | QQ 适配层 + legacy 只读桥 | 同上 | 已提交 |
+| `E:\Jinyv-plugins\desktop-pet` | 桌宠服务端适配层 | 上游 `YVFENGXS/Jinyu-pet` | 已提交，不复制客户端源码 |
+| `E:\Jinyv-plugins\video-call` | 视频通话适配层 | 上游 `YVFENGXS/jinyu-video-call` | 已提交，不复制服务源码 |
 | `$DSH_HOME\plugins\jinyu-memory-dsh` | DSH 特殊插件（JS/cordis） | 用户 zip，无已知远程 | 源码不复制、不改动 |
 | `var/vendor/dsh-video-storyboard` | 第三方分镜 CLI | `https://github.com/SAOS-3624/dsh-video-storyboard` | 独立安装，固定 ref |
 
@@ -101,12 +102,12 @@
 - 新仓库、git 新历史（未 push）。
 - core 13 模块迁移 + `MemoryAPI` + 租约/幂等。
 - 插件契约、多路径加载器、事件/工具/钩子/调度四套注册表。
-- 插件实现移到 `E:\Jinyv-plugins\{qqbot,desktop-pet,video-call}` 独立 git 仓库。
+- 插件实现移到单一插件仓库 `E:\Jinyv-plugins` 的三个子目录。
 - qqbot 外部加载并跑通最小闭环 + NoneBot 可选降级。
 - dsh 特殊接入：检测/可选启停/导入/导出/journal/冲突。
-- 自检 22 项、unittest 14 项、DSH Node 测试 15 项。
+- 自检 22 项、unittest 15 项、DSH Node 测试 15 项。
 - 已完成：主仓库 `plugins/` 副本删除；qqbot 仓库按顺序建立旧能力适配入口；dsh CLI 安装。
-- 受限：旧 QQ 源码整块复制仍被安全策略拒绝，适配入口通过 `legacy_bridge.py` 只读调用。
+- 8 个 QQ 能力模块已复制到 `qqbot/features/`，内部导入改为包内相对导入；旧目录只作为 `legacy_entry` 回退。
 
 ### P1：核心行为对齐
 - 迁 104 项回归，确认 DB schema、水位线、披露、承诺、Dream 与旧版逐项一致。

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -61,6 +62,32 @@ class QQBotPluginTest(unittest.TestCase):
         self.assertTrue(capabilities.ok)
         self.assertTrue(capabilities.value["adapter"]["message_loop"])
         self.assertIn("legacy_bridge", capabilities.value)
+
+    def test_local_reminder_and_owner_gate_features(self):
+        status = {item["name"]: item for item in self.plugin.features.status()}
+        self.assertTrue(status["reminder"]["present"])
+        self.assertTrue(status["owner_gate"]["present"])
+        self.assertEqual(status["reminder"]["source"], "local")
+
+        reminder = self.plugin.features.load("reminder")
+        owner_gate = self.plugin.features.load("owner_gate")
+        reminder.init(str(Path(self.data.name) / "reminders.db"))
+        owner_gate.init(str(Path(self.data.name) / "owner.db"))
+
+        scheduled = reminder.schedule("qq-u1", 1001, 0, 30, "测试提醒")
+        self.assertTrue(scheduled["ok"])
+        claimed = reminder.claim_due(now=time.time() + 40)
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["text"], "测试提醒")
+
+        begun = owner_gate.begin("qq", "10001", by="admin")
+        self.assertTrue(begun["ok"])
+        confirmed = owner_gate.confirm("qq", "10001", begun["code"], via="qq-u10001")
+        self.assertTrue(confirmed["ok"])
+        self.assertTrue(owner_gate.is_owner("qq", "10001"))
+
+        reminder.close()
+        owner_gate.close()
 
     def test_degrades_without_nonebot(self):
         has_nonebot = importlib.util.find_spec("nonebot") is not None

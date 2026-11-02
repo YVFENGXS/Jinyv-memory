@@ -26,18 +26,19 @@
 │       ├── ScheduleRegistry + Scheduler（按窗口领租约）
 │       └── PluginRecord × N（状态 / 健康 / 降级原因）
 ├── integrations/dsh.py（特殊接入：检测 / 启停 / 导入 / 导出 / journal）
-└── E:\Jinyv-plugins\*（独立 git 仓库，plugin.toml + __init__.py）
+└── E:\Jinyv-plugins\*（单一插件仓库的子目录，plugin.toml + __init__.py）
 ```
 
 ### 插件仓库布局
 
-主仓库不持有插件实现。每个插件是独立 git 仓库，放在统一的外部目录：
+主仓库不持有插件实现。所有插件放在单一外部仓库 `E:\Jinyv-plugins`，每个插件是其中一个子目录：
 
 ```
-E:\Jinyv-plugins\
-├── qqbot\          # 适配层 + legacy 只读桥（远程待确认）
-├── desktop-pet\    # 桌宠服务端适配层（客户端在原仓库 Jinyu-pet）
-└── video-call\     # 通话适配层（服务在原仓库 jinyu-video-call）
+E:\Jinyv-plugins\        # git 仓库 main；远程 YVFENGXS/jinyv-plugins（待创建）
+├── qqbot\              # 适配层 + features 能力入口
+├── desktop-pet\        # 桌宠服务端适配层（客户端在原仓库 Jinyu-pet）
+├── video-call\         # 通话适配层（服务在原仓库 jinyu-video-call）
+└── .repo-history\      # 原子仓库历史备份（gitignore）
 ```
 
 dsh 不在此目录：它是 JS/cordis 特殊插件，源码留在用户 zip / `$DSH_HOME`，
@@ -123,8 +124,10 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 ### qqbot
 - 传输层可选：`nonebot_adapter.py` 只在装了 NoneBot2 + OneBot v11 时导入；否则 `ctx.degrade`。
 - 本轮闭环：`handle_message` → before 钩子召回 → `MemoryAPI.chat`（落 turns / 拼上下文 / 生成 / 归档）→ after 钩子 → `qqbot.turn.completed` 事件。
-- 工具：`qqbot.remember` / `qqbot.recall` / `qqbot.status`。
-- 未迁：富消息、贴纸、ASR、链接/视频、B 站、提醒、主人绑定、主动话题（P2）。
+- 工具：`qqbot.remember` / `qqbot.recall` / `qqbot.status` / `qqbot.capabilities`。
+- 已迁入 `qqbot/features/`：`richmsg / linkmeta / bili_live / reminder / owner_gate / asr / mcp_client / task_supervisor`；内部导入已改为包内相对导入，不再依赖旧目录。
+- 可选依赖：nonebot2 / nonebot-adapter-onebot / httpx；缺依赖时对应能力降级。
+- 提醒与主人绑定已有 unittest 覆盖；旧 `__init__.py` 的主动话题/命令/轮换仍未复制。
 
 ### desktop-pet（独立仓库 `YVFENGXS/Jinyu-pet`）
 - 客户端是 Electron 薄壳，**不复制源码**；主仓库只提供服务端适配层与协议真源。
@@ -154,10 +157,10 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0（本轮） | core 迁移 + 契约 + 多路径加载器 + 外部 qqbot 闭环 + 外部适配器 + dsh 桥接 + 自检/测试 | `selfcheck` 22 项、`unittest` 14 项通过 |
-| P0.5（本轮） | 主仓库 `plugins/` 副本已删除；qqbot 仓库已按顺序建立旧能力适配入口；dsh 支持 CLI 安装 | `git status` 干净；适配入口状态可见 |
+| P0（本轮） | core 迁移 + 契约 + 多路径加载器 + 外部 qqbot 闭环 + QQ 能力迁移 + 外部适配器 + dsh 桥接 + 自检/测试 | `selfcheck` 22 项、`unittest` 15 项通过 |
+| P0.5（本轮） | 主仓库 `plugins/` 副本已删除；8 个 QQ 能力已迁入 `qqbot/features/` 并改写导入；dsh 支持 CLI 安装 | `git status` 干净；提醒/主人绑定测试通过 |
 | P1 | 把 104 项旧回归迁到新结构；`tools/serve.py` 宿主 HTTP API 插件化；环境变量完全对齐 | 旧回归全绿；QQ/桌宠/通话不回归 |
-| P2 | qqbot 完整迁移：richmsg / linkmeta / reminder / owner_gate / asr / bili_live / 主动话题 | 逐模块行为等价对照 |
+| P2 | qqbot 旧入口接线：主动话题/命令/轮换；富消息/链接视频等接入 NoneBot matcher | 逐模块行为等价对照 |
 | P3 | desktop-v1 服务端插件（包装 `desktop_server.py`），Jinyu-pet 联调 | 协议 fixtures + 断线重连 |
 | P4 | video-call 宿主桥 + 独立服务联调；禁止双写 SQLite | 通话一轮落库、召回一致 |
 | P5 | DSH 改造版安装/导入验收；第三方分镜 CLI 检测与调用 | Node 测试 + 导入幂等 |

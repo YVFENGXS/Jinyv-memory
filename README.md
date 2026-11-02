@@ -3,7 +3,7 @@
 以「记忆核心」为主体、外围能力插件化的瑾瑜记忆运行时。本轮已把插件实现移出主仓库：
 
 - 主仓库只保留 **core、插件契约、加载器、配置、测试**。
-- 插件是 **独立 git 仓库**，统一放在 `E:\Jinyv-plugins\`，加载器通过多路径发现。
+- 插件统一放在 **单一外部 git 仓库** `E:\Jinyv-plugins\`（每个插件一个子目录），加载器通过多路径发现。
 - dsh 是 **特殊接入类型**（JS/cordis），不进入 Python 插件契约，由核心侧桥接。
 - 桌宠 `Jinyu-pet`、通话 `jinyu-video-call`、dsh `jinyu-memory-dsh` 的原仓库/源码保持不动。
 
@@ -33,14 +33,15 @@ E:\Jinyv-memory/                      # 主仓库：core / 契约 / 加载器 / 
 │   ├── accounts.toml
 │   ├── plugins/*.toml                # 插件配置（实现不在主仓库）
 │   └── integrations/dsh.toml         # dsh 特殊接入配置
-├── plugins/                          # 仅说明；上一轮实现副本待你确认后删除
-├── tests/                            # 14 项回归
+├── plugins/                          # 仅 README；实现副本已删除
+├── tests/                            # 15 项回归
 └── docs/                             # 架构 / 契约 / 迁移 / desktop-v1 协议
 
-E:\Jinyv-plugins/                     # 独立插件仓库集合
-├── qqbot/                            # git 仓库：QQ 适配层 + legacy 只读桥
-├── desktop-pet/                      # git 仓库：桌宠服务端适配层
-└── video-call/                       # git 仓库：视频通话适配层
+E:\Jinyv-plugins/                     # 单一插件 git 仓库（main）
+├── qqbot/                            # QQ 适配层 + features 能力入口
+├── desktop-pet/                      # 桌宠服务端适配层
+├── video-call/                       # 视频通话适配层
+└── .repo-history/                    # 原子仓库历史备份（gitignore）
 # dsh 源码不在 Jinyv-plugins：保留在用户 zip / $DSH_HOME/plugins/jinyu-memory-dsh
 ```
 
@@ -48,12 +49,10 @@ E:\Jinyv-plugins/                     # 独立插件仓库集合
 
 | 仓库 | 远程地址 | 本地路径 | 状态 |
 |---|---|---|---|
-| 主仓库 | `https://github.com/YVFENGXS/Jinyv-memory` | `E:\Jinyv-memory` | 新历史，未推送 |
-| QQ 插件 | **待确认**（建议 `.../Jinyv-qqbot`） | `E:\Jinyv-plugins\qqbot` | 已建独立仓库并提交 |
-| 桌宠适配器 | **待确认**（建议 `.../Jinyv-plugin-desktop-pet`） | `E:\Jinyv-plugins\desktop-pet` | 已建独立仓库并提交 |
-| 桌宠客户端 | `https://github.com/YVFENGXS/Jinyu-pet` | `E:\rp_memory_project\rp-desktop-pet` | 原仓库不动 |
-| 视频通话适配器 | **待确认**（建议 `.../Jinyv-plugin-video-call`） | `E:\Jinyv-plugins\video-call` | 已建独立仓库并提交 |
-| 视频通话服务 | `https://github.com/YVFENGXS/jinyu-video-call` | `E:\rp_memory_project\jinyu-video-call` | 原仓库不动 |
+| 主仓库 | `https://github.com/YVFENGXS/Jinyv-memory` | `E:\Jinyv-memory` | 已推送 `refactor/plugin-core` |
+| 插件仓库 | `https://github.com/YVFENGXS/jinyv-plugins` | `E:\Jinyv-plugins` | 本地已建 main；远程尚不存在 |
+| 桌宠客户端 | `https://github.com/YVFENGXS/Jinyu-pet` | `E:\rp_memory_project\rp-desktop-pet` | 原仓库不动，插件仓库只放适配层 |
+| 视频通话服务 | `https://github.com/YVFENGXS/jinyu-video-call` | `E:\rp_memory_project\jinyu-video-call` | 原仓库不动，插件仓库只放适配层 |
 | dsh 改造版 | 用户 zip，无已知远程 | `$DSH_HOME/plugins/jinyu-memory-dsh` | 源码不复制、不改动 |
 | 第三方分镜 | `https://github.com/SAOS-3624/dsh-video-storyboard` | `var/vendor/dsh-video-storyboard` | 独立安装，固定 ref |
 
@@ -62,14 +61,15 @@ E:\Jinyv-plugins/                     # 独立插件仓库集合
 | 项 | 状态 |
 |---|---|
 | 插件契约 / 加载器 | 已完成；支持多路径扫描、依赖排序、工具/钩子/事件/定时任务、失败隔离与降级 |
-| qqbot 插件仓库 | 已完成独立仓库；外部加载后跑通 10 轮闭环 |
-| desktop-pet / video-call | 已完成独立适配器仓库；可被发现、注册、健康检查、正常降级 |
+| qqbot 插件目录 | 已在单一插件仓库；外部加载后跑通 10 轮闭环 |
+| desktop-pet / video-call | 已在单一插件仓库；可被发现、注册、健康检查、正常降级 |
 | dsh 特殊接入 | 已完成检测、可选启停、导入/导出、journal 幂等、dsh-wins 冲突记录 |
-| QQ 旧能力迁移 | 已建 6 项能力的插件侧适配入口（按顺序）；旧源码未复制，仍由 `legacy_bridge.py` 只读引用 |
+| QQ 旧能力迁移 | ✅ 8 个能力模块已复制到 `qqbot/features/` 并改写内部导入；提醒/主人绑定有测试覆盖 |
+| 单一插件仓库 | ✅ `E:\Jinyv-plugins` 已合并为一个 git 仓库；远程 `jinyv-plugins` 尚不存在 |
 | 主仓库 plugins 清理 | ✅ 已删除四个实现副本，仅保留说明文件 |
 | dsh 安装 | ✅ `jinyv-memory dsh install --source <zip|目录>` 可安装到 DSH_HOME |
 | 推送 | ✅ 已推送 `refactor/plugin-core`（分支最新提交）；`main` 未动 |
-| 自检 / 测试 | selfcheck 22 项、unittest 14 项通过；dsh zip 自带 Node 测试 15/15 通过 |
+| 自检 / 测试 | selfcheck 22 项、unittest 15 项通过；dsh zip 自带 Node 测试 15/15 通过 |
 
 ## 三、快速开始
 
@@ -79,7 +79,7 @@ $env:PYTHONPATH = "E:\Jinyv-memory\src"
 # 离线自检：外部插件发现 + qqbot 闭环 + dsh 桥接
 python -m jinyv_memory.cli selfcheck
 
-# 14 项回归
+# 15 项回归
 python -m unittest discover -s tests -t . -v
 
 # 插件健康（含 dsh 特殊接入）
@@ -130,21 +130,21 @@ dsh 不是 Python 插件，加载器不会扫描它。核心侧 `integrations/ds
 - 旧 `deploy/install_storyboard.sh` → `scripts/install_storyboard.sh`。
 - 本轮 qqbot 适配层 → `E:\Jinyv-plugins\qqbot`。
 
-**独立仓库 / 适配层**
+**单一插件仓库 / 适配层**
 - qqbot：消息闭环、工具、钩子、定时任务、NoneBot 可选降级。
 - desktop-pet：`handle_hello/handle_text` + 健康检查；客户端在原仓库。
 - video-call：`memory_context/record_turn` + 健康检查；服务在原仓库。
 - dsh：核心桥接；第三方分镜只检测与安装。
 
 **未完成 / 受限**
-- QQ 旧能力（`richmsg / linkmeta / bili_live / reminder / owner_gate / asr / mcp_client / task_supervisor`、主动话题/命令/轮换）仍在旧仓库；qqbot 仓库已按顺序建立适配入口 `features/__init__.py`，但**源码没有复制**。执行环境安全策略仍拒绝整块复制旧实现，需要改为逐模块人工改写或引入 submodule。
-- 主仓库 `plugins/` 已删除实现副本，只保留 `plugins/README.md`。
+- 旧 `__init__.py` 中的主动话题/命令/轮换（`legacy_entry`）尚未复制；如需启用，把 `legacy_source_dir` 指向旧包目录作为回退。
+- 8 个能力的 NoneBot/富消息实际接线仍按 P2 逐模块对照，当前先保证可导入、可测试、最小闭环不回归。
 - 104 项旧回归、宿主 HTTP API、桌宠 WebSocket 服务、通话联调、部署脚本。
 
 ## 六、待确认决策
 
-1. **QQ 旧能力下一步**：适配入口已建，但旧源码不能复制。是否改为逐模块人工重写（不复制旧文件），或接受 submodule 引用旧仓库？
-2. **三个新插件仓库远程地址**：qqbot / desktop-pet / video-call 的 GitHub 仓库名与归属？
+1. **QQ 旧入口下一步**：8 个能力模块已迁入；主动话题/命令/轮换仍在旧 `__init__.py`，是否继续拆分为 `legacy/` 子模块？
+2. **插件仓库远程**：`https://github.com/YVFENGXS/jinyv-plugins` 尚不存在；请在 GitHub 创建空仓库后执行 README 中的 push 命令。
 3. **dsh 改造版安装**：继续用 zip（已支持 `dsh install`），还是后续提供 git 仓库？
 4. **dsh 同步策略**：已按确认改为 `dsh-wins`；`core-wins` 仅作为配置回退保留。是否需要人工合并队列待定。
 5. **是否合并到 `main`**：新架构已在 `refactor/plugin-core`；是否走 PR 合并，或继续保留分支。
