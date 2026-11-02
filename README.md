@@ -1,4 +1,4 @@
-﻿﻿﻿# Jinyu Memory
+﻿﻿﻿﻿# Jinyu Memory
 
 一套给 QQ 角色扮演机器人用的**分层记忆中间件**：把「最近聊了什么」「半个月前发生过什么」「必须一直记住的设定」分开存，并在 token 预算内按优先级拼进上下文。
 
@@ -12,8 +12,10 @@
 - 闲置 N 小时自动轮换会话，strict 承诺与长期事实跨会话继承
 - 时间感知：账本锚注入「当前时间/星期」，间隔 30 分钟～2 小时写「已过多久」，超过 2 小时直接写出上次发言的日期时间与差值（跨天会点明），热窗消息带日期与星期
 - 显著性排序：被反复记录（`mentions`）或被确认（`verified`）的事件卡在同分时优先
+- 可逆摘要：事件卡除摘要外存 1–3 句逐字原话（`quotes`），需要时按 `event_id` 用 `query_memory(detail="raw")` 回捞原文
+- 章节卡：Dream 把 30 天前的明细卡按会话/受众并成 T2 章节卡；明细卡保留，仍可展开
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
-- 95 项回归测试，不依赖任何 API key
+- 99 项回归测试，不依赖任何 API key
 
 ---
 
@@ -37,7 +39,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ（走 JinyuHost）
-├── tests/test_regression.py # 95 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
+├── tests/test_regression.py # 99 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── serve.py             # 宿主 HTTP 服务：/chat /remember /recall（零依赖）
@@ -48,10 +50,13 @@ jinyu-memory/
 │   └── benchmark-recall.svg # 评测图表
 ├── deploy/
 │   ├── install_plugin.sh
+│   ├── install_desktop_adapter.sh # 可选：装 desktop-v1 桌宠适配器（systemd）
 │   ├── install_storyboard.sh # 可选：装第三方视频分镜工具（不随仓库分发）
 │   └── qqbot.service
+├── desktop_server.py        # desktop-v1 WebSocket 适配器（可 Mock/真实模型）
 ├── bot.py                   # NoneBot2 启动入口
 ├── requirements.txt
+├── requirements-desktop.txt # 桌面适配器依赖（fastapi/uvicorn/websockets）
 └── .env.example
 ```
 
@@ -84,7 +89,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入等 95 项场景（服务器实测 18 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡等 99 项场景（服务器实测 18 秒）。
 
 ## 评测结果（可复现）
 
@@ -118,7 +123,18 @@ python tests/test_regression.py
 
 ### 前台指标（真实语料主私聊）
 
-60 条真实用户问句，48 条与参考记忆相关：回答准确率 **0.854** [0.728, 0.928]，3 条「记错」为参考记忆过期，剔除后 0.917；人设硬违规 0/60；延迟 p50 1.99 s / p95 4.95 s；平均 prompt 3852 token；承重度 0.158。
+60 条真实用户问句（48 条与参考记忆相关），同一次运行的三联指标：
+
+| 回答准确率 | 平均 prompt token | 延迟 p50 / p95 |
+|---|---|---|
+| **0.854** [0.728, 0.928] | 3852 | 1.99 s / 4.95 s |
+
+3 条「记错」为参考记忆过期，剔除后 0.917；人设硬违规 0/60；承重度 0.158。
+`python tools/eval_memory.py --real ...` 现在会直接打印这张表（token 用与线上水位线同一套本地估算）。
+
+> **外部基准 LongMemEval-S：未跑。** 仓库既不带该数据集，也不带官方 judge；没有可复现的判分脚本，
+> 所以不提供数字，也不把上表当成 LongMemEval 分数。要补这一项，需要自行下载数据集并接入 judge，
+> 再按同一口径（回答准确率 / 平均 prompt token / 延迟）记录。
 
 ### 显著性（mentions / verified）
 
@@ -153,7 +169,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 95 项回归
+python tests/test_regression.py                        # 99 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -185,6 +201,39 @@ $env:RP_FRONT_KEY="sk-..."; $env:RP_BACK_KEY="sk-..."; python examples\chat_cli.
 输入 `/new` 开新会话（同 continuity，跨会话记忆生效），`/quit` 退出并冲刷尾部归档。
 
 默认请求 `https://api.deepseek.com`，用 `RP_LLM_BASE` / `RP_FRONT_MODEL` / `RP_BACK_MODEL` 可换成任何 OpenAI 兼容服务。
+
+### 桌面桌宠：desktop-v1 适配器
+
+`desktop_server.py` 用同一套 `RPContextMiddleware` + `persona.py` 对外开一个 WebSocket（FastAPI + uvicorn），供 `rp-desktop-pet` 客户端连接。没有 `RP_FRONT_KEY` / `RP_BACK_KEY` 时自动用 Mock 模型，方便先跑通协议。
+
+本地直接跑：
+
+```powershell
+pip install -r requirements-desktop.txt
+$env:RP_FRONT_KEY="sk-..."; $env:RP_BACK_KEY="sk-..."
+python desktop_server.py --token dev-token
+# 健康检查 http://127.0.0.1:8787/desktop/v1/health → {"ok":true,"mode":"real"}
+```
+
+服务器上（systemd，密钥不复制，复用现有 `.env`）：
+
+```bash
+scp -i .deploy_key desktop_server.py ubuntu@HOST:/tmp/
+scp -i .deploy_key deploy/install_desktop_adapter.sh ubuntu@HOST:/tmp/
+ssh -i .deploy_key ubuntu@HOST "sed -i 's/\r$//' /tmp/install_desktop_adapter.sh && sudo bash /tmp/install_desktop_adapter.sh"
+```
+
+脚本装出 `rp-desktop.service`：`User=qqbot`、只监听 `127.0.0.1:8787`、`EnvironmentFile=/opt/qqbot/bot/.env`（模型密钥留在服务器上）。默认 `RP_DB=/opt/qqbot/data/rp_memory.db`、`RP_SESSION=qq-u3521544885`，桌宠直接读写 QQ 机器人主库，并与主私聊共用同一条会话（热窗口、事件卡、长期事实和 epoch 轮换规则都一致）；用 `RP_SESSION` 可以换成别的 `qq-u…` / `qq-g…` 会话。旧的 `desktop_memory.db` 保留在磁盘上但不再使用。端口与令牌写在 `/etc/rp-desktop.env`（600 root）。
+
+客户端在另一台机器时，用 SSH 隧道把服务器回环端口映射到本地：
+
+```bash
+ssh -N -L 127.0.0.1:8787:127.0.0.1:8787 -i .deploy_key ubuntu@HOST
+```
+
+回环连接可设 `RP_DESKTOP_TRUST_LOCAL=1` 免令牌（隧道本身即认证）；对外暴露时必须配 `RP_DESKTOP_TOKEN` 并加 TLS。桌宠客户端自己会拉起这条隐藏隧道（右键菜单里也能断开/重连），一般不需要手动开。
+
+渠道隔离：`desktop_server.py` 调模型时会在 `PERSONA["core"]` 后面追加一段「当前渠道：桌面桌宠」，允许模型在句首写 `[[act:动作词]]` / `[[mood:表情词]]`（词表与客户端 `body.js` 的 `KIT_MOTIONS` / `KIT_EXPRESSIONS` 一致）。`reply_filter` 在落库前把标记取出、清掉正文，只把动作塞进 `pet.say.actions`、把表情塞进首条气泡的 `emotion`；QQ 插件不追加这段说明，读到的历史也是纯文字，两边不会串味。
 
 ### 其它框架：JinyuHost 与 HTTP 写入通道
 

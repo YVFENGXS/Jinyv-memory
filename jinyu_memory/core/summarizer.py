@@ -65,6 +65,9 @@ PROMPT = """你是角色扮演记忆整理员。只输出一个 JSON 对象，�
     不是世界事实；写进长期记忆会让下一轮把「查不到」当成已确认的结论。这类内容
     一律不写进 durable_facts 或 claims。「知情」槽位只写对话里明确建立的知道 / 保密关系，
     拿不准对方是否知情就留空，不要用「不知道」占位。
+13. quotes：0-3 条对话里的原话，逐字摘录，不改写、不拼接、不补标点。
+    优先选带具体名词 / 称呼 / 数字 / 承诺的句子，每条 4-40 字；
+    不要摘角色自己的总结句，也不要编造；没有值得留的就填空数组。
 
 输出格式：
 {"summary":"一句话：谁因为什么做了什么",
@@ -74,6 +77,7 @@ PROMPT = """你是角色扮演记忆整理员。只输出一个 JSON 对象，�
  "durable_facts":[{"fact":"主人养了一只猫，叫团子","tags":["猫","团子","宠物"],
                    "category":"设定","importance":0.9,"ttl_hours":null,
                    "emotion":0.8,"authority":0.9,"speaker":"主人"}],
+ "quotes":["团子今天不吃鱼","是不是生病了？"],
  "entity_hooks":["..."],"rel_hooks":["..."],"knowledge_boundary":"both",
  "subject":"主人","importance":0.5,"precision":"normal","confidence":0.8}
 
@@ -94,7 +98,7 @@ REPAIR = "上一条回复不是合法的事件卡 JSON，问题：{err}。请只
 
 # 社交圈模式：多人共用一份记忆时，事实必须标清属于谁，否则「喜欢猫」会串人
 SOCIAL_RULE = """
-13. 这是多人社交圈：每条用户消息带「[群号]/[私聊] 昵称(QQ)：」前缀。durable_facts 每条
+14. 这是多人社交圈：每条用户消息带「[群号]/[私聊] 昵称(QQ)：」前缀。durable_facts 每条
     必须加 "about" 字段，填冒号前的说话人标签原词（形如「小明(12345)」，含括号里的 QQ，
     不要带群号或「私聊」）；与具体的人无关的公共事实填 ""。不要把两个人的事实合成一条。
 """
@@ -205,6 +209,14 @@ def validate(data):
     rel = _terms(data.get("rel_hooks", []), 5)
     if rel is None:
         return None, "rel_hooks_not_list"
+    quotes = data.get("quotes")
+    if quotes is not None and not isinstance(quotes, list):
+        return None, "quotes_not_list"
+    clean_quotes = []
+    for raw in quotes or []:
+        q = CTRL.sub("", str(raw)).strip().strip("「」『』\"'“”")
+        if 4 <= len(q) <= 40 and WORD.search(q) and q not in clean_quotes:
+            clean_quotes.append(q)
     boundary = data.get("knowledge_boundary", "both")
     if boundary not in BOUNDARIES:
         return None, f"knowledge_boundary_must_be:{'/'.join(BOUNDARIES)}"
@@ -295,6 +307,7 @@ def validate(data):
     out = {
         "summary": CTRL.sub("", summary).strip()[:200],
         "state_changes": sc,
+        "quotes": clean_quotes[:3],
         "entity_hooks": hooks,
         "rel_hooks": rel,
         "knowledge_boundary": boundary,
@@ -306,6 +319,11 @@ def validate(data):
     if data.get("durable_facts"):
         out["durable_facts"] = data["durable_facts"]
     return out, None
+
+
+def _quote_key(text):
+    """原话核验用：去空白与引号后做子串比对，避免模型改标点就被当成原话。"""
+    return re.sub(r"[\s\"'“”‘’「」『』（）()]+", "", str(text or ""))
 
 
 def summarize(back_llm, dialogue, open_promises=(), max_repair=1, social=False):
@@ -327,6 +345,11 @@ def summarize(back_llm, dialogue, open_promises=(), max_repair=1, social=False):
         else:
             fields, err = validate(data)
             if err is None:
+                # P1：quotes 必须是本段对话里真实出现的原话，改写/拼接的一律丢掉。
+                # 宁缺毋滥：没有通过核验就留空，不让模型编一句「原话」进库。
+                key = _quote_key(dialogue)
+                fields["quotes"] = [q for q in fields.get("quotes") or ()
+                                    if _quote_key(q) in key][:3]
                 return fields, None
         if attempt >= max_repair:
             break

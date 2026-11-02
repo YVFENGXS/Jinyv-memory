@@ -441,15 +441,27 @@ def card_date(card):
 
 
 def format_cards(cards, limit=200):
-    """按时间线升序输出事件卡，带日期前缀——模型能看出哪件事在前、哪件在后。"""
+    """按时间线升序输出事件卡，带日期与卡号前缀——模型能看出先后、也能指定展开哪张。
+
+    只有完整披露（full）的卡走这里；paraphrase / hint / silence 由
+    disclosure.render 输出固定句，永远不会碰到 quotes。原话是 P1 的「可逆摘要」：
+    摘要给骨架，quotes 补 1-3 句原声，避免模型把概括当成原话复述。
+    """
     lines = []
     for c in sorted(cards, key=lambda x: (x.get("turn_start") or 0, x.get("turn_end") or 0)):
         when = card_date(c)
+        eid = str(c.get("event_id") or "").strip()
+        span = f"t{c['turn_start']}-{c['turn_end']}"
+        tag = f"章节 {span}" if c.get("layer") == "chapter" else span
+        ref = f"[{tag}]{' ' + eid if eid else ''}"
         secret = "（此秘密仅角色自己知道，不得主动说破）" \
             if c.get("knowledge_boundary") == "self" else ""
-        lines.append(f"- {when + ' ' if when else ''}"
-                     f"[t{c['turn_start']}-{c['turn_end']}] "
-                     f"{clean_text(c['summary'], limit)}{secret}")
+        body = clean_text(c['summary'], limit)
+        quotes = c.get("quotes") or []
+        if quotes:
+            body += "（原话：" + "；".join(
+                f"「{clean_text(q, 40)}」" for q in quotes[:3]) + "）"
+        lines.append(f"- {when + ' ' if when else ''}{ref} {body}{secret}")
     return "\n".join(lines)
 
 

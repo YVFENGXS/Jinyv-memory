@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "id": "01HQ8Z5K3M9T2R5W7X1Y4C0B8A",
+  "type": "ack",
+  "ts": 1793427740000,
+  "seq": 5,
+  "payload": { "ref_id": "01HQ8Z8K3M9T2R5W7X1Y4C0B8A", "status": "rendered" }
+}

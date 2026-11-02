@@ -1,0 +1,4 @@
+# 桌面端 desktop-v1 适配器（与 QQ 插件无关，可单独安装）
+fastapi>=0.100
+uvicorn>=0.20
+websockets>=12,<16

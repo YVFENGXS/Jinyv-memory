@@ -23,6 +23,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 from hashlib import sha256
 from pathlib import Path
 
@@ -71,6 +72,15 @@ def wilson(k, n, z=1.96):
     c = (p + z * z / (2 * n)) / d
     h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
     return [round(max(0.0, c - h), 3), round(min(1.0, c + h), 3)]
+
+
+def pct(vals, p):
+    """延迟分位数：样本少时用最近秩，不插值，避免把一次冷启动摊成 p50。"""
+    if not vals:
+        return None
+    s = sorted(vals)
+    return s[min(len(s) - 1, max(0, int(round(p * (len(s) - 1)))))]
+
 
 # 剧本：10 张卡，覆盖修伞 / 遗物 / 保密 / 灯会 / 师兄 / 信 / 白鹤
 # 每张卡的 summary 里带一个唯一关键句，GT 用它判断命中。
@@ -979,6 +989,9 @@ def run(real=False, out=None, corpus="small", ablate=False,
         "answer_accuracy": None,
         "boundary_respect": None,
         "prompt_dependence": None,
+        "avg_prompt_tokens": None,
+        "latency_p50_ms": None,
+        "latency_p95_ms": None,
     }
 
     if real:
@@ -991,11 +1004,16 @@ def run(real=False, out=None, corpus="small", ablate=False,
             bound_n = 0
             dep_n = 0                  # 抽掉 top-1 卡后仍能答对的样本数 / 抽得动的样本数
             dep_keep = 0
+            lat_ms, ptoks = [], []     # 三联表：延迟只计主回答，不含消融的第二次调用
             by_id = {c["event_id"]: c for c in db.all_cards(sid, cid)}
             for q, gt, snippet, _ in cases:
                 msgs = mw._build_messages(PERSONA, sid, cid, upto=upto, query=q)
                 ask = msgs + [{"role": "user", "content": q}]
+                ptoks.append(rp.est_tokens(
+                    "\n".join(str(m.get("content") or "") for m in ask), mw.profile))
+                t0 = time.perf_counter()
                 ans = front.chat(ask, temperature=0.0, max_tokens=200)
+                lat_ms.append((time.perf_counter() - t0) * 1000)
                 row = rows[[r["q"] for r in rows].index(q)]
                 row["ans"] = " ".join(str(ans or "").split())[:120]
                 if gt in BOUNDARY:
@@ -1035,6 +1053,13 @@ def run(real=False, out=None, corpus="small", ablate=False,
                 result["prompt_dependence"] = round(1 - dep_keep / dep_n, 3)
                 result["prompt_dependence_ci"] = wilson(dep_n - dep_keep, dep_n)
                 result["dependence_cases"] = dep_n
+            # 三联表口径：同一批问句的「回答准确率 / 平均 prompt token / 延迟分位」。
+            # token 是本地估的（与线上水位线同一套 est_tokens），不是服务端计费值。
+            if ptoks:
+                result["avg_prompt_tokens"] = int(sum(ptoks) / len(ptoks))
+            if lat_ms:
+                result["latency_p50_ms"] = int(pct(lat_ms, 0.50))
+                result["latency_p95_ms"] = int(pct(lat_ms, 0.95))
         except Exception as exc:               # noqa: BLE001
             print(f"[warn] 真实模型评测跳过：{exc}")
 
@@ -1066,6 +1091,12 @@ def run(real=False, out=None, corpus="small", ablate=False,
             print(f"承重度={result['prompt_dependence']}"
                   f"（抽掉 top-1 记忆卡后答错的比例，{result.get('dependence_cases')} 条可抽样本）"
                   f" 95%CI={result.get('prompt_dependence_ci')}")
+        if result["latency_p50_ms"] is not None:
+            print("\n三联表（真实模型，同一批问句）")
+            print("  回答准确率  平均prompt token  延迟 p50 / p95")
+            print(f"  {result['answer_accuracy']}       {result['avg_prompt_tokens']}          "
+                  f"{result['latency_p50_ms'] / 1000:.2f}s / "
+                  f"{result['latency_p95_ms'] / 1000:.2f}s")
 
     if ablate and external:
         ra = real_ablate(db, sid, cid, upto, cases)

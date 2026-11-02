@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "id": "01HQ8Z3K3M9T2R5W7X1Y4C0B8A",
+  "type": "event.interaction",
+  "ts": 1793427720000,
+  "seq": 3,
+  "payload": {
+    "kind": "poke",
+    "position": { "x": 1180, "y": 740 },
+    "detail": { "count": 3, "duration_ms": 800 }
+  }
+}

@@ -725,6 +725,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS turns(
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, character_id TEXT NOT NULL,
   turn_idx INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
   created_at TEXT DEFAULT (datetime('now')), UNIQUE(session_id, character_id, turn_idx, role));
 CREATE INDEX IF NOT EXISTS idx_turns ON turns(session_id, character_id, turn_idx);
 CREATE TABLE IF NOT EXISTS event_cards(
@@ -967,6 +968,19 @@ def default_audience(sid: str) -> str:
     return ""
 
 
+SOURCE_LABELS = {"qq": "QQ", "desk": "桌宠", "video": "视频通话"}
+
+# 舞台指令（通话页/桌宠用）不该回到共享记忆：QQ 不认识 [[表情:..]]，会当正文发出去，
+# 模型也会照着历史继续写。渲染/归档时把这类标记剥掉，QQ 自己的 [[face:..]] 不动。
+STAGE_TAG_RE = re.compile(r"\[\[\s*(表情|动作|收起|重置|待机|转头|歪头|抬头|低头|点头)\s*[:：]?\s*[^\]]*\]\]")
+
+
+def source_label(src: str) -> str:
+    """写入/渲染用的来源标签；空值或未知来源不标，老数据不受影响。"""
+    name = SOURCE_LABELS.get(str(src or "").strip().lower())
+    return f"[{name}] " if name else ""
+
+
 def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=5.0)   # timeout 即 busy_timeout（秒）
     conn.row_factory = sqlite3.Row
@@ -996,6 +1010,13 @@ CARD_EXTRA_COLS = {
     "retracted_by": "TEXT NOT NULL DEFAULT ''",
     "revision": "INTEGER NOT NULL DEFAULT 1",
     "supersedes_id": "TEXT NOT NULL DEFAULT ''",
+    # 原话（P1）：后台摘要时顺手留 1-3 句对话原文，供完整披露时展开；
+    # 低等级披露永远读不到这一列。老行留空数组，不影响原有注入。
+    "quotes": "TEXT NOT NULL DEFAULT '[]'",
+    # 分层（P2）：event=普通事件卡，chapter=Dream 离线合并出的章节卡；
+    # covers 记下章节覆盖了哪些明细卡，便于幂等与审计。
+    "layer": "TEXT NOT NULL DEFAULT 'event'",
+    "covers": "TEXT NOT NULL DEFAULT '[]'",
 }
 
 # 长期事实的标签/热力/时效列：tags 供检索先筛，importance 做热力排序，
@@ -1028,11 +1049,12 @@ def _card(row) -> dict:
     """行 → 卡片 dict：JSON 列解析 + 新列兜底默认值（兼容阶段一的老行）。"""
     d = dict(row)
     d["state_changes"] = json.loads(d.get("state_changes") or "{}")
-    for k in ("entity_hooks", "rel_hooks", "conflict_flags"):
+    for k in ("entity_hooks", "rel_hooks", "conflict_flags", "quotes", "covers"):
         d[k] = json.loads(d.get(k) or "[]")
     d["importance"] = float(d.get("importance") or 0.5)
     d["knowledge_boundary"] = d.get("knowledge_boundary") or "both"
     d["precision"] = d.get("precision") or "normal"
+    d["layer"] = d.get("layer") or "event"
     d["mentions"] = int(d.get("mentions") or 0)
     d["verified"] = int(d.get("verified") or 0)
     d["bot_id"] = d.get("bot_id") or lane_bot(d.get("session_id") or "")
@@ -1048,8 +1070,8 @@ def _card(row) -> dict:
 INSERT_CARD = ("INSERT INTO event_cards(event_id,session_id,character_id,turn_start,turn_end,"
                "summary,state_changes,entity_hooks,rel_hooks,knowledge_boundary,importance,"
                "conflict_flags,precision,mentions,verified,bot_id,audience,subject,"
-               "revision,supersedes_id,idempotency_key)"
-               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+               "revision,supersedes_id,idempotency_key,quotes,layer,covers)"
+               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 
 
 def _card_params(card):
@@ -1068,9 +1090,12 @@ def _card_params(card):
             card.get("bot_id") or lane_bot(sid),
             card.get("audience") or default_audience(sid),
             card.get("subject") or "",
-            int(card.get("revision") or 1),
+            card.get("revision") or 1,
             card.get("supersedes_id") or "",
-            card["idempotency_key"])
+            card["idempotency_key"],
+            json.dumps(card.get("quotes") or [], ensure_ascii=False),
+            card.get("layer") or "event",
+            json.dumps(card.get("covers") or [], ensure_ascii=False))
 
 
 class DB:
@@ -1086,6 +1111,10 @@ class DB:
 
     @staticmethod
     def _migrate(conn):
+        # 对话轮补来源列：后加的列老行留空，读取时按「未知来源」渲染
+        ucols = {r["name"] for r in conn.execute("PRAGMA table_info(turns)")}
+        if "source" not in ucols:
+            conn.execute("ALTER TABLE turns ADD COLUMN source TEXT NOT NULL DEFAULT ''")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(event_cards)")}
         for name, decl in CARD_EXTRA_COLS.items():
             if name not in cols:
@@ -1146,10 +1175,11 @@ class DB:
         finally:
             conn.close()
 
-    def add_turn(self, sid, cid, idx, role, content):
+    def add_turn(self, sid, cid, idx, role, content, source=""):
         with self._c() as c:
-            c.execute("INSERT OR IGNORE INTO turns(session_id,character_id,turn_idx,role,content)"
-                      " VALUES(?,?,?,?,?)", (sid, cid, idx, role, content))
+            c.execute("INSERT OR IGNORE INTO turns(session_id,character_id,turn_idx,role,"
+                      "content,source) VALUES(?,?,?,?,?,?)",
+                      (sid, cid, idx, role, content, str(source or "")))
 
     def max_turn(self, sid, cid) -> int:
         cond, args = _sid_filter(sid)
@@ -1167,7 +1197,7 @@ class DB:
 
     def get_turns(self, sid, cid, lo=1, hi=None):  # 闭区间 [lo, hi]；hi=None 到最新
         cond, id_args = _sid_filter(sid)
-        sql = ("SELECT turn_idx, role, content, created_at FROM turns"
+        sql = ("SELECT turn_idx, role, content, source, created_at FROM turns"
                f" WHERE character_id=? AND {cond} AND turn_idx>=?")
         args = [cid] + id_args + [lo]
         if hi is not None:
@@ -1852,6 +1882,29 @@ class DB:
             c.execute("UPDATE dream_runs SET summary=? WHERE character_id=? AND day=?",
                       (str(summary)[:200], cid, str(day)))
 
+    def chapter_candidates(self, cid, before, limit=400):
+        """Dream 章节卡原料：早于 before 的明细卡（未撤回、未被章节覆盖）。"""
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT * FROM event_cards WHERE character_id=?"
+                " AND retracted_at IS NULL AND COALESCE(layer,'event')='event'"
+                " AND created_at<? ORDER BY session_id, turn_end LIMIT ?",
+                (cid, str(before), int(limit))).fetchall()
+        return [_card(r) for r in rows]
+
+    def chapter_covers(self, cid) -> set:
+        """已生成章节覆盖过的明细卡 id；避免 Dream 每天重复合并。"""
+        with self._c() as c:
+            rows = c.execute("SELECT covers FROM event_cards WHERE character_id=?"
+                             " AND COALESCE(layer,'event')='chapter'", (cid,)).fetchall()
+        out = set()
+        for r in rows:
+            try:
+                out.update(str(x) for x in json.loads(r["covers"] or "[]"))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def expire_temp_facts(self, cid, now="", dry_run=False):
         """过期临时事实退场：标记 retracted 而不是物理删除，保留审计痕迹。
 
@@ -2199,11 +2252,19 @@ class RPContextMiddleware:
         self.register_tool(
             "query_memory",
             "查询本会话的长期记忆（词条与历史事件）。主人问起过去的人、事、承诺，"
-            "而上下文里没写时，先查一次再回答；不要凭印象说「不记得」。",
+            "而上下文里没写时，先查一次再回答；不要凭印象说「不记得」。"
+            "如果只要摘要不够、想看当时原话，用 detail=raw + event 展开那一张卡；"
+            "event 填卡片方括号里的编号（如 E-ab12cd34）或轮次区间（如 t5-6）。"
+            "最多回 2 轮、约 400 token，只能展开当前主体在你这儿看得到的卡。",
             {"type": "object",
-             "properties": {"query": {"type": "string",
-                                      "description": "要查的人名、事情或约定关键词"}},
-             "required": ["query"]},
+             "properties": {
+                 "query": {"type": "string",
+                           "description": "要查的人名、事情或约定关键词"},
+                 "detail": {"type": "string", "enum": ["summary", "raw"],
+                            "description": "summary=摘要检索（默认）；raw=展开指定事件卡的原文"},
+                 "event": {"type": "string",
+                           "description": "事件卡编号（E-ab12cd34）或轮次区间（t5-6），配合 detail=raw"}},
+             "required": []},
             self._tool_query_memory)
         self.register_tool(
             "now",
@@ -2213,7 +2274,15 @@ class RPContextMiddleware:
             self._tool_now)
 
     def _tool_query_memory(self, args, sid, cid, ctx=None) -> str:
-        q = str((args or {}).get("query") or "").strip()
+        args = args or {}
+        q = str(args.get("query") or "").strip()
+        event = str(args.get("event") or "").strip()
+        detail = str(args.get("detail") or "").strip().lower()
+        if event or detail == "raw":
+            if not event:
+                return ("要展开原文需要 event：填事件卡方括号里的编号（如 E-ab12cd34），"
+                        "或轮次区间（如 t5-6）。")
+            return self._expand_event(event, sid, cid)
         if not q:
             return "缺少 query 参数。"
         lines = []
@@ -2233,9 +2302,59 @@ class RPContextMiddleware:
         cards = [c for _, c in hits]
         if cards:
             lines.append("相关事件：" + "；".join(
-                f"[t{c.get('turn_start')}-{c.get('turn_end')}] "
+                f"[t{c.get('turn_start')}-{c.get('turn_end')} {c.get('event_id')}] "
                 f"{retriever.clean_text(c.get('summary') or '', 160)}" for c in cards))
         return "\n".join(lines) or "没有查到相关记录。"
+
+    def _expand_event(self, ref, sid, cid) -> str:
+        """把某张事件卡按区间回捞成原文：只读、有上限、过受众与披露两道门。"""
+        try:
+            cards = self.db.all_cards(sid, cid)
+        except Exception as e:                    # noqa: BLE001
+            logger.warning("工具 query_memory 展开读卡失败 sid=%s：%s", sid, e)
+            return "读记忆失败，这次没展开。"
+        low = str(ref or "").strip().lower()
+        target = None
+        for c in cards:
+            eid = str(c.get("event_id") or "").strip().lower()
+            span = f"t{c.get('turn_start')}-{c.get('turn_end')}"
+            if low in (eid, eid[2:] if eid.startswith("e-") else eid,
+                       span, span[1:]):
+                target = c
+                break
+        if target is None:
+            return ("没有找到这张事件卡。只能展开当前主体在你这儿看得到的事件卡，"
+                    "编号见方括号（如 E-ab12cd34）或写轮次区间（如 t5-6）。")
+        ok, _ = self._injectable([target])
+        if not ok:
+            return "这张卡当前不可展开。"
+        scene = disclosure.scene_of(sid, is_owner=(lane_principal(sid) == "owner"))
+        level = ("full" if not disclosure.DISCLOSURE_ENABLED
+                 else disclosure.decide(target, scene, 1.0)[0])
+        if level != "full":
+            return "这张卡在当前场合只能模糊带过，不能展开原文。"
+        try:
+            turns = self.db.get_turns(target["session_id"], target["character_id"],
+                                      int(target["turn_start"]),
+                                      int(target["turn_end"]))
+        except Exception as e:                    # noqa: BLE001
+            logger.warning("工具 query_memory 展开原文失败 sid=%s：%s", sid, e)
+            return "读原文失败，这次没展开。"
+        if not turns:
+            return "这张卡对应的原文已经不在库里了。"
+        # 硬上限：最多 2 轮（4 条消息）、约 400 token（600 汉字），超出在句末收尾
+        picked, used = [], 0
+        for t in turns[:4]:
+            who = "瑾瑜" if t.get("role") == "assistant" else "对方"
+            line = f"[t{t.get('turn_idx')}] {who}：{str(t.get('content') or '')[:300]}"
+            if used + len(line) > 600:
+                picked.append("……（后略）")
+                break
+            picked.append(line)
+            used += len(line)
+        return (f"原始对话（事件卡 {target.get('event_id')}，"
+                f"t{target.get('turn_start')}-{target.get('turn_end')}）：\n"
+                + "\n".join(picked))
 
     def _tool_now(self, args, sid, cid, ctx=None) -> str:
         now = datetime.now().astimezone()
@@ -2334,19 +2453,22 @@ class RPContextMiddleware:
                            sid, cid, total, self.budget)
 
     def chat(self, user_input, persona, sid, cid, reply_filter=None,
-             tool_context=None, speaker="") -> str:
+             tool_context=None, speaker="", store_input=None, source="",
+             store_reply=None) -> str:
         self._sessions.add((sid, cid))
         # Gemini B2：DB 读失败不能让前台对话直接崩。降级为「人设 + 本轮输入」，
         # 异常计数 + 堆栈照常记录，DB 恢复后轮号取 DB 与本地兜底的较大值。
         user_stored = False
+        # 送模型的 prompt 与落库正文分开：通话提示词/屏幕实况不应污染共享记忆
+        stored_input = user_input if store_input is None else str(store_input or "")
         try:
             turn = max(self.db.max_turn(sid, cid), self._fallback_turn.get((sid, cid), 0)) + 1
-            self.db.add_turn(sid, cid, turn, "user", user_input)   # P0-4：回复前先落库
+            self.db.add_turn(sid, cid, turn, "user", stored_input, source)  # P0-4：回复前先落库
             user_stored = True
             if retriever.pin_intent(user_input):                   # 显式「记住这件事」
                 self._maybe_pin(sid, cid, user_input)
             msgs = self._build_messages(persona, sid, cid, upto=turn - 1,
-                                        query=user_input, speaker=speaker)
+                                        query=user_input, speaker=speaker, source=source)
         except Exception as e:
             self._unexpected_errors += 1
             self._last_error = f"{type(e).__name__}: {e}"
@@ -2355,7 +2477,10 @@ class RPContextMiddleware:
             msgs = [{"role": "system",
                      "content": persona["core"] + "\n" + _now_line()}]
         self._fallback_turn[(sid, cid)] = turn
-        msgs.append({"role": "user", "content": user_input})   # R1：只在末尾注入一次
+        # 当前这句也带来源：只标历史不标本轮，模型就分不清「现在是在哪个入口说话」
+        label = source_label(source)
+        msgs.append({"role": "user",
+                     "content": f"{label}{user_input}" if label else user_input})   # R1：只注入一次
         reply = self._guard_reply(msgs, persona, sid, cid, tool_context)
         if reply_filter is not None:          # 落库前清洗（如群聊里模型照抄「昵称：」前缀）
             try:
@@ -2366,7 +2491,13 @@ class RPContextMiddleware:
         # 否则这一轮会从记忆里凭空消失（2026-10-30 视频报告丢失事故）。
         if user_stored:
             try:
-                self.db.add_turn(sid, cid, turn, "assistant", reply)
+                stored_reply = reply
+                if store_reply is not None:      # 回包原样，落库只留干净正文（剥掉舞台指令）
+                    try:
+                        stored_reply = store_reply(reply) or reply
+                    except Exception:            # noqa: BLE001  清洗失败就按原样存
+                        stored_reply = reply
+                self.db.add_turn(sid, cid, turn, "assistant", stored_reply, source)
                 hi = turn - self.keep_recent
                 if hi >= 1:                                # R2：只投递 hi，批次由 worker 决定
                     self._last_hi[(sid, cid)] = max(self._last_hi.get((sid, cid), 0), hi)
@@ -2668,7 +2799,8 @@ class RPContextMiddleware:
                                    x[1].get("turn_end", 0)), reverse=True)
         return scored[:max(1, int(limit))]
 
-    def _build_messages(self, persona, sid, cid, upto=None, query="", speaker=""):
+    def _build_messages(self, persona, sid, cid, upto=None, query="", speaker="",
+                        source=""):
         lg, cursor = self._ledger(sid, cid), self.db.get_cursor(sid, cid)
         floor = max(cursor, self._floor.get((sid, cid), 0))   # 手术挤出过的轮次不再回到 prompt
         # 热对话 = 游标 / 手术 floor 之后、且不含当前轮（当前轮由调用方追加）
@@ -2932,14 +3064,27 @@ class RPContextMiddleware:
                 "不要编造细节。")
         recent, prev_dt = [], None                          # 热窗时间标注：见 _stamp / RECENT_GAP_SECONDS
         now = datetime.now().astimezone()
+        has_source = bool(source_label(source)) or any(
+            source_label(t.get("source")) for t in turns)
+        if has_source:
+            anchors[1]["content"] += (
+                "\n【来源标签】[QQ]/[桌宠]/[视频通话] 表示主人这次从哪个入口说的话，"
+                "都是同一位主人；三个入口共用这一份记忆。"
+                "标签只在主人说的话前面，你没有标签；回答不受入口影响，"
+                "也不要在回复里写出这些标签。")
         for t in turns:
             dt = _parse_utc(t.get("created_at"))
             gap = None if (dt is None or prev_dt is None) else (dt - prev_dt).total_seconds()
             gap_open = dt is not None and (gap is None or gap >= RECENT_GAP_SECONDS)
+            label = source_label(t.get("source")) if t["role"] == "user" else ""
+            content = t["content"]
+            if t["role"] == "assistant":
+                content = STAGE_TAG_RE.sub("", content or "").strip()
             if t["role"] == "user" and t["content"] and gap_open:
-                recent.append({"role": "user", "content": f"{_stamp(dt, now, gap)} {t['content']}"})
+                recent.append({"role": "user",
+                               "content": f"{_stamp(dt, now, gap)} {label}{t['content']}"})
             else:
-                recent.append({"role": t["role"], "content": t["content"]})
+                recent.append({"role": t["role"], "content": f"{label}{content}"})
             if dt is not None:
                 prev_dt = dt
         out, dropped, level = self._fit(anchors, sections, recent, sid, cid)
@@ -3605,7 +3750,10 @@ class RPContextMiddleware:
             if turns:                                  # 区间为空则跳过后台调用，直接推进游标
                 lg = copy.deepcopy(self._ledger(sid, cid))   # 在副本上算，事务成功才换入
                 promise.ensure_shape(lg)
-                dialogue = "\n".join(f"{t['role']}: {t['content']}" for t in turns)
+                dialogue = "\n".join(
+                    f"{source_label(t.get('source'))}{t['role']}: "
+                    f"{STAGE_TAG_RE.sub('', t['content'] or '').strip() if t['role'] == 'assistant' else t['content']}"
+                    for t in turns)
                 fields, err = summarize(self.back, dialogue,          # 一次自修复重试（决策 4）
                                         promise.prompt_lines(lg),      # E：候选承诺 ID 清单
                                         social=self.social)            # 社交圈：事实带 about
@@ -3632,6 +3780,7 @@ class RPContextMiddleware:
                     "session_id": sid, "character_id": cid, "turn_start": lo, "turn_end": hi,
                     "summary": fields["summary"],
                     "state_changes": fields["state_changes"],
+                    "quotes": fields.get("quotes") or [],
                     "entity_hooks": fields["entity_hooks"],
                     "rel_hooks": fields["rel_hooks"],
                     "knowledge_boundary": fields["knowledge_boundary"],

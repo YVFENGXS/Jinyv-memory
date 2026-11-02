@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "id": "01HQ8Z7K3M9T2R5W7X1Y4C0B8A",
+  "type": "hello.ack",
+  "ts": 1793427695000,
+  "seq": 0,
+  "device_id": "dev_01HQ8Z7K3M9T2R5W7X1Y4C0B8",
+  "payload": {
+    "session": "s_01HQ8Z8K3M9T2R5W7X1Y4C0B8",
+    "primary": true,
+    "server_time": 1793427695000,
+    "heartbeat_s": 30,
+    "protocol": "desktop-v1",
+    "limits": { "downlink_per_min": 60, "input_per_sec": 1, "proactive_per_hour": 6 },
+    "figures": ["whale"]
+  }
+}

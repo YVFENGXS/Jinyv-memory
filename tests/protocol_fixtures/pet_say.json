@@ -1,0 +1,20 @@
+{
+  "v": 1,
+  "id": "01HQ8Z8K3M9T2R5W7X1Y4C0B8A",
+  "type": "pet.say",
+  "ts": 1793427750000,
+  "seq": 1,
+  "device_id": "dev_01HQ8Z7K3M9T2R5W7X1Y4C0B8",
+  "payload": {
+    "msg_id": "m_01HQ8Z9K3M9T2R5W7X1Y4C0B8",
+    "reply_to": "01HQ8Z1K3M9T2R5W7X1Y4C0B8A",
+    "display_no": 812,
+    "bubbles": [
+      { "text": "你回来啦。", "emotion": "happy", "delay_ms": 0, "tts_url": null },
+      { "text": "今天……还好吗？", "emotion": "shy", "delay_ms": 900, "tts_url": "https://example.invalid/tts/one-time-token" }
+    ],
+    "actions": ["wave"],
+    "priority": 1,
+    "ttl_ms": 300000
+  }
+}

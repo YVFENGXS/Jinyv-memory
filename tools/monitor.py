@@ -2,7 +2,8 @@
 """本地观测终端：在你自己的电脑上透视云服务器上的机器人。
 
 用法（在仓库根目录）：
-    python tools/monitor.py follow      实时滚动：谁在说话 / 前台生成了什么 / 后台归纳了什么
+    python tools/monitor.py follow      实时滚动：QQ / 桌宠 / 视频通话的消息与回复、
+                                        前台生成、后台归纳（三类来源带标签区分）
     python tools/monitor.py status      服务状态：systemd / NapCat / WS 连接 / 最近活动 / 报错数
     python tools/monitor.py sessions    记忆台账：每个会话的轮数、卡片数、承诺、热窗口、失败
     python tools/monitor.py qr          拉取最新登录二维码并自动打开（等刷新，约 1~2 分钟）
@@ -19,6 +20,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 HOST = os.environ.get("RP_SSH_HOST", "")
@@ -59,10 +61,17 @@ def ssh(script: str, timeout: int = 90) -> str:
 
 # ---------------------------------------------------------------- follow
 
-def _classify(line: str) -> str:
+def _classify(line: str, unit: str = "") -> str:
     """一行日志 → 带颜色的展示行。"""
+    if line.startswith("[desktop] ") or line.startswith("[call] "):
+        if "瑾瑜" in line:
+            return paint(line, "green")
+        return paint(line, "white", "bold")
     if "[jinyu]" in line:
         for kw, style in (("前台生成", ("green",)), ("归纳完成", ("cyan",)),
+                          ("跨窗口已发送", ("green",)),
+                          ("say_in 排好", ("cyan",)),
+                          ("say_in 未发送", ("yellow",)),
                           ("会话轮换", ("cyan",)), ("继承", ("cyan",)),
                           ("贴纸入库", ("cyan",)), ("connected", ("cyan",))):
             if kw in line:
@@ -82,19 +91,65 @@ def _classify(line: str) -> str:
     return line
 
 
+FOLLOW_LABELS = {UNIT: "QQ", "rp-desktop": "桌宠", "rp-call": "通话"}
+FOLLOW_STYLES = {UNIT: ("cyan",), "rp-desktop": ("yellow",), "rp-call": ("green",)}
+
+
+def _journal(raw: bytes):
+    """journalctl -o json 的一行 → (unit, 时间, 正文)；坏行返回 None。"""
+    try:
+        rec = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    unit = str(rec.get("_SYSTEMD_UNIT") or "").split(".")[0]
+    msg = rec.get("MESSAGE") or ""
+    if isinstance(msg, list):
+        msg = "".join(str(x) for x in msg)
+    try:
+        ts = datetime.fromtimestamp(
+            int(rec.get("__REALTIME_TIMESTAMP") or 0) / 1e6).strftime("%H:%M:%S")
+    except (ValueError, OSError, OverflowError):
+        ts = "--:--:--"
+    return unit, ts, str(msg)
+
+
+def _keep(unit: str, msg: str) -> bool:
+    """桌宠/通话只留人话与错误，过滤 uvicorn 的访问日志与通话状态轮询。"""
+    if unit not in (UNIT, "rp-desktop", "rp-call"):
+        return False
+    if msg.startswith("INFO:"):
+        return False
+    if unit == "rp-call":
+        return msg.startswith("[call]") or "ERROR" in msg or "Traceback" in msg
+    if unit == "rp-desktop":
+        return (msg.startswith("[desktop]") or "ERROR" in msg
+                or "Traceback" in msg)
+    return True
+
+
 def cmd_follow() -> None:
+    units = [UNIT, "rp-desktop", "rp-call"]
+    uargs = " ".join(f"-u {u}" for u in units)
     cmd = ["ssh", "-i", KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=NUL",
-           f"{USER}@{HOST}", f"sudo journalctl -u {UNIT} -f -n 40 -o cat"]
-    print(paint(f"实时观测 {USER}@{HOST}（Ctrl+C 退出）", "bold"))
+           f"{USER}@{HOST}", f"sudo journalctl {uargs} -f -n 60 -o json"]
+    print(paint(f"实时观测 {USER}@{HOST}：QQ / 桌宠 / 视频通话（Ctrl+C 退出）", "bold"))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL)
     assert p.stdout is not None
     try:
         for raw in p.stdout:
-            line = raw.decode("utf-8", "replace").rstrip("\r\n")
-            if line:
-                print(_classify(line))
+            item = _journal(raw)
+            if not item:
+                continue
+            unit, ts, msg = item
+            if not msg or not _keep(unit, msg):
+                continue
+            label = paint(f"[{FOLLOW_LABELS.get(unit, unit[:4])}]",
+                          *FOLLOW_STYLES.get(unit, ("dim",)))
+            print(f"{paint(ts, 'dim')} {label} {_classify(msg, unit)}", flush=True)
     except KeyboardInterrupt:
         pass
     finally:

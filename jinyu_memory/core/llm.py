@@ -118,6 +118,32 @@ def _messages_brief(messages):
                      for m in messages if isinstance(m, dict))
 
 
+def cache_stats(usage) -> dict:
+    """把服务商 usage 里的缓存字段压成统一字典；没有就返回空。
+
+    DeepSeek 给 prompt_cache_hit_tokens / prompt_cache_miss_tokens，
+    OpenAI 系给 prompt_tokens_details.cached_tokens。只用于观测，
+    不参与任何生成或计费决策；字段缺失时静默跳过，不报错。
+    """
+    usage = usage if isinstance(usage, dict) else {}
+    out = {}
+    for key in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "prompt_tokens"):
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            out[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        try:
+            out["cached_tokens"] = int(details["cached_tokens"])
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def retry_delay(attempt, retry_after=None):
     """指数退避 + 抖动；服务端明确给了 Retry-After 就照它（都封顶 30s）。"""
     if retry_after is not None:
@@ -206,6 +232,16 @@ class LLM:
                 with urllib.request.urlopen(self._req(payload, want),
                                             timeout=self.timeout) as r:
                     body = json.loads(r.read().decode())
+                cs = cache_stats(body.get("usage"))
+                hit, miss = cs.get("prompt_cache_hit_tokens"), cs.get("prompt_cache_miss_tokens")
+                if hit is not None or miss is not None:
+                    total = (hit or 0) + (miss or 0)
+                    rate = ((hit or 0) / total * 100) if total else 0.0
+                    logger.info("[jinyu] 缓存命中 模型=%s hit=%s miss=%s 命中率=%.1f%%",
+                                self.model, hit or 0, miss or 0, rate)
+                elif cs.get("cached_tokens") is not None:
+                    logger.info("[jinyu] 缓存命中 模型=%s cached=%s",
+                                self.model, cs["cached_tokens"])
                 choice = body["choices"][0]
                 message = choice.get("message") or {}
                 content = (message.get("content") or "").strip()
