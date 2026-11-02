@@ -55,8 +55,9 @@ def _union(cards, key, limit):
 def _chapter_summary(cards, limit=240):
     """章节正文只做「日期 + 各明细首句」的确定性拼接，不调模型、不新增信息。
 
-    预算按卡数均分：切章后一般 8-10 张，每张都能分到至少 20 字，
-    不会出现「前几张写满 240 字、后半段完全没信息」。
+    预算按卡数均分，并且先把日期前缀「MM-DD」（7 字）、分隔符「；」和可能的
+    省略号扣掉：切章后一般 8-12 张，每张都能分到一段正文，不会因为前缀占位
+    把最后几张挤掉。
     """
     rows = []
     for card in cards:
@@ -65,7 +66,8 @@ def _chapter_summary(cards, limit=240):
             rows.append((_mmdd(card.get("created_at")), text))
     if not rows:
         return ""
-    share = max(20, (limit - 24) // len(rows))
+    overhead = sum(7 for when, _ in rows if when) + len(rows) - 1 + 1
+    share = max(8, (limit - overhead) // len(rows))
     parts = [f"「{when}」{text[:share]}" if when else text[:share]
              for when, text in rows]
     text = "；".join(parts)
@@ -101,21 +103,29 @@ def _chapter_cards_sql(db, cid, cutoff):
 
 
 def _chapter_cards_py(db, cid, cutoff):
-    """老 SQLite 没有 JSON1 时的回退：逐页取、在 Python 里跳过 covers。"""
+    """老 SQLite 没有 JSON1 时的回退：用 keyset 往后翻，在 Python 里跳过 covers。
+
+    不能按 offset 翻页：如果前几千张都已覆盖，offset 会永远停在同一段覆盖区。
+    keyset 用上一页最后一行的 (session_id, turn_end, event_id) 作游标，
+    被过滤掉的覆盖卡不会挡住后面的新卡；上限按「收集到的未覆盖卡数」计。
+    """
     covers = db.chapter_covers(cid)
-    cards, offset, capped = [], 0, False
+    cards, after, capped = [], None, False
     while True:
-        page = db.chapter_candidates(cid, cutoff, limit=CHAPTER_LIMIT, offset=offset,
-                                     skip_covered=False)
+        page = db.chapter_candidates(cid, cutoff, limit=CHAPTER_LIMIT, offset=0,
+                                     skip_covered=False, after=after)
         if not page:
             break
         cards.extend(c for c in page if c["event_id"] not in covers)
-        if len(page) < CHAPTER_LIMIT:
-            break
-        offset += CHAPTER_LIMIT
-        if offset >= CHAPTER_SCAN:
+        if len(cards) >= CHAPTER_SCAN:
+            cards = cards[:CHAPTER_SCAN]
             capped = True
             break
+        if len(page) < CHAPTER_LIMIT:
+            break
+        last = page[-1]
+        after = (last.get("session_id"), int(last.get("turn_end") or 0),
+                 last.get("event_id"))
     return cards, capped
 
 
@@ -165,6 +175,10 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
         # 每章最多 CHAPTER_GROUP_MAX 张，保证摘要能覆盖到这一段的头尾。
         chunks = [group[i:i + CHAPTER_GROUP_MAX]
                   for i in range(0, len(group), CHAPTER_GROUP_MAX)]
+        # 尾块不足 min_cards（比如 11 张切成 10+1）时并进上一章，
+        # 否则最后那 1-2 张每轮都凑不够数，永远成不了章节。
+        if len(chunks) > 1 and len(chunks[-1]) < min_cards:
+            chunks[-2].extend(chunks.pop())
         for chunk in chunks:
             if stats["chapters"] >= max_chapters:
                 break

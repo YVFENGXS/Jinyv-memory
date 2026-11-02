@@ -1889,13 +1889,17 @@ class DB:
             c.execute("UPDATE dream_runs SET summary=? WHERE character_id=? AND day=?",
                       (str(summary)[:200], cid, str(day)))
 
-    def chapter_candidates(self, cid, before, limit=400, offset=0, skip_covered=True):
-        """Dream 章节卡原料：早于 before 的明细卡，按 event_id 稳定分页。
+    def chapter_candidates(self, cid, before, limit=400, offset=0, skip_covered=True,
+                           after=None):
+        """Dream 章节卡原料：早于 before 的明细卡，按 (session_id, turn_end, event_id) 稳定分页。
 
         skip_covered=True 时直接在 SQL 里排除已被章节卡 covers 覆盖的明细卡，
         不再靠 Python 逐页过滤——否则最早的一批卡全被覆盖后，offset 永远翻不到新区间。
         该过滤依赖 SQLite 的 json_each；老库没有 JSON1 会抛 OperationalError，
         由调用方回退到 Python 过滤。
+
+        after=(session_id, turn_end, event_id) 走 keyset 翻页：跳过这个游标之前的行，
+        适合「取回后还要在 Python 里过滤」的回退路径，不会像 offset 那样卡在覆盖区。
         """
         sql = ("SELECT * FROM event_cards WHERE character_id=?"
                " AND retracted_at IS NULL AND COALESCE(layer,'event')='event'"
@@ -1906,7 +1910,13 @@ class DB:
                     " json_each(COALESCE(ch.covers,'[]'))"
                     " WHERE ch.character_id=? AND COALESCE(ch.layer,'event')='chapter')")
             params.append(cid)
-        # event_id 做 tie-breaker：session_id/turn_end 相同也能保证 offset 翻页不重不漏
+        if after:
+            sid, turn_end, eid = after
+            sql += (" AND (session_id>? OR (session_id=? AND (turn_end>?"
+                    " OR (turn_end=? AND event_id>?))))")
+            turn_end = int(turn_end or 0)
+            params.extend([sid, sid, turn_end, turn_end, str(eid)])
+        # event_id 做 tie-breaker：session_id/turn_end 相同也能保证翻页不重不漏
         sql += " ORDER BY session_id, turn_end, event_id LIMIT ? OFFSET ?"
         with self._c() as c:
             rows = c.execute(sql, (*params, int(limit), max(0, int(offset)))).fetchall()

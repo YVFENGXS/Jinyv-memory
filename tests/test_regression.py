@@ -3661,6 +3661,53 @@ def test_chapter_lane_grouping():
     print("R88 章节车道分组: OK 跨 epoch 合并 / 日期取覆盖期最后一天")
 
 
+def _chapter_cover_set(db, sid, cid):
+    return {eid for c in db.all_cards(sid, cid) if c.get("layer") == "chapter"
+            for eid in c.get("covers") or []}
+
+
+def test_chapter_scan_cap_advances():
+    """R90：扫描触顶标 scan_capped 且下一轮继续往后覆盖；
+    无 JSON1 的 Python 回退用 keyset 越过整段已覆盖的卡。"""
+    db = fresh("/tmp/rp_chapter_cap.db")
+    for i in range(500):
+        db.insert_card(_card(event_id=f"E-{i:04d}", turn_start=i * 2 + 1,
+                             turn_end=i * 2 + 2, summary=f"旧事 {i}",
+                             created_at="2026-01-01 00:00:00",
+                             idempotency_key=f"cap{i}"))
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    saved = (dream.CHAPTER_LIMIT, dream.CHAPTER_SCAN)
+    dream.CHAPTER_LIMIT, dream.CHAPTER_SCAN = 400, 400
+    try:
+        first = dream.chapterize(db, "c1", days=30, min_cards=3, max_chapters=2, now=now)
+        assert first["scan_capped"] is True, first
+        assert first["chapters"] == 2, first
+        first_covers = _chapter_cover_set(db, "s1", "c1")
+        second = dream.chapterize(db, "c1", days=30, min_cards=3, max_chapters=2, now=now)
+        assert second["chapters"] == 2, second
+        assert second["scan_capped"] is True, second
+        more_covers = _chapter_cover_set(db, "s1", "c1") - first_covers
+        assert more_covers, "触顶后下一轮应覆盖到新的卡，不能原地饿死"
+        # 模拟无 JSON1 的回退路径：前 400 张全在覆盖区，keyset 仍能取到后面的卡
+        dream.CHAPTER_LIMIT, dream.CHAPTER_SCAN = 400, 1000
+        cards, capped = dream._chapter_cards_py(db, "c1", "2026-10-03 00:00:00")
+        assert not capped, "500 张里只需翻两页，不应触顶"
+        assert {c["event_id"] for c in cards} == {
+            f"E-{i:04d}" for i in range(500)} - _chapter_cover_set(db, "s1", "c1")
+        # 11 张切成 10+1 时，尾块并进上一章，不能把最后 1 张丢掉
+        db2 = fresh("/tmp/rp_chapter_tail.db")
+        for i in range(11):
+            db2.insert_card(_card(event_id=f"E-t{i:02d}", turn_start=i * 2 + 1,
+                                  turn_end=i * 2 + 2, summary=f"旧事 {i}",
+                                  created_at="2026-01-01 00:00:00",
+                                  idempotency_key=f"tail{i}"))
+        tail = dream.chapterize(db2, "c1", days=30, min_cards=3, max_chapters=5, now=now)
+        assert tail["chapters"] == 1 and tail["cards"] == 11, tail
+    finally:
+        dream.CHAPTER_LIMIT, dream.CHAPTER_SCAN = saved
+    print("R90 章节扫描上限: OK 触顶标记 / 下一轮继续推进 / 回退 keyset / 尾块并入")
+
+
 def test_desktop_remote_smoke():
     """R89：桌宠/通话 remote 模式冒烟——健康检查、Bearer 鉴权、不直连主库。"""
     try:
@@ -3759,7 +3806,8 @@ if __name__ == "__main__":
                test_host_http_helpers, test_web_search_parse, test_raw_expand_event,
                test_quotes_and_cache_telemetry, test_dream_chapter_cards,
                test_dream_chapter_paging, test_dream_chapter_failure_releases,
-               test_chapter_lane_grouping, test_desktop_remote_smoke,
+               test_chapter_lane_grouping, test_chapter_scan_cap_advances,
+               test_desktop_remote_smoke,
                test_chat_stores_reply_when_context_build_fails):
         fn()
     print("\nall regression tests passed")
