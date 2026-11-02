@@ -1070,8 +1070,9 @@ def _card(row) -> dict:
 INSERT_CARD = ("INSERT INTO event_cards(event_id,session_id,character_id,turn_start,turn_end,"
                "summary,state_changes,entity_hooks,rel_hooks,knowledge_boundary,importance,"
                "conflict_flags,precision,mentions,verified,bot_id,audience,subject,"
-               "revision,supersedes_id,idempotency_key,quotes,layer,covers)"
-               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+               "revision,supersedes_id,idempotency_key,quotes,layer,covers,created_at)"
+               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+               " COALESCE(NULLIF(?,''), datetime('now')))")
 
 
 def _card_params(card):
@@ -1090,12 +1091,13 @@ def _card_params(card):
             card.get("bot_id") or lane_bot(sid),
             card.get("audience") or default_audience(sid),
             card.get("subject") or "",
-            card.get("revision") or 1,
+            int(card.get("revision") or 1),
             card.get("supersedes_id") or "",
             card["idempotency_key"],
             json.dumps(card.get("quotes") or [], ensure_ascii=False),
             card.get("layer") or "event",
-            json.dumps(card.get("covers") or [], ensure_ascii=False))
+            json.dumps(card.get("covers") or [], ensure_ascii=False),
+            str(card.get("created_at") or ""))
 
 
 class DB:
@@ -1604,9 +1606,14 @@ class DB:
                              (sid, cid)).fetchone()[0]
 
     def card_rows(self, sid, cid, limit=500):
-        """事件卡合并用：本会话全部卡，按时间线升序（旧→新）。"""
+        """事件卡合并用：本会话明细卡，按时间线升序（旧→新）。
+
+        只取 layer='event'：章节卡是索引，不能被管理员合并当成普通卡删掉，
+        否则 covers/layer 一起丢失。
+        """
         with self._c() as c:
             rows = c.execute("SELECT * FROM event_cards WHERE session_id=? AND character_id=?"
+                             " AND COALESCE(layer,'event')='event'"
                              " ORDER BY turn_start, turn_end LIMIT ?",
                              (sid, cid, max(2, int(limit)))).fetchall()
         return [_card(r) for r in rows]
@@ -1882,14 +1889,14 @@ class DB:
             c.execute("UPDATE dream_runs SET summary=? WHERE character_id=? AND day=?",
                       (str(summary)[:200], cid, str(day)))
 
-    def chapter_candidates(self, cid, before, limit=400):
-        """Dream 章节卡原料：早于 before 的明细卡（未撤回、未被章节覆盖）。"""
+    def chapter_candidates(self, cid, before, limit=400, offset=0):
+        """Dream 章节卡原料：早于 before 的明细卡，支持分页（offset 翻过已覆盖区间）。"""
         with self._c() as c:
             rows = c.execute(
                 "SELECT * FROM event_cards WHERE character_id=?"
                 " AND retracted_at IS NULL AND COALESCE(layer,'event')='event'"
-                " AND created_at<? ORDER BY session_id, turn_end LIMIT ?",
-                (cid, str(before), int(limit))).fetchall()
+                " AND created_at<? ORDER BY session_id, turn_end LIMIT ? OFFSET ?",
+                (cid, str(before), int(limit), max(0, int(offset)))).fetchall()
         return [_card(r) for r in rows]
 
     def chapter_covers(self, cid) -> set:
@@ -2333,6 +2340,16 @@ class RPContextMiddleware:
                  else disclosure.decide(target, scene, 1.0)[0])
         if level != "full":
             return "这张卡在当前场合只能模糊带过，不能展开原文。"
+        if target.get("layer") == "chapter":
+            # 章节卡是索引。按区间回捞只会拿到那两轮原文，不是章节里的具体事件；
+            # 直接把 covers 目录给模型，让它自己挑一张明细卡再展开。
+            covers = [str(x).strip() for x in (target.get("covers") or []) if str(x).strip()]
+            if not covers:
+                return "这是章节卡，但没有记录覆盖的明细卡。"
+            shown = "、".join(covers[:8])
+            tail = f"（共 {len(covers)} 张）" if len(covers) > 8 else ""
+            return (f"章节卡 {target.get('event_id')} 只做索引，不直接展开原文。"
+                    f"可以再展开其中一张明细卡：{shown}{tail}。")
         try:
             turns = self.db.get_turns(target["session_id"], target["character_id"],
                                       int(target["turn_start"]),

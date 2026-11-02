@@ -70,12 +70,18 @@ TOKEN = _cli("--token", os.environ.get("RP_DESKTOP_TOKEN", "dev-token"))
 # 服务只监听回环、客户端经 SSH 隧道进来时，可不开令牌（隧道本身即认证）
 TRUST_LOCAL = os.environ.get("RP_DESKTOP_TRUST_LOCAL", "") in ("1", "true", "yes")
 DB_PATH = os.environ.get("RP_DB", str(ROOT / "desktop_memory.db"))
-# 与 QQ 插件共用同一条记忆：默认接主私聊的会话（可用 RP_SESSION 换成别的 qq-u/qq-g）
+# 与 QQ 插件共用同一条记忆：必须显式指定接哪个会话，不再猜默认号码
 CID = "jinyu"
-BASE_SESSION = os.environ.get("RP_SESSION", "qq-u3521544885").strip() or "qq-u3521544885"
+BASE_SESSION = (os.environ.get("RP_SESSION") or "").strip()
+if not BASE_SESSION:
+    raise SystemExit("[desktop] 缺少 RP_SESSION：写要与 QQ 共用哪个会话（如 qq-u10001 / qq-g100001）")
 # 设了 RP_HOST_BASE + RP_HOST_TOKEN 就走 QQ 进程里的宿主接口，本进程不再碰 SQLite
 HOST_BASE = (os.environ.get("RP_HOST_BASE") or "").rstrip("/")
 HOST_TOKEN = (os.environ.get("RP_HOST_TOKEN") or "").strip()
+# 明确用 RP_DB 又没配宿主接口 = 两个进程直连同一个库，归档游标会互抢。
+# 独立本地库联调时设 RP_ALLOW_LOCAL_DB=1 显式放行。
+ALLOW_LOCAL_DB = (os.environ.get("RP_ALLOW_LOCAL_DB") or "").strip().lower() in {
+    "1", "true", "yes"}
 # 跨窗口推送：QQ 插件经本机 POST /desktop/v1/say 让瑾瑜在桌宠气泡里说话
 WIN_TOKEN = str(os.environ.get("RP_WIN_TOKEN") or "").strip()
 
@@ -94,6 +100,13 @@ def _brief(text, limit=300):
 
 def host_configured() -> bool:
     return bool(HOST_BASE and HOST_TOKEN)
+
+
+if not host_configured() and os.environ.get("RP_DB") and not ALLOW_LOCAL_DB:
+    raise SystemExit(
+        "[desktop] 检测到 RP_DB 但没有 RP_HOST_BASE / RP_HOST_TOKEN："
+        "桌宠进程不能直接读写 QQ 主库（同一个库只能有一个归档进程）。"
+        "请改配宿主接口；确实要用独立本地库联调时设 RP_ALLOW_LOCAL_DB=1。")
 
 
 async def host_chat(text, source, hint=""):

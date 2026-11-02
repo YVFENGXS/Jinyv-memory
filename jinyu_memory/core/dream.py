@@ -9,12 +9,18 @@ from __future__ import annotations
 import hashlib, logging, os, uuid
 from datetime import datetime, timedelta, timezone
 
+from rp_skeleton import lane_base
+
 logger = logging.getLogger("rp_memory")
 
 DEFAULT_AT = (3, 30)          # 本地时间 03:30
 CHAPTER_DAYS = max(1, int(os.environ.get("RP_CHAPTER_DAYS") or 30))
 CHAPTER_MIN = max(2, int(os.environ.get("RP_CHAPTER_MIN") or 3))
 CHAPTER_MAX = max(1, int(os.environ.get("RP_CHAPTER_MAX") or 4))
+# 单页取 400 张；已覆盖的卡靠 offset 翻页跳过，避免「最早 400 张全被覆盖后
+# 第 401 张永远取不到」。扫描上限防止一次整理把整库翻一遍。
+CHAPTER_LIMIT = max(1, int(os.environ.get("RP_CHAPTER_LIMIT") or 400))
+CHAPTER_SCAN = max(CHAPTER_LIMIT, int(os.environ.get("RP_CHAPTER_SCAN") or 8000))
 
 
 def next_run(now=None, at=DEFAULT_AT):
@@ -58,12 +64,29 @@ def _chapter_summary(cards, limit=240):
     return text
 
 
+def _chapter_cards(db, cid, cutoff, covers):
+    """分页取候选并跳过已覆盖卡：fixes 固定 LIMIT 400 后永远看不到第 401 张。"""
+    cards, offset = [], 0
+    while offset < CHAPTER_SCAN:
+        page = db.chapter_candidates(cid, cutoff, limit=CHAPTER_LIMIT, offset=offset)
+        if not page:
+            break
+        cards.extend(c for c in page if c["event_id"] not in covers)
+        if len(page) < CHAPTER_LIMIT:
+            break
+        offset += CHAPTER_LIMIT
+    return cards
+
+
 def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
                dry_run=False, now=None):
     """把足够老的明细卡合成章节卡（T2）。
 
-    安全边界：只合并同一 (session_id, audience, bot_id, knowledge_boundary) 的卡，
+    安全边界：只合并同一 (车道, audience, bot_id, knowledge_boundary) 的卡，
     不同受众/边界绝不混章；明细卡保留不删（可继续展开原文），章节只做粗索引。
+    分组按车道基键（lane_base）而不是带 #epoch 的会话 id：48 小时轮换不会把
+    一段旧事切成十几组。章节卡的 created_at 取被覆盖卡的最大时间，渲染日期
+    跟着「事件发生的那段」走，而不是「生成本身的那天」。
     幂等：covers 记录已覆盖的明细卡，重复跑不会重复合并。
     """
     days = CHAPTER_DAYS if days is None else max(1, int(days))
@@ -71,16 +94,15 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
     max_chapters = CHAPTER_MAX if max_chapters is None else max(1, int(max_chapters))
     stamp = now or datetime.now(timezone.utc)
     cutoff = (stamp - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    cards = [c for c in db.chapter_candidates(cid, cutoff)
-             if c["event_id"] not in db.chapter_covers(cid)]
+    cards = _chapter_cards(db, cid, cutoff, db.chapter_covers(cid))
     groups = {}
     for card in cards:
-        key = (card.get("session_id") or "", card.get("audience") or "",
+        key = (lane_base(card.get("session_id")), card.get("audience") or "",
                card.get("bot_id") or "", card.get("knowledge_boundary") or "both")
         groups.setdefault(key, []).append(card)
     stats = {"chapters": 0, "cards": 0}
     ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    for (sid, audience, bot_id, boundary), group in ordered:
+    for (lane, audience, bot_id, boundary), group in ordered:
         if stats["chapters"] >= max_chapters:
             break
         if len(group) < min_cards:
@@ -93,9 +115,14 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
         subjects = [str(c.get("subject") or "").strip() for c in group]
         subjects = [s for s in subjects if s]
         subject = max(set(subjects), key=subjects.count) if subjects else ""
+        # 章节落在组里最新的真实会话（epoch）上，轮换后仍和普通卡走同一条读路径；
+        # 日期取被覆盖卡的最大时间，而不是插入时的「今天」。
+        newest = max(group, key=lambda c: (str(c.get("created_at") or ""),
+                                           int(c.get("turn_end") or 0)))
+        stamps = [str(c.get("created_at") or "") for c in group if c.get("created_at")]
         card = {
             "event_id": f"E-{uuid.uuid4().hex[:8]}",
-            "session_id": sid, "character_id": cid,
+            "session_id": newest.get("session_id") or lane, "character_id": cid,
             "turn_start": min(int(c.get("turn_start") or 0) for c in group),
             "turn_end": max(int(c.get("turn_end") or 0) for c in group),
             "summary": summary, "state_changes": {}, "quotes": [],
@@ -106,6 +133,7 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
             "precision": "normal", "conflict_flags": [],
             "audience": audience, "bot_id": bot_id,
             "layer": "chapter", "covers": ids,
+            "created_at": max(stamps) if stamps else "",
             "idempotency_key": "chapter:" + hashlib.sha1(
                 "|".join(sorted(ids)).encode()).hexdigest()[:24],
         }
@@ -116,8 +144,9 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
         if db.insert_card(card):
             stats["chapters"] += 1
             stats["cards"] += len(group)
-            logger.info("Dream 章节卡 sid=%s 覆盖=%d 区间=%d-%d",
-                        sid, len(group), card["turn_start"], card["turn_end"])
+            logger.info("Dream 章节卡 lane=%s 覆盖=%d 区间=%d-%d 日期=%s",
+                        lane, len(group), card["turn_start"], card["turn_end"],
+                        card["created_at"] or "now")
     return stats
 
 
@@ -152,13 +181,15 @@ def run(mw, cid, dry_run=False, day=None, min_facts=20, max_sessions=8, now=None
                 logger.info("Dream 词条合并 base=%s 组=%d：%s", owner["base"], len(groups),
                             "；".join(f"{len(g['ids'])}→{str(g['fact'])[:16]}"
                                      for g in groups[:6]))
+        # 章节生成与词条合并在同一个 try 里：chapterize 抛异常同样要放开当日占坑，
+        # 否则「失败放开、当天还能补跑」的承诺在章节这一步就不成立。
+        chapter = chapterize(mw.db, cid, dry_run=dry_run, now=now)
+        stats["chapters"] = int(chapter.get("chapters") or 0)
+        stats["chapter_cards"] = int(chapter.get("cards") or 0)
     except Exception:
         if not dry_run:
             mw.db.dream_release(cid, day)       # 失败放开占坑，当天还能再试
         raise
-    chapter = chapterize(mw.db, cid, dry_run=dry_run, now=now)
-    stats["chapters"] = int(chapter.get("chapters") or 0)
-    stats["chapter_cards"] = int(chapter.get("cards") or 0)
     if not dry_run:
         mw.db.dream_note(cid, day,
                          f"expired={len(stats['expired'])} sessions={stats['sessions']}"

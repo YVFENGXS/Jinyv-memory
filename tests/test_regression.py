@@ -3520,7 +3520,10 @@ def test_quotes_and_cache_telemetry():
 
     card = _card(event_id="E-q1", summary="主人养的猫今天不吃鱼",
                  quotes=["团子今天不吃鱼"], idempotency_key="kq")
-    assert "原话" in retriever.format_cards([card])
+    # 默认不带原话：只有召回（已过披露层）才显式要求 quotes
+    assert "原话" not in retriever.format_cards([card])
+    assert "原话" in retriever.format_cards([card], with_quotes=True)
+    assert "原话" in retriever.format_recall([(1.0, card)])
 
     assert llm.cache_stats({"prompt_cache_hit_tokens": "10",
                             "prompt_cache_miss_tokens": 2}) == {
@@ -3562,8 +3565,136 @@ def test_dream_chapter_cards():
     assert len(chapter["covers"]) == 4, chapter["covers"]
     assert "团子" in chapter["summary"], chapter["summary"]
     assert "[章节" in retriever.format_cards([chapter])
+    # 章节日期跟着「被覆盖事件」走，而不是生成日（今天）
+    assert chapter["created_at"] == "2026-01-01 00:00:00", chapter["created_at"]
+    assert "01-01" in retriever.format_cards([chapter])
+    # 管理员合并只拿明细卡，章节卡不能被并掉
+    assert not [c for c in db.card_rows("s1", "c1") if c.get("layer") == "chapter"]
+    # 章节卡不直接展开原文，而是给 covers 目录让模型挑具体事件
+    mw = RPContextMiddleware(MockFront("沈青梧"), MockBack(), db)
+    out = mw._tool_query_memory({"event": chapter["event_id"]}, "s1", "c1")
+    assert "明细卡" in out and "E-old1" in out, out
     assert dream.chapterize(db, "c1", days=30, min_cards=3, now=now)["chapters"] == 0
-    print("R85 Dream 章节卡: OK 只并老卡 / 边界隔离 / 幂等 / dry_run 不写库")
+    print("R85 Dream 章节卡: OK 只并老卡 / 边界隔离 / 幂等 / 日期 / 不可直接展开")
+
+
+def test_dream_chapter_paging():
+    """R86：最早 400 张已被章节覆盖时，分页仍能取到第 401 张之后的卡。"""
+    db = fresh("/tmp/rp_chapter_page.db")
+    all_ids = [f"E-{i:04d}" for i in range(500)]
+    covered = all_ids[:400]
+    db.insert_card(_card(event_id="E-pre", turn_start=1, turn_end=800,
+                         summary="更早的章节", layer="chapter", covers=covered,
+                         created_at="2026-01-01 00:00:00", idempotency_key="pre"))
+    for i in range(500):
+        db.insert_card(_card(event_id=f"E-{i:04d}", turn_start=i * 2 + 1,
+                             turn_end=i * 2 + 2, summary=f"旧事 {i}",
+                             entity_hooks=["团子"], created_at="2026-01-01 00:00:00",
+                             idempotency_key=f"pg{i}"))
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    stats = dream.chapterize(db, "c1", days=30, min_cards=3, max_chapters=1, now=now)
+    assert stats["chapters"] == 1 and stats["cards"] == 100, stats
+    chapter = [c for c in db.all_cards("s1", "c1") if c.get("layer") == "chapter"
+               and c["event_id"] != "E-pre"][0]
+    assert set(chapter["covers"]) == set(all_ids[400:]), chapter["covers"][:3]
+    assert dream.chapterize(db, "c1", days=30, min_cards=3, now=now)["chapters"] == 0
+    print("R86 章节分页: OK 越过已覆盖的 400 张，取到第 401 张之后")
+
+
+def test_dream_chapter_failure_releases():
+    """R87：chapterize 抛异常也要释放当日占坑，当天还能补跑。"""
+    db = fresh("/tmp/rp_chapter_fail.db")
+
+    class FakeMW:
+        def __init__(self):
+            self.db = db
+
+    original = dream.chapterize
+
+    def boom(*a, **k):
+        raise RuntimeError("章节生成失败")
+
+    dream.chapterize = boom
+    try:
+        try:
+            dream.run(FakeMW(), "c1", day="2026-11-02")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("chapterize 失败应向上抛")
+    finally:
+        dream.chapterize = original
+    with db._c() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM dream_runs WHERE character_id='c1'"
+                        " AND day='2026-11-02'").fetchone()
+    assert row["n"] == 0, dict(row)
+    assert db.dream_claim("c1", "2026-11-02") is True      # 当天可以补跑
+    print("R87 章节失败释放: OK 异常后占坑被清，当天可重跑")
+
+
+def test_chapter_lane_grouping():
+    """R88：48 小时 epoch 轮换不切碎章节；章节日期取覆盖期最大值。"""
+    db = fresh("/tmp/rp_chapter_lane.db")
+    rows = [("qq-u10001#1", 1, 2, "01-01 00:00:00"),
+            ("qq-u10001#1", 3, 4, "01-02 00:00:00"),
+            ("qq-u10001#1", 5, 6, "01-03 00:00:00"),
+            ("qq-u10001#2", 7, 8, "01-04 00:00:00"),
+            ("qq-u10001#2", 9, 10, "01-05 00:00:00")]
+    for i, (sid, lo, hi, when) in enumerate(rows):
+        db.insert_card(_card(session_id=sid, event_id=f"E-lane{i}", turn_start=lo,
+                             turn_end=hi, summary=f"旧事 {i}", entity_hooks=["团子"],
+                             created_at=f"2026-{when}", idempotency_key=f"lane{i}"))
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    stats = dream.chapterize(db, "c1", days=30, min_cards=3, now=now)
+    assert stats["chapters"] == 1 and stats["cards"] == 5, stats
+    chapter = [c for c in db.all_cards("qq-u10001#2", "c1")
+               if c.get("layer") == "chapter"][0]
+    assert len(chapter["covers"]) == 5, chapter["covers"]      # 两个 epoch 合并成一张
+    assert chapter["session_id"] == "qq-u10001#2", chapter["session_id"]
+    assert chapter["created_at"] == "2026-01-05 00:00:00", chapter["created_at"]
+    print("R88 章节车道分组: OK 跨 epoch 合并 / 日期取覆盖期最后一天")
+
+
+def test_desktop_remote_smoke():
+    """R89：桌宠/通话 remote 模式冒烟——健康检查、Bearer 鉴权、不直连主库。"""
+    try:
+        from fastapi.testclient import TestClient
+    except Exception:                       # noqa: BLE001
+        print("R89 桌面 remote 冒烟: SKIP（未安装 fastapi/httpx）")
+        return
+    saved = {k: os.environ.get(k) for k in
+             ("RP_SESSION", "RP_HOST_BASE", "RP_HOST_TOKEN", "RP_WIN_TOKEN", "RP_DB",
+              "RP_ALLOW_LOCAL_DB", "RP_FRONT_KEY", "RP_BACK_KEY")}
+    try:
+        for key in saved:
+            os.environ.pop(key, None)
+        os.environ.update({"RP_SESSION": "qq-u10001",
+                           "RP_HOST_BASE": "http://127.0.0.1:8080",
+                           "RP_HOST_TOKEN": "host-token",
+                           "RP_WIN_TOKEN": "win-token"})
+        import importlib
+        ds = importlib.import_module("desktop_server")
+        client = TestClient(ds.APP)
+        assert client.get("/desktop/v1/health").json()["mode"] == "remote"
+        assert client.post("/desktop/v1/say", json={"text": "你好"}).status_code == 401
+        ok = client.post("/desktop/v1/say", json={"text": "你好"},
+                         headers={"Authorization": "Bearer win-token"})
+        # 没有在线桌宠时业务层会回「没有窗口」，但鉴权必须已经通过（不是 401）
+        assert ok.status_code != 401, ok.text
+        assert ok.json().get("error") != "unauthorized", ok.text
+        cs = importlib.import_module("call_server")
+        cc = TestClient(cs.APP)
+        assert cc.get("/health").json()["host"] == "remote"
+        assert cc.post("/call/say", json={"text": "你好"}).status_code == 401
+        print("R89 桌面 remote 冒烟: OK health / Bearer 鉴权 / host=remote")
+    finally:
+        for name in ("desktop_server", "call_server"):
+            sys.modules.pop(name, None)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 if __name__ == "__main__":
@@ -3621,6 +3752,8 @@ if __name__ == "__main__":
                test_vision_hint, test_balance_action, test_host_api,
                test_host_http_helpers, test_web_search_parse, test_raw_expand_event,
                test_quotes_and_cache_telemetry, test_dream_chapter_cards,
+               test_dream_chapter_paging, test_dream_chapter_failure_releases,
+               test_chapter_lane_grouping, test_desktop_remote_smoke,
                test_chat_stores_reply_when_context_build_fails):
         fn()
     print("\nall regression tests passed")

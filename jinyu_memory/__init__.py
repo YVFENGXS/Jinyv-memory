@@ -97,6 +97,8 @@
                                     （社交圈默认关闭，用 /social on 开启，独立 db 存记忆）
   RP_SESSION_EPOCH_HOURS            选填，闲置多少小时后开启新会话 epoch，默认 48，0=不轮换
   RP_EPOCH_FLUSH_SECONDS            选填，轮换前冲刷旧会话尾部的超时秒数，默认 8
+  RP_HOST_TOKEN                     选填，开启宿主接口（/jinyu/chat）的 Bearer 令牌
+  RP_SESSION / RP_HOST_SESSION      宿主接口写哪个会话；启用 /jinyu/chat 时必填
 """
 import asyncio
 import base64
@@ -241,9 +243,9 @@ EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48)
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
 # 宿主接口：浏览器/桌宠经 HTTP 进来，复用 QQ 这一进程的中间件，避免两个进程抢同一个库
 HOST_TOKEN = str(os.environ.get("RP_HOST_TOKEN") or "").strip()
+# 宿主接口写哪个会话必须显式配置：不猜号码，缺了就整体不启用（见 _install_host_routes）
 HOST_SESSION = str(os.environ.get("RP_HOST_SESSION")
-                   or os.environ.get("RP_SESSION")
-                   or "qq-u3521544885").strip() or "qq-u3521544885"
+                   or os.environ.get("RP_SESSION") or "").strip()
 HOST_MAX_PROMPT = max(1000, int(float(os.environ.get("RP_HOST_MAX_PROMPT") or 16000)))
 # 跨窗口发话：QQ 私聊由本进程直接发；桌宠/通话各自有 HTTP 推送端点
 DESKTOP_SAY_URL = (os.environ.get("RP_DESKTOP_SAY_URL")
@@ -1140,8 +1142,8 @@ def _install_host_routes() -> None:
     global _HOST_ROUTES_READY
     if _HOST_ROUTES_READY:
         return
-    if not HOST_TOKEN:
-        logger.info("[jinyu] 宿主接口未启用（缺 RP_HOST_TOKEN）")
+    if not HOST_TOKEN or not HOST_SESSION:
+        logger.info("[jinyu] 宿主接口未启用（缺 RP_HOST_TOKEN 或 RP_SESSION / RP_HOST_SESSION）")
         return
     app = getattr(driver, "server_app", None)    # NoneBot2 FastAPI driver
     if app is None:

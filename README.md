@@ -210,8 +210,10 @@ $env:RP_FRONT_KEY="sk-..."; $env:RP_BACK_KEY="sk-..."; python examples\chat_cli.
 
 ```powershell
 pip install -r requirements-desktop.txt
+$env:RP_SESSION="qq-u你的QQ号"    # 必填：和 QQ 私聊共用哪个会话
 $env:RP_FRONT_KEY="sk-..."; $env:RP_BACK_KEY="sk-..."
 python desktop_server.py --token dev-token
+# 本地模式写独立的 desktop_memory.db（不碰 QQ 主库）
 # 健康检查 http://127.0.0.1:8787/desktop/v1/health → {"ok":true,"mode":"real"}
 ```
 
@@ -220,10 +222,11 @@ python desktop_server.py --token dev-token
 ```bash
 scp -i .deploy_key desktop_server.py ubuntu@HOST:/tmp/
 scp -i .deploy_key deploy/install_desktop_adapter.sh ubuntu@HOST:/tmp/
-ssh -i .deploy_key ubuntu@HOST "sed -i 's/\r$//' /tmp/install_desktop_adapter.sh && sudo bash /tmp/install_desktop_adapter.sh"
+ssh -i .deploy_key ubuntu@HOST "sed -i 's/\r$//' /tmp/install_desktop_adapter.sh && \
+  sudo RP_SESSION=qq-u你的QQ号 bash /tmp/install_desktop_adapter.sh"
 ```
 
-脚本装出 `rp-desktop.service`：`User=qqbot`、只监听 `127.0.0.1:8787`、`EnvironmentFile=/opt/qqbot/bot/.env`（模型密钥留在服务器上）。默认 `RP_DB=/opt/qqbot/data/rp_memory.db`、`RP_SESSION=qq-u3521544885`，桌宠直接读写 QQ 机器人主库，并与主私聊共用同一条会话（热窗口、事件卡、长期事实和 epoch 轮换规则都一致）；用 `RP_SESSION` 可以换成别的 `qq-u…` / `qq-g…` 会话。旧的 `desktop_memory.db` 保留在磁盘上但不再使用。端口与令牌写在 `/etc/rp-desktop.env`（600 root）。
+脚本装出 `rp-desktop.service`：`User=qqbot`、只监听 `127.0.0.1:8787`、`EnvironmentFile=/opt/qqbot/bot/.env`（模型密钥留在服务器上）。**桌宠不再直接读写 QQ 主库**：脚本把 `RP_HOST_BASE=http://127.0.0.1:8080`、`RP_HOST_TOKEN`、`RP_SESSION` 写进 `/etc/rp-desktop.env`（600 root），桌宠经 QQ 进程里的 `POST /jinyu/chat` 写入，热窗口、事件卡、长期事实和 epoch 轮换都由那一个进程负责——这是「同一个 `RP_DB` 只能有一个进程」的硬约束（见 [九、已知限制](#九已知限制)）。脚本不会写 `RP_DB`，并会删掉老版本遗留的 `RP_DB` 行；第一次给 `bot/.env` 补 `RP_HOST_TOKEN` 后要重启 QQ 机器人，宿主接口才会就绪。会话号必须显式传入（不再内置），且与 QQ 私聊使用的会话一致。
 
 客户端在另一台机器时，用 SSH 隧道把服务器回环端口映射到本地：
 
@@ -393,6 +396,10 @@ NapCat 与 NoneBot 的启动顺序不敏感：反了也会在约 30 秒后自动
 | `RP_COOLDOWN` | `2` | 同一会话冷却秒数，期间连发会被丢弃 |
 | `RP_SESSION_EPOCH_HOURS` | `48` | 闲置多久开新会话；`0` 关闭轮换 |
 | `RP_EPOCH_FLUSH_SECONDS` | `8` | 轮换前冲刷旧会话的超时 |
+| `RP_HOST_TOKEN` | 空 | 宿主接口 `/jinyu/chat` 的 Bearer 令牌；不配则不启用 |
+| `RP_SESSION` / `RP_HOST_SESSION` | 空 | 宿主接口写哪个会话；启用 `/jinyu/chat` 时必填，桌宠/通话也必填 |
+| `RP_HOST_BASE` | 空 | 桌宠/通话指向 QQ 进程宿主接口的地址（如 `http://127.0.0.1:8080`） |
+| `RP_ALLOW_LOCAL_DB` | `0` | `1`=允许桌宠/通话在没配宿主接口时用 `RP_DB` 开独立本地库（仅联调） |
 | `RP_RICH` | `1` | 富消息（图片/表情/贴纸/语音/搜图）总开关 |
 | `RP_IMG_MAX_MB` | `15` | 单张图片下载上限；QQ 大 GIF 常见 6~12MB |
 | `RP_IMG_TEXT_LIMIT` | `4000` | 视觉判读抄录图中文字的上限（字符）；截图/文档可继续调大 |
@@ -565,7 +572,7 @@ sqlite3 /opt/qqbot/data/rp_memory.db ".backup '/opt/qqbot/backup/rp-$(date +%F).
 - 视频只能读元数据（标题/作者/简介）与抽帧画面理解：B 站/抖音/YouTube 链接一出现就自动抽帧，受 `RP_VIDEO_DAILY` 每日配额约束，超过 `RP_VIDEO_MAX_SECONDS` 不看；抽帧依赖 `ffmpeg`（非 B 站另需 `yt-dlp`），未安装则只用元数据
 - 抖音等站点有反爬，元数据可能抓不到；失败时只保留链接本身
 - 机器人离线期间到期的提醒会在重启后补发，可能晚于约定时间
-- 单进程单实例；同一个 `RP_DB` 只能有一个进程，否则归档游标互抢
+- 单进程单实例；同一个 `RP_DB` 只能有一个进程，否则归档游标互抢。桌宠 / 通话服务因此**不直接开库**：必须配 `RP_HOST_BASE` + `RP_HOST_TOKEN`，经 QQ 进程的 `/jinyu/chat` 读写；缺这两项而只给了 `RP_DB` 会拒绝启动（本地独立库联调可显式设 `RP_ALLOW_LOCAL_DB=1`）
 - 每条消息一次前台调用 + 每 2 轮一次后台调用，注意成本
 - 第三方协议端有封号风险，请使用小号并自行评估
 - 贴纸库不做自动删除（它是资产，不是临时文件）

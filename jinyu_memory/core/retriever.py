@@ -440,11 +440,12 @@ def card_date(card):
         return ""
 
 
-def format_cards(cards, limit=200):
+def format_cards(cards, limit=200, with_quotes=False):
     """按时间线升序输出事件卡，带日期与卡号前缀——模型能看出先后、也能指定展开哪张。
 
-    只有完整披露（full）的卡走这里；paraphrase / hint / silence 由
-    disclosure.render 输出固定句，永远不会碰到 quotes。原话是 P1 的「可逆摘要」：
+    with_quotes 默认 False：只有经披露层判为 full 的召回卡才会拼原话。
+    【历史事件】【硬记忆】这类固定注入段不经过 disclosure.decide，绝不能带原话，
+    否则群聊里一张 self/敏感卡的原句会直接进 prompt。原话是 P1 的「可逆摘要」：
     摘要给骨架，quotes 补 1-3 句原声，避免模型把概括当成原话复述。
     """
     lines = []
@@ -458,13 +459,17 @@ def format_cards(cards, limit=200):
             if c.get("knowledge_boundary") == "self" else ""
         body = clean_text(c['summary'], limit)
         quotes = c.get("quotes") or []
-        if quotes:
+        if with_quotes and quotes:
             body += "（原话：" + "；".join(
                 f"「{clean_text(q, 40)}」" for q in quotes[:3]) + "）"
         lines.append(f"- {when + ' ' if when else ''}{ref} {body}{secret}")
     return "\n".join(lines)
 
 
-def format_recall(hits):
-    """召回结果同样按时间线升序：记忆是「发生过的事」，不是按分数排的清单。"""
-    return format_cards([c for _, c in hits])
+def format_recall(hits, with_quotes=True):
+    """召回结果同样按时间线升序：记忆是「发生过的事」，不是按分数排的清单。
+
+    召回命中在进这里之前已经逐张过 disclosure.decide（full 才走），
+    所以可以带上原话；其它注入路径必须保持默认的 with_quotes=False。
+    """
+    return format_cards([c for _, c in hits], with_quotes=with_quotes)
