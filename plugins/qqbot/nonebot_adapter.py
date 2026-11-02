@@ -23,7 +23,10 @@ def install(ctx: PluginContext, plugin) -> None:
         if not text:
             return
         if isinstance(event, GroupMessageEvent):
-            if not event.is_tome():
+            to_me = event.is_tome() if hasattr(event, "is_tome") else bool(
+                getattr(event, "to_me", False)
+            )
+            if not to_me:
                 return
             session_id = f"qq-g{event.group_id}"
         elif isinstance(event, PrivateMessageEvent):
