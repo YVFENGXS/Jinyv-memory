@@ -4,7 +4,7 @@
 
 ## 1. 目录与 manifest
 
-插件是**独立 git 仓库**，默认放在 `E:\Jinyv-plugins\<插件目录>`，不进入主仓库。
+插件默认放在单一外部仓库 `E:\Jinyv-plugins\<插件目录>`，不进入主仓库。
 加载器按 `config/core.toml` 的 `[plugins].search_paths`（或 `JINYV_PLUGIN_PATHS`）
 扫描多个目录；同一 `id` 冲突只记错，不覆盖。
 
