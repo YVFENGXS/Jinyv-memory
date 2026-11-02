@@ -53,7 +53,7 @@ dsh 不在此目录：它是 JS/cordis 特殊插件，源码留在用户 zip / `
 
 ### 核心不负责
 - 平台消息解析、富消息渲染、贴纸、ASR、B 站、直播、桌宠/通话协议、DSH 安装。
-- 这些全部落在 `plugins/`，失败不影响 core 与其他插件。
+- 这些全部落在独立插件仓库（`E:\Jinyv-plugins\*`），失败不影响 core 与其他插件。
 
 ## 3. 生命周期
 
@@ -63,7 +63,7 @@ discover → 依赖解析 → import → setup(ctx) → start(ctx) → running/d
                                                    stop(ctx) → stopped
 ```
 
-- **发现**：扫描 `plugins/*/plugin.toml`；`id` 冲突或 TOML 解析失败只记录为「发现失败」，不中断。
+- **发现**：按 `search_paths` 扫描多个目录下的 `*/plugin.toml`；`id` 冲突或 TOML 解析失败只记录为「发现失败」，不中断。
 - **依赖**：`requires` 做拓扑排序；缺失或成环 → 该插件 `failed`，不阻塞其他插件。
 - **加载**：以 Python 包方式导入，插件内部可用相对导入；未暴露 `PLUGIN` / `create_plugin()` / `setup()` → `failed`。
 - **启动失败回滚**：按 `plugin_id` 撤销已注册工具、钩子、事件订阅、定时任务。

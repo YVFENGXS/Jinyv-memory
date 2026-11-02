@@ -65,11 +65,11 @@
 
 | 旧位置/外部仓库 | 新位置 | 状态 |
 |---|---|---|
-| 主仓库 `desktop_server.py` | `plugins/desktop-pet/__init__.py` | 🟡 结构 + `handle_hello/handle_text` + 健康检查；未起 WS |
+| 主仓库 `desktop_server.py` | `E:\Jinyv-plugins\desktop-pet\__init__.py` | 🟡 结构 + `handle_hello/handle_text` + 健康检查；未起 WS |
 | `docs/protocol/desktop-v1.md` | 已复制 | ✅ |
 | `deploy/install_desktop_adapter.sh` | 待迁 `scripts/install_desktop_adapter.sh` | ⬜ P3 |
-| 独立仓库 `YVFENGXS/Jinyu-pet` | `scripts/install_external_plugins.sh` 拉取到 `external/` | ✅ 脚本 |
-| 独立仓库 `YVFENGXS/jinyu-video-call` | `plugins/video-call/` 适配层；服务源码不复制 | 🟡 结构 + 适配接口 |
+| 独立仓库 `YVFENGXS/Jinyu-pet` | 客户端原仓库不动；配置指向本地克隆 | ✅ |
+| 独立仓库 `YVFENGXS/jinyu-video-call` | `E:\Jinyv-plugins\video-call` 适配层；服务源码不复制 | 🟡 结构 + 适配接口 |
 | 通话仓库自带 `jinyu_memory/core/` | 保持外部；推荐只走 `RP_HOST_BASE/TOKEN` | ⬜ P4 |
 
 ### 2.4 DSH / 视频分镜
