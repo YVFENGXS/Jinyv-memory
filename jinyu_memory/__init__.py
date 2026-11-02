@@ -9,6 +9,7 @@
 - 富消息：回复里的 [[face:..]]/[[img:..]]/[[search:..]]/[[sticker:..]]/[[voice:..]]
   标记渲染成 QQ 表情 / 图片 / 搜图 / 贴纸 / 语音（RP_RICH=0 可整体关闭）
 - 贴纸自学习：收到的图片/商城表情自动入库并打标签（RP_AUTOSTICKER，带每日配额）
+- 群聊省 token：/imgat on 后只有被 @ 的群消息才下载/判读图片（默认全量分析）
 - 定时提醒：识别「X 分钟后提醒我…」或 /remind 命令，落 SQLite，到点由人设口吻发出
 - 可主动沉默：模型输出 [[pass]] 时这一轮一条都不发（仍写记忆），连续两次后强制开口
 - 进程退出时冲刷归档（shutdown 内部等待后台批次）
@@ -62,7 +63,7 @@
   RP_IMG_TEXT_LIMIT                 选填，视觉判读抄录图中文字的上限（字符），默认 4000
   RP_IMG_NOTE_TEXT                  选填，OCR 注入前台的字数上限，默认 4000
   RP_ADMIN_QQ                       选填，允许 /persona /memory /merge /save /tags /find /img
-                                    /sticker /fix /voice /testrich /social 的 QQ
+                                    /sticker /fix /voice /testrich /social /imgat 的 QQ
   RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
   RP_FACT_MERGE_MIN                 选填，会话事实达到多少条才自动合并，默认 20
   RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
@@ -1166,6 +1167,7 @@ async def _startup():
     db_path = Path(os.environ.get("RP_DB") or "data/rp_memory.db").expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _social_load(db_path.with_name("social_state.json"))
+    _img_state_load(db_path.with_name("media_state.json"))
     mw_plain = RPContextMiddleware(
         from_env("front"), from_env("back"), DB(str(db_path)),
         max_tokens=int(os.environ.get("RP_MAX_TOKENS") or 64000),
@@ -2284,6 +2286,43 @@ async def _link_notes(text: str, event: MessageEvent) -> str:
 
 capture = on_message(priority=1, block=False)
 
+# 群聊图片是否只在被 @ 时分析。开着能省视觉 token，默认保持旧行为（全量分析）。
+# 状态落 RP_DB 同目录 media_state.json，重启不丢。
+_IMG_AT_ONLY = False
+_IMG_STATE_PATH: Optional[Path] = None
+
+
+def _img_state_load(path: Path) -> None:
+    global _IMG_STATE_PATH, _IMG_AT_ONLY
+    _IMG_STATE_PATH = path
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except Exception as exc:                    # noqa: BLE001  坏文件不该拦住启动
+        logger.warning(f"[jinyu] 媒体状态读取失败: {exc}")
+        return
+    if isinstance(data, dict):
+        _IMG_AT_ONLY = bool(data.get("group_image_at_only"))
+
+
+def _img_state_save() -> None:
+    if _IMG_STATE_PATH is None:
+        return
+    try:
+        tmp = _IMG_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"group_image_at_only": _IMG_AT_ONLY},
+                                  ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_IMG_STATE_PATH)
+    except Exception as exc:                    # noqa: BLE001
+        logger.warning(f"[jinyu] 媒体状态保存失败: {exc}")
+
+
+def _img_at_switch(on: bool) -> None:
+    global _IMG_AT_ONLY
+    _IMG_AT_ONLY = bool(on)
+    _img_state_save()
+
 
 _CAPTION_NOISE = re.compile(r"\[(?:图片|表情|动画表情|视频|语音|文件)\]")
 
@@ -2324,6 +2363,9 @@ def _extract_image_urls(event: MessageEvent) -> list:
 
 @capture.handle()
 async def _capture(event: MessageEvent):
+    # 群聊省 token：没被 @ 就不下载、不判读、不入表情包库；私聊始终分析。
+    if isinstance(event, GroupMessageEvent) and _IMG_AT_ONLY and not event.is_tome():
+        return
     urls = _extract_image_urls(event)
     if not urls:
         return
@@ -3675,6 +3717,20 @@ async def _admin(event: MessageEvent, text: str) -> bool:
             await asyncio.to_thread(_social_switch, False)
             await matcher.finish("社交圈模式已关闭：回到每个群/私聊各自分离的记忆。")
         await matcher.finish(await asyncio.to_thread(_social_report))
+        return True
+    if cmd in ("imgat", "群图"):
+        act = (arg.split() or [""])[0].lower()
+        if act in ("on", "开", "开启", "只at", "只@"):
+            await asyncio.to_thread(_img_at_switch, True)
+            await matcher.finish(
+                "已开启：群聊只分析被 @ 消息里的图片；没被 @ 的图不下载、不判读、"
+                "不进表情包库（省视觉 token）。私聊不受影响。")
+        if act in ("off", "关", "关闭", "全部"):
+            await asyncio.to_thread(_img_at_switch, False)
+            await matcher.finish("已关闭：群聊里所有图片都会下载/判读（恢复旧行为）。")
+        await matcher.finish(
+            f"群聊图片仅 @ 时分析：{'开启' if _IMG_AT_ONLY else '关闭'}\n"
+            "切换：/imgat on｜/imgat off（别名 /群图）")
         return True
     if cmd in ("merge", "合并"):
         words = {w.lower() for w in arg.split()}

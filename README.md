@@ -519,6 +519,7 @@ NapCat 与 NoneBot 的启动顺序不敏感：反了也会在约 30 秒后自动
 | `/tag <文件名> <标签...>` | 给贴纸加标签 |
 | `/untag <文件名> <标签>` | 去掉一个标签（文件保留） |
 | `/fix <文件名\|标签> 角色=… 标签=a,b 描述=…` | 修正视觉误判（别名 `/改tag` `/纠错`） |
+| `/imgat on\|off`（`/群图`） | 群聊是否只在被 @ 时下载/判读图片；`on` 省视觉 token，默认 `off`（全量分析） |
 | `/testrich [文本]` | 自测富消息链路：文本、表情、贴纸、语音各发一条 |
 
 `/fix` 的 `角色=` 留空表示「认不出是谁」；改完同样的图再发会直接用新结果，已写进长期记忆的旧说法用 `/memory del` 清掉。
@@ -602,9 +603,14 @@ sqlite3 /opt/qqbot/data/rp_memory.db ".backup '/opt/qqbot/backup/rp-$(date +%F).
 - **dsh-bili-humanism**（B站账号接入规范，上游文档，不随仓库分发）——本仓库 B站写操作的边界直接照它来：只开白名单接口、风控命中就持久暂停、发出后回读核验、失败不自动重试、只能人工 `/bili unlock` 解除；评论带图走视频笔记也是按它的思路补的。感谢作者把「哪些能自动、哪些必须人来」写成了可执行的规则。
 - **[bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)** —— 评论、视频笔记、动态图片上传、扫码登录这些接口的字段、返回码与请求头，全部对照这份社区文档实现；没有它，这些接口只能靠抓包猜。
 - **[dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard)** —— 视频分镜（第三方组件，不随本仓库分发，脚本按上游固定提交拉取）。
+- **[Live2D Cubism Core](https://www.live2d.com/en/sdk/)**、**[PixiJS](https://pixijs.com/)**、**[pixi-live2d-display](https://github.com/guansss/pixi-live2d-display)** —— 通话页 Live2D 渲染使用的运行时与开源库。
+- **DeepSeek-chan（大肥鱼）Live2D 模型** —— 原画 / 拆分：神宫凉子，Live2D 建模：霓虹猫_NeonNeko；模型不随仓库分发，版权与使用条件归原作者。
 - **[NoneBot2](https://nonebot.dev/)**、**[OneBot v11](https://github.com/botuniverse/onebot-11)**、**[NapCatQQ](https://github.com/NapNeko/NapCatQQ)** —— QQ 侧接入的全部基础设施。
 - **[AstrBot](https://github.com/AstrBotDevs/AstrBot)** —— 上下文管理、重试退避、临时文件清理等工程实践的参考（未复制代码，许可证差异见下方）。
 - **[SeekMemory](https://github.com/NeverENG/SeekMemory)** —— 长期记忆与检索方向的参考项目，感谢作者公开分享；本仓库的分层记忆、召回评测在设计时参考过它的思路。
+- **dsh-fish** —— 事件卡显著性（mentions / verified / solid）与查询侧二字切片的设计做过对照，感谢作者公开思路；本仓库独立实现，未复制代码。
+- **[VimgFind](https://github.com/Just-A-Freshman/VimgFind)** —— 图片重定向后的二次校验、索引阶段过滤垃圾图等安全与降噪思路参考。
+- **[opencode-acp](https://github.com/ranxianglei/opencode-acp)**、**[billion-context-pi](https://github.com/ranxianglei/billion-context-pi)**、**[billion-context](https://github.com/ranxianglei/billion-context)** —— 长会话上下文压缩方向的参考：由模型判断何时压缩、压缩什么，用增量分层压缩代替硬截断；本仓库的归档与摘要策略在设计时参考过这些思路，未复制代码。
 - **DeepSeek** —— 前台与后台的模型服务。
 
 以上项目各有各的许可证；本仓库只借鉴设计思路、对照公开接口文档，未复制其源码。
