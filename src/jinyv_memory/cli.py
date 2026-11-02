@@ -40,11 +40,30 @@ def cmd_plugins(args) -> int:
     runtime.load_plugins()
     runtime.start()
     try:
-        print(json.dumps({"core": runtime.core.health(), "plugins": runtime.loader.health()},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps(runtime.health(), ensure_ascii=False, indent=2))
     finally:
         runtime.shutdown()
     return 0
+
+
+def cmd_dsh(args) -> int:
+    runtime = _runtime(args)
+    runtime.core.memory.open_session(args.account or "desktop")
+    try:
+        if args.dsh_command == "status":
+            result = runtime.dsh.status()
+        elif args.dsh_command == "import":
+            result = runtime.dsh.import_session(args.session, args.account)
+        elif args.dsh_command == "export":
+            result = runtime.dsh.export_session(args.session, args.account, args.limit)
+        elif args.dsh_command == "sync":
+            result = runtime.dsh.sync_session(args.session, args.account, args.limit)
+        else:
+            raise SystemExit(f"未知 dsh 子命令：{args.dsh_command}")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        runtime.core.shutdown()
 
 
 def cmd_chat(args) -> int:
@@ -93,7 +112,7 @@ def cmd_run(args) -> int:
 
 
 def cmd_selfcheck(args) -> int:
-    """离线闭环：发现 4 个插件 → 跑 10 轮 → 归档/召回/租约/幂等/DSH 导入。"""
+    """离线闭环：外部插件发现 → 跑 10 轮 → 租约/幂等/DSH 双向桥接。"""
     checks = 0
 
     def check(condition: bool, message: str) -> None:
@@ -110,8 +129,9 @@ def cmd_selfcheck(args) -> int:
     print("== 插件发现 ==")
     _print_plugins(runtime)
     ids = {row["id"] for row in runtime.loader.health()}
-    check({"qqbot", "desktop-pet", "video-call", "dsh-video-storyboard"} <= ids,
-          "四个插件均被发现")
+    check({"qqbot", "desktop-pet", "video-call"} <= ids, "三个 Python 插件从外部目录被发现")
+    check(any("Jinyv-plugins" in str(path) for path in runtime._plugin_dirs),
+          "插件搜索路径包含外部目录")
     qqbot_record = runtime.loader.get("qqbot")
     check(qqbot_record is not None and qqbot_record.plugin is not None, "qqbot 插件已加载")
     check(runtime.loader.tools.get("qqbot.recall") is not None, "qqbot 注册了召回工具")
@@ -192,17 +212,36 @@ def cmd_selfcheck(args) -> int:
         "kind": "事件", "importance": 0.8, "turn": 1,
         "createdAt": "2026-11-01T12:00:00.000Z",
     }], ensure_ascii=False), encoding="utf-8")
-    dsh_record = runtime.loader.get("dsh-video-storyboard")
-    dsh_plugin = dsh_record.plugin
-    dsh_plugin.dsh_home = dsh_home
-    dsh_plugin.sessions_dir = dsh_home / "jinyu-memory" / "sessions"
-    dsh_plugin.session_count = 1
-    import_result = runtime.loader.tools.call("dsh.import_session", {"session": "sess-a"})
-    check(import_result.ok and import_result.value["cards_inserted"] == 1
-          and import_result.value["facts_inserted"] == 1, "DSH 会话导入核心记忆")
-    duplicate = runtime.loader.tools.call("dsh.import_session", {"session": "sess-a"})
-    check(duplicate.ok and duplicate.value["cards_duplicate"] == 1
-          and duplicate.value["facts_duplicate"] == 1, "DSH 重复导入保持幂等")
+    from .integrations.dsh import DshBridge
+
+    dsh_bridge = DshBridge.from_file(
+        runtime.paths.config_dir / "integrations" / "dsh.toml",
+        memory=runtime.core.memory,
+        paths=runtime.paths,
+        overrides={
+            "dsh_home": str(dsh_home),
+            "plugin_dir": "",
+            "storyboard_dir": "",
+            "account": "desktop",
+            "sync_mode": "both",
+        },
+    )
+    check(dsh_bridge.status()["sessions"] == 1, "DSH 桥检测到本地记忆仓")
+    first = dsh_bridge.import_session("sess-a")
+    check(first["cards_inserted"] == 1 and first["facts_inserted"] == 1,
+          "DSH 会话导入核心记忆")
+    second = dsh_bridge.import_session("sess-a")
+    check(second["skipped"] == 2 and second["conflicts"] == 0,
+          "DSH 重复导入按 journal 幂等跳过")
+
+    runtime.core.memory.remember("desktop", "瑾瑜喜欢米饭", speaker="瑾瑜", importance=0.8)
+    export_first = dsh_bridge.export_session("sess-a")
+    check(export_first["cards_new"] >= 1, "核心卡片导出到 DSH")
+    export_second = dsh_bridge.export_session("sess-a")
+    check(export_second["cards_new"] == 0 and export_second["facts_new"] == 0,
+          "DSH 重复导出幂等")
+    check((session_dir / ".jinyv-bridge.json").exists(), "桥接 journal 已落盘")
+    check(dsh_bridge.start() is False, "未配置托管命令时 dsh 不替用户启动进程")
 
     runtime.shutdown()
     print(f"\nSELFCHECK OK：{checks} 项检查通过；临时数据目录 {data_dir}")
@@ -220,6 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("run")
     chat = sub.add_parser("chat")
     chat.add_argument("--account", default="owner_qq")
+    dsh = sub.add_parser("dsh")
+    dsh_sub = dsh.add_subparsers(dest="dsh_command", required=True)
+    dsh_sub.add_parser("status")
+    for name in ("import", "export", "sync"):
+        item = dsh_sub.add_parser(name)
+        item.add_argument("--session", required=True, help="DSH 会话目录名或 id")
+        item.add_argument("--account", default=None, help="核心 lane")
+        if name in {"export", "sync"}:
+            item.add_argument("--limit", type=int, default=50)
     return parser
 
 
@@ -230,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         "plugins": cmd_plugins,
         "chat": cmd_chat,
         "run": cmd_run,
+        "dsh": cmd_dsh,
     }
     return handlers[args.command](args)
 

@@ -22,3 +22,13 @@ core = ""
 [llm]
 # env = 读 RP_* 环境变量；mock = 离线假模型
 mode = "env"
+
+[plugins]
+# 多路径扫描：按顺序发现每个子目录下的 plugin.toml。
+# 相对路径以仓库根为基准；也可用 JINYV_PLUGIN_PATHS（os.pathsep 分隔）覆盖。
+# 主仓库 plugins/ 当前保留为待清理的旧副本，暂不纳入扫描。
+search_paths = ["../Jinyv-plugins"]
+
+[dsh]
+# dsh 是特殊接入类型，不进入 Python 插件契约；配置见 config/integrations/dsh.toml
+enabled = true

@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
@@ -318,6 +320,40 @@ class MemoryAPI:
             "cards": len(self.db.recent_cards(lane.session_id, lane.character_id, 500)),
             "unexpected_errors": int(getattr(self.middleware, "_unexpected_errors", 0)),
         }
+
+    def export_memory(self, lane: Lane | str | None = None, limit: int = 50) -> dict[str, Any]:
+        """导出当前 lane 的卡片与事实，供外部桥接（如 DSH）写入。"""
+        lane = self.open_session(self._resolve(lane))
+        limit = max(1, min(500, int(limit or 50)))
+        cards = self.db.recent_cards(lane.session_id, lane.character_id, limit)
+        facts: list[dict[str, Any]] = []
+        conn = sqlite3.connect(self.db.path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, fact, tags, importance, category, speaker, turn_end, created_at"
+                " FROM durable_facts WHERE session_id=? AND character_id=?"
+                " AND retracted_at IS NULL ORDER BY id DESC LIMIT ?",
+                (lane.session_id, lane.character_id, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            try:
+                tags = json.loads(row["tags"] or "[]")
+            except (TypeError, ValueError):
+                tags = []
+            facts.append({
+                "id": int(row["id"]),
+                "text": str(row["fact"] or ""),
+                "tags": [str(tag) for tag in tags],
+                "category": str(row["category"] or ""),
+                "speaker": str(row["speaker"] or ""),
+                "importance": float(row["importance"] or 0.5),
+                "turn_end": int(row["turn_end"] or 0),
+                "created_at": str(row["created_at"] or ""),
+            })
+        return {"cards": cards, "facts": facts, "lane": lane.key}
 
     def consolidate(self, lane: Lane | str | None = None, *, dry_run: bool = False,
                     day: str | None = None) -> dict[str, Any]:

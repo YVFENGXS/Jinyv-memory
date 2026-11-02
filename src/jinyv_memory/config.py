@@ -96,6 +96,25 @@ class Config:
     def core_get(self, key: str, default: Any = None) -> Any:
         return self.core.get(key, default)
 
+    def plugin_search_paths(self) -> list[Path]:
+        """插件搜索路径：JINYV_PLUGIN_PATHS 优先，其次 [plugins].search_paths。"""
+        raw_env = str(self.env.get("JINYV_PLUGIN_PATHS") or "").strip()
+        if raw_env:
+            candidates = [item for item in raw_env.split(os.pathsep) if item.strip()]
+        else:
+            section = self.core.get("plugins")
+            configured = section.get("search_paths") if isinstance(section, dict) else []
+            if isinstance(configured, str):
+                configured = [configured]
+            candidates = list(configured or [])
+        paths: list[Path] = []
+        for item in candidates:
+            path = Path(str(item)).expanduser()
+            if not path.is_absolute():
+                path = self.root / path
+            paths.append(path.resolve())
+        return paths
+
     def plugin_raw(self, plugin_id: str) -> dict[str, Any]:
         return self.plugins.get(plugin_id, {})
 

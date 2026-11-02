@@ -57,6 +57,10 @@ class QQBotPluginTest(unittest.TestCase):
         status = self.runtime.loader.tools.call("qqbot.status", {})
         self.assertTrue(status.ok)
         self.assertGreaterEqual(status.value["facts"], 1)
+        capabilities = self.runtime.loader.tools.call("qqbot.capabilities", {})
+        self.assertTrue(capabilities.ok)
+        self.assertTrue(capabilities.value["adapter"]["message_loop"])
+        self.assertIn("legacy_bridge", capabilities.value)
 
     def test_degrades_without_nonebot(self):
         has_nonebot = importlib.util.find_spec("nonebot") is not None

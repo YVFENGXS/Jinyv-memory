@@ -77,7 +77,7 @@ class PluginLoader:
         dirs = [Path(path) for path in (plugin_dirs or [self.root / "plugins"])]
         for plugin_dir in dirs:
             if not plugin_dir.exists():
-                self.logger.warning("插件目录不存在：%s", plugin_dir)
+                self.logger.debug("插件目录不存在，跳过：%s", plugin_dir)
                 continue
             for child in sorted(plugin_dir.iterdir()):
                 if not child.is_dir() or child.name.startswith((".", "_")):

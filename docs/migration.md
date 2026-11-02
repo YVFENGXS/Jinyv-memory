@@ -7,6 +7,23 @@
 3. 外围模块先做适配层，再逐模块替换；每搬一个都用旧行为对照。
 4. 第三方/改造版源码不直接入库：保留独立安装脚本或外部仓库。
 5. 不复制第三方完整表结构与命名，只吸收行为级机制。
+6. 插件实现不进主仓库：每个插件是 `E:\Jinyv-plugins\<name>` 下的独立 git 仓库，
+   主仓库只保留 core、契约、加载器、配置与测试。
+7. 本轮执行环境的安全策略禁止把旧 QQ 实现整块复制进新仓库，因此 qqbot 旧能力
+   先提供 `legacy_bridge.py` 只读引用；物理迁移需用户明确授权。
+
+## 1.5 外部插件仓库布局
+
+| 本地路径 | 角色 | 远程地址 | 状态 |
+|---|---|---|---|
+| `E:\Jinyv-plugins\qqbot` | QQ 适配层 + legacy 只读桥 | 待确认（建议 `.../Jinyv-qqbot`） | 已建仓库并提交 |
+| `E:\Jinyv-plugins\desktop-pet` | 桌宠服务端适配层 | 待确认（建议 `.../Jinyv-plugin-desktop-pet`） | 已建仓库并提交 |
+| `E:\Jinyv-plugins\video-call` | 视频通话适配层 | 待确认（建议 `.../Jinyv-plugin-video-call`） | 已建仓库并提交 |
+| `$DSH_HOME\plugins\jinyu-memory-dsh` | DSH 特殊插件（JS/cordis） | 用户 zip，无已知远程 | 源码不复制、不改动 |
+| `var/vendor/dsh-video-storyboard` | 第三方分镜 CLI | `https://github.com/SAOS-3624/dsh-video-storyboard` | 独立安装，固定 ref |
+
+加载器由 `config/core.toml` 的 `[plugins].search_paths` 或 `JINYV_PLUGIN_PATHS`
+驱动，按顺序扫描多个目录。主仓库 `plugins/` 当前不参与扫描。
 
 ## 2. 模块映射
 
@@ -34,14 +51,14 @@
 
 | 旧位置 | 新位置 | 状态 |
 |---|---|---|
-| `jinyu_memory/__init__.py`（消息入口/命令/轮换/主动话题） | `plugins/qqbot/__init__.py` + `nonebot_adapter.py` | 🟡 部分：消息→记忆闭环、工具、钩子、降级 |
-| `richmsg.py`（富消息/贴纸/SSRF） | 待迁入 qqbot 子模块 | ⬜ P2 |
-| `linkmeta.py`（链接/视频/分镜调用） | qqbot 子模块 + dsh 适配层 | ⬜ P2/P5 |
-| `bili_live.py`（B 站） | 计划独立 `plugins/bili-live` | ⬜ P2 |
-| `reminder.py`（提醒） | qqbot 定时任务或独立插件 | ⬜ P2 |
-| `owner_gate.py`（主人绑定） | core 身份模型 + qqbot 命令 | ⬜ P2 |
-| `asr.py`（语音转文字） | qqbot 子模块 | ⬜ P2 |
-| `mcp_client.py` | 独立 `plugins/mcp-tools` | ⬜ P2 |
+| `jinyu_memory/__init__.py`（消息入口/命令/轮换/主动话题） | `E:\Jinyv-plugins\qqbot\__init__.py` + `nonebot_adapter.py` | 🟡 适配层已迁；旧入口逻辑待授权 |
+| `richmsg.py`（富消息/贴纸/SSRF） | qqbot 仓库（legacy 只读桥） | 🟡 仅桥接，未物理迁入 |
+| `linkmeta.py`（链接/视频/分镜调用） | qqbot 仓库 + dsh 桥 | 🟡 仅桥接，未物理迁入 |
+| `bili_live.py`（B 站） | 计划 qqbot 仓库内独立能力模块 | 🟡 仅桥接 |
+| `reminder.py`（提醒） | qqbot 定时任务 | 🟡 仅桥接 |
+| `owner_gate.py`（主人绑定） | core 身份模型 + qqbot 命令 | 🟡 仅桥接 |
+| `asr.py`（语音转文字） | qqbot 能力模块 | 🟡 仅桥接 |
+| `mcp_client.py` | qqbot 能力模块 / 独立插件 | 🟡 仅桥接 |
 | `task_supervisor.py` | `core/schedules.py` + `core/lease.py` 已部分替代 | 🟡 部分 |
 
 ### 2.3 桌宠 / 视频通话
@@ -60,16 +77,17 @@
 | 来源 | 新位置 | 状态 |
 |---|---|---|
 | 用户 zip `jinyu-memory-dsh` | `scripts/install_dsh_plugin.py` 安装到 `$DSH_HOME/plugins/` | ✅ 安装脚本实测通过；源码不入库 |
-| zip 的本地记忆仓 | `plugins/dsh-video-storyboard/store.py` 只读适配 + `dsh.import_session` | ✅ 行为级导入 |
-| 第三方 `dsh-video-storyboard` CLI | `scripts/install_storyboard.sh` + 插件检测 `bin/storyboard.mjs` | ✅ 安装脚本；调用待 P5 |
+| zip 的本地记忆仓 | `src/jinyv_memory/integrations/dsh_store.py` 只读适配 | ✅ 行为级读取 |
+| DSH ↔ 核心 | `src/jinyv_memory/integrations/dsh.py`（检测/启停/导入/导出/journal） | ✅ 特殊接入，不进插件加载器 |
+| 第三方 `dsh-video-storyboard` CLI | `scripts/install_storyboard.sh` + 桥接检测 `bin/storyboard.mjs` | ✅ 安装脚本；调用待 P5 |
 | 旧 `deploy/install_storyboard.sh` | `scripts/install_storyboard.sh` | ✅ 改造迁移 |
-| 第三方/改造版源码 | **不入库** | ✅ 遵守旧约定 |
+| 第三方/改造版源码 | **不复制** | ✅ 留在 zip / `$DSH_HOME` |
 
 ### 2.5 运行入口与基础设施
 
 | 旧位置 | 新位置 | 状态 |
 |---|---|---|
-| `bot.py`（11 行 NoneBot 启动） | `jinyv_memory.cli` + `plugins/qqbot/nonebot_adapter.py` | 🟡 需真实 NoneBot 环境验证 |
+| `bot.py`（11 行 NoneBot 启动） | `jinyv_memory.cli` + `E:\Jinyv-plugins\qqbot\nonebot_adapter.py` | 🟡 需真实 NoneBot 环境验证 |
 | `requirements.txt` | `pyproject.toml`（core 零依赖；插件 extras） | ✅ |
 | `.env.example` | `.env.example` | 🟡 重新整理，未做旧变量全量对照 |
 | `tools/serve.py`（宿主 HTTP API） | 计划 `plugins/host-api` 或 core 内置 HTTP | ⬜ P1 |
@@ -81,10 +99,12 @@
 ### P0（本轮，已完成）
 - 新仓库、git 新历史（未 push）。
 - core 13 模块迁移 + `MemoryAPI` + 租约/幂等。
-- 插件契约、加载器、事件/工具/钩子/调度四套注册表。
-- qqbot 最小闭环 + NoneBot 可选降级。
-- desktop-pet / video-call / dsh-video-storyboard 骨架与健康检查。
-- 自检 16 项、unittest 12 项、DSH Node 测试 15 项。
+- 插件契约、多路径加载器、事件/工具/钩子/调度四套注册表。
+- 插件实现移到 `E:\Jinyv-plugins\{qqbot,desktop-pet,video-call}` 独立 git 仓库。
+- qqbot 外部加载并跑通最小闭环 + NoneBot 可选降级。
+- dsh 特殊接入：检测/可选启停/导入/导出/journal/冲突。
+- 自检 22 项、unittest 14 项、DSH Node 测试 15 项。
+- 待授权：主仓库 `plugins/` 副本删除；旧 QQ 能力物理迁入 qqbot 仓库。
 
 ### P1：核心行为对齐
 - 迁 104 项回归，确认 DB schema、水位线、披露、承诺、Dream 与旧版逐项一致。
@@ -123,6 +143,8 @@
 | 旧仓库继续改动 | 迁移副本分叉 | 定同步节奏；P1 前冻结核心行为 |
 | 远程 main 非空 | 覆盖会丢历史 | 只推新分支；合并走 PR |
 | QQ 入口耦合深 | 迁移回归量大 | 逐模块搬；先工具/钩子后命令 |
+| 旧源码复制被策略阻断 | 功能暂留旧仓库 | 只读 legacy 桥；获得授权后新建 + 改写 |
+| 主仓库副本残留 | 违反「只保留 core」口径 | 从扫描路径排除；确认后 `git rm` |
 | 多进程写同一 SQLite | 游标互抢/重复归档 | 宿主 API 单写者；租约 + 幂等 |
 | 桌宠 AGPL | 许可证污染主仓库 | 独立仓库、独立进程、协议交互 |
 | dsh 约定冲突 | 违约/审计风险 | 安装脚本；源码不入库 |

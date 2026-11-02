@@ -2,6 +2,7 @@
 """加载器：发现、注册、降级、失败隔离与依赖顺序。"""
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import textwrap
@@ -9,6 +10,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+EXTERNAL = Path(os.environ.get("JINYV_PLUGIN_PATHS") or ROOT.parent / "Jinyv-plugins")
 sys.path.insert(0, str(ROOT / "src"))
 
 from jinyv_memory.runtime import JinyvRuntime  # noqa: E402
@@ -44,12 +46,14 @@ class LoaderTest(unittest.TestCase):
         runtime.start()
         return runtime
 
-    def test_discovers_all_four_plugins(self):
+    def test_discovers_external_plugins(self):
+        self.assertTrue(EXTERNAL.exists(), f"外部插件目录不存在：{EXTERNAL}")
         runtime = self._boot()
         try:
             ids = set(runtime.loader.records)
-            self.assertTrue({"qqbot", "desktop-pet", "video-call",
-                             "dsh-video-storyboard"} <= ids)
+            self.assertTrue({"qqbot", "desktop-pet", "video-call"} <= ids)
+            self.assertNotIn("dsh-video-storyboard", ids)
+            self.assertTrue(any(str(EXTERNAL) == str(path) for path in runtime._plugin_dirs))
             self.assertIsNotNone(runtime.loader.tools.get("qqbot.remember"))
             self.assertIsNotNone(runtime.loader.tools.get("qqbot.recall"))
             self.assertIsNotNone(runtime.loader.schedules.get("qqbot.heartbeat"))
@@ -75,7 +79,7 @@ class LoaderTest(unittest.TestCase):
                             raise RuntimeError("boom")
                     return Bad()
             """)
-            runtime = self._boot([base, ROOT / "plugins"])
+            runtime = self._boot([base, EXTERNAL])
             try:
                 bad = runtime.loader.get("bad-plugin")
                 self.assertIsNotNone(bad)

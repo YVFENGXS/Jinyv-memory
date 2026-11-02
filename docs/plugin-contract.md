@@ -4,12 +4,20 @@
 
 ## 1. 目录与 manifest
 
+插件是**独立 git 仓库**，默认放在 `E:\Jinyv-plugins\<插件目录>`，不进入主仓库。
+加载器按 `config/core.toml` 的 `[plugins].search_paths`（或 `JINYV_PLUGIN_PATHS`）
+扫描多个目录；同一 `id` 冲突只记错，不覆盖。
+
 ```
-plugins/<插件目录>/
+E:\Jinyv-plugins\<插件目录>/
 ├── plugin.toml
 ├── __init__.py        # 包入口，可用相对导入
+├── README.md          # 仓库地址、配置、能力状态
 └── ...                # 其他模块
 ```
+
+> dsh 是特殊接入类型（JS/cordis），不实现本契约，也不被加载器扫描；
+> 由 `src/jinyv_memory/integrations/dsh.py` 负责检测、启停、导入/导出与冲突记录。
 
 ```toml
 [plugin]
@@ -209,7 +217,7 @@ class Health:
 ## 11. 最小插件示例
 
 ```python
-# plugins/hello/__init__.py
+# E:\Jinyv-plugins\hello\__init__.py
 from jinyv_memory.contract import Health, PluginContext, ToolSpec
 from jinyv_memory.contract import PluginManifest
 

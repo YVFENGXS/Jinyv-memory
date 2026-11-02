@@ -8,6 +8,7 @@ from typing import Any
 
 from .config import Config
 from .core.runtime import build_core
+from .integrations.dsh import DshBridge
 from .loader import PluginLoader
 from .paths import Paths
 
@@ -30,11 +31,23 @@ class JinyvRuntime:
             runtime=self.core,
             logger=self.logger,
         )
-        self._plugin_dirs = plugin_dirs or []
+        self._plugin_dirs = (
+            [Path(path) for path in plugin_dirs]
+            if plugin_dirs is not None
+            else self.config.plugin_search_paths()
+        )
+        self.dsh = DshBridge.from_file(
+            self.paths.config_dir / "integrations" / "dsh.toml",
+            memory=self.core.memory,
+            paths=self.paths,
+            logger=logging.getLogger("jinyv.dsh"),
+        )
         self.started = False
 
     def load_plugins(self) -> None:
-        self.loader.discover(self._plugin_dirs or [self.paths.root / "plugins"])
+        if not self._plugin_dirs:
+            self.logger.warning("未配置插件搜索路径：检查 [plugins].search_paths 或 JINYV_PLUGIN_PATHS")
+        self.loader.discover(self._plugin_dirs)
         self.loader.load_all()
 
     def start(self) -> None:
@@ -42,11 +55,14 @@ class JinyvRuntime:
             return
         self.core.memory.open_session(self.core.accounts.default_key)
         self.loader.start_all()
+        if self.dsh.enabled and bool(self.dsh.config.get("auto_start", False)):
+            self.dsh.start()
         self.started = True
 
     def shutdown(self) -> None:
         if not self.started:
             return
+        self.dsh.stop()
         self.loader.stop_all()
         self.core.shutdown()
         self.started = False
@@ -56,6 +72,8 @@ class JinyvRuntime:
             "ok": True,
             "core": self.core.health(),
             "plugins": self.loader.health(),
+            "plugin_search_paths": [str(path) for path in self._plugin_dirs],
+            "dsh": self.dsh.status(),
         }
 
 

@@ -1,0 +1,19 @@
+# DSH 特殊接入（JS/cordis 插件，不进入 Python 插件契约）
+enabled = true
+# 留空读 DSH_HOME，再退到 ~/.dsh
+dsh_home = ""
+# DSH 改造版安装目录；留空 = $DSH_HOME/plugins/jinyu-memory-dsh
+# 源码不进入主仓库，也不复制到 Jinyv-plugins；由 scripts/install_dsh_plugin.py 安装
+plugin_dir = ""
+# 第三方视频分镜 CLI 目录；留空读 RP_STORYBOARD_DIR
+storyboard_dir = ""
+# 导入/导出使用哪个核心 lane
+account = "desktop"
+# 可选托管：auto_start=true 且配置 start_command 时由主进程启停
+auto_start = false
+start_command = []
+stop_timeout_seconds = 5
+# core-wins：双端同时变化时保留核心版本，并把冲突写入 .jinyv-bridge.json
+conflict_policy = "core-wins"
+# both / import / export
+sync_mode = "both"
