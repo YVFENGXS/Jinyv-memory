@@ -145,7 +145,8 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 - **启停**：仅当 `auto_start=true` 且配置 `start_command` 时由主进程 `Popen` 托管；默认不启动第三方进程。
 - **导入**：`cards.json / facts.json` → `event_cards / durable_facts`；核心 UNIQUE 键 + journal 双端哈希，重复导入不产生副本。
 - **导出**：核心卡片/事实 → DSH 同结构文件；`.jinyv-bridge.json` 记录 `core_sig / dsh_sig`，重复导出幂等。
-- **冲突**：同一逻辑条目双端同时变化 → 默认 `core-wins`，冲突写入 journal；DSH 单端变化保留用户改动并记录。事实按文本 append-only，不做原地覆盖。
+- **冲突**：同一逻辑条目双端同时变化 → 默认 `dsh-wins`，以 DSH 文本为准；核心旧结论写入 journal 与 `var/integrations/dsh/conflicts.jsonl` 修订归档，不物理删除核心记录。单边变化保持现状（DSH 单边改动保留用户修改）。
+- **插件侧**：安装脚本把 `scripts/dsh_wins_adapter.js` 放到插件 `lib/jinyv-dsh-wins.js`，在 `lib/index.js` 注入 `installDshWins(ctx, createStore)`，并备份 `index.js.jinyv-orig`；`--unpatch` 可回滚。插件侧在 `.jinyv-bridge.json` 写入 `dsh_claims` 与 `config.json` 的 `jinyvConflictPolicy=dsh-wins`。
 - **安装**：`scripts/install_dsh_plugin.py --source <zip|dir>` 校验后安装到 `$DSH_HOME/plugins/jinyu-memory-dsh`；第三方 CLI 由 `scripts/install_storyboard.sh` 固定 ref 安装。
 - 已验证：dsh zip 自带 Node 测试 15/15；桥接导入/导出/幂等/冲突测试通过。
 

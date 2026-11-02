@@ -8,10 +8,11 @@ DSH 侧是 JS/cordis 插件，按它自己的宿主机制运行；核心侧只�
 4. 桥接：核心 → DSH 的导出，带 journal、冲突记录与确定性裁决。
 
 同步语义：
-- 导入：DSH 新条目进入核心；同一 id 内容变化视为冲突，默认 core-wins（保留核心，
-  记录冲突），不静默覆盖。
+- 导入：DSH 新条目进入核心；同一 id 内容变化时写入冲突记录，等待导出阶段裁决。
 - 导出：核心条目写入 DSH；用 `.jinyv-bridge.json` 记录 core/dsh 双端内容哈希。
-  只有一端变化时同步该端；两端同时变化时按 `conflict_policy` 裁决（默认 core-wins）。
+  只有一端变化时同步该端；两端同时变化时按 `conflict_policy` 裁决（默认 dsh-wins）。
+- dsh-wins：以 DSH 文本为准，核心旧结论进入 journal 与 conflicts.jsonl 修订归档，
+  不物理删除核心记录。
 - 幂等：核心侧靠 event_cards.idempotency_key / durable_facts UNIQUE；桥接侧靠
   journal 的双端哈希与稳定 id，重复 import/export 不产生副本。
 """
@@ -46,7 +47,7 @@ DEFAULTS: dict[str, Any] = {
     "auto_start": False,
     "start_command": [],
     "stop_timeout_seconds": 5.0,
-    "conflict_policy": "core-wins",
+    "conflict_policy": "dsh-wins",
     "sync_mode": "both",
 }
 
@@ -225,7 +226,7 @@ class DshBridge:
             "managed": running,
             "pid": self._process.pid if running else None,
             "account": self.account,
-            "conflict_policy": str(self.config.get("conflict_policy") or "core-wins"),
+            "conflict_policy": str(self.config.get("conflict_policy") or "dsh-wins"),
             **self.detect(),
         }
 
@@ -278,6 +279,51 @@ class DshBridge:
             finally:
                 self._log_file = None
 
+    # ------------------------------------------------------------ 冲突策略辅助
+    def _policy(self) -> str:
+        value = str(self.config.get("conflict_policy") or "dsh-wins").strip().lower()
+        return "core-wins" if value == "core-wins" else "dsh-wins"
+
+    def _archive_conflict(self, record: dict[str, Any]) -> None:
+        """核心侧冲突修订归档：不物理删除旧结论，追加到独立 JSONL。"""
+        directory = self.paths.data_dir / "integrations" / "dsh"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "conflicts.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _apply_dsh_card(self, core_card: Mapping[str, Any], target: Mapping[str, Any],
+                        account: str) -> dict[str, Any]:
+        """dsh-wins：把 DSH 卡片文本写回核心卡，旧核心文本进入冲突归档。"""
+        core_id = str(core_card.get("event_id") or "")
+        dsh_text = str(target.get("summary") or "").strip()
+        old_core = str(core_card.get("summary") or "")
+        cid = self.memory.lane(account).character_id
+        old, updated = self.memory.db.update_card(core_id, cid, dsh_text)
+        return {
+            "updated": bool(updated),
+            "core_id": core_id,
+            "core_before": old or old_core,
+            "new_dsh": dsh_text,
+            "revision": int(core_card.get("revision") or 1),
+        }
+
+    def _apply_dsh_fact(self, core_fact: Mapping[str, Any], target: Mapping[str, Any],
+                        account: str) -> dict[str, Any]:
+        """dsh-wins：把 DSH 事实文本写回核心事实，旧核心文本进入冲突归档。"""
+        core_id = core_fact.get("id")
+        dsh_text = str(target.get("text") or "").strip()
+        old_core = str(core_fact.get("text") or "")
+        cid = self.memory.lane(account).character_id
+        old, changed = self.memory.db.update_fact(core_id, cid, dsh_text)
+        return {
+            "updated": bool(changed),
+            "core_id": str(core_id),
+            "core_before": old or old_core,
+            "new_dsh": dsh_text,
+            "revision": int(core_fact.get("revision") or 1),
+        }
+
     # ------------------------------------------------------------ 导入
     def _session(self, ref: str) -> dsh_store.DshSession:
         return dsh_store.find_session(ref, self.home)
@@ -302,7 +348,7 @@ class DshBridge:
             if previous is not None:
                 conflicts.append({
                     "kind": "card", "id": card_id,
-                    "reason": "DSH 条目在导入后发生变化；按 core-wins 保留核心版本",
+                    "reason": f"DSH 条目在导入后发生变化；等待导出阶段按 {self._policy()} 裁决",
                     "previous": previous, "current": signature,
                 })
                 continue
@@ -321,7 +367,7 @@ class DshBridge:
             if previous is not None:
                 conflicts.append({
                     "kind": "fact", "id": fact_id,
-                    "reason": "DSH 条目在导入后发生变化；按 core-wins 保留核心版本",
+                    "reason": f"DSH 条目在导入后发生变化；等待导出阶段按 {self._policy()} 裁决",
                     "previous": previous, "current": signature,
                 })
                 continue
@@ -378,9 +424,11 @@ class DshBridge:
         cards = [dict(item) for item in session.cards]
         facts = [dict(item) for item in session.facts]
         cards_by_id = {str(item.get("id") or ""): item for item in cards}
+        facts_by_id = {str(item.get("id") or ""): item for item in facts}
         facts_by_text = {str(item.get("text") or ""): item for item in facts}
         stats = {"cards_new": 0, "cards_updated": 0, "facts_new": 0, "facts_updated": 0,
-                 "skipped": 0, "conflicts": 0}
+                 "core_updates": 0, "skipped": 0, "conflicts": 0}
+        policy = self._policy()
         conflicts: list[dict[str, Any]] = []
 
         for core_card in snapshot["cards"]:
@@ -415,19 +463,44 @@ class DshBridge:
                 stats["cards_updated"] += 1
                 continue
             if dsh_sig != entry.get("dsh_sig") and core_sig != entry.get("core_sig"):
-                conflicts.append({
-                    "kind": "card", "id": core_id,
-                    "reason": "双端同时变化；按 core-wins 用核心版本覆盖 DSH",
-                })
                 stats["conflicts"] += 1
-                merged = dict(target)
-                merged.update({key: value for key, value in mapped.items() if key != "id"})
-                merged["id"] = target.get("id", dsh_id)
-                self._replace_by_id(cards, merged)
-                journal["exported"][entry_key] = {
-                    "dsh_id": merged["id"], "core_sig": core_sig, "dsh_sig": core_sig,
-                }
-                stats["cards_updated"] += 1
+                if policy == "dsh-wins":
+                    applied = self._apply_dsh_card(core_card, target, account or self.account)
+                    conflict = {
+                        "kind": "card", "id": core_id, "winner": "dsh",
+                        "policy": "dsh-wins",
+                        "core_before": applied["core_before"],
+                        "new_dsh": applied["new_dsh"],
+                        "core_updated": applied["updated"],
+                        "core_revision": applied["revision"],
+                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    conflicts.append(conflict)
+                    self._archive_conflict(conflict)
+                    if applied["updated"]:
+                        stats["core_updates"] += 1
+                    after_sig = _card_sig(self._core_card_to_dsh(
+                        {**core_card, "summary": applied["new_dsh"]}
+                    ))
+                    journal["exported"][entry_key] = {
+                        "dsh_id": target.get("id", dsh_id),
+                        "core_sig": after_sig, "dsh_sig": dsh_sig,
+                        "last_conflict": "dsh-wins",
+                    }
+                else:
+                    conflicts.append({
+                        "kind": "card", "id": core_id,
+                        "reason": "双端同时变化；按 core-wins 用核心版本覆盖 DSH",
+                    })
+                    merged = dict(target)
+                    merged.update({key: value for key, value in mapped.items()
+                                   if key != "id"})
+                    merged["id"] = target.get("id", dsh_id)
+                    self._replace_by_id(cards, merged)
+                    journal["exported"][entry_key] = {
+                        "dsh_id": merged["id"], "core_sig": core_sig, "dsh_sig": core_sig,
+                    }
+                    stats["cards_updated"] += 1
             elif dsh_sig != entry.get("dsh_sig"):
                 # 只有 DSH 改动：保留用户改动，不覆盖
                 journal["exported"][entry_key]["dsh_sig"] = dsh_sig
@@ -448,16 +521,97 @@ class DshBridge:
             if str(core_fact.get("speaker") or "") == "dsh":
                 continue                    # 来自 DSH 的事实不回声
             text = str(core_fact.get("text") or "").strip()
-            if not text or text in facts_by_text:
+            if not text:
                 continue
+            core_id = str(core_fact.get("id") or "")
             mapped = self._core_fact_to_dsh(core_fact)
-            facts.append(mapped)
-            facts_by_text[text] = mapped
-            stats["facts_new"] += 1
+            core_sig = _fact_sig(mapped)
+            entry_key = f"fact:{core_id}"
+            entry = journal["exported"].get(entry_key)
+            target_id = str((entry or {}).get("dsh_id") or mapped["id"])
+            target = facts_by_id.get(target_id)
+            if target is None:
+                facts.append(mapped)
+                facts_by_id[mapped["id"]] = mapped
+                facts_by_text[text] = mapped
+                journal["exported"][entry_key] = {
+                    "dsh_id": mapped["id"], "core_sig": core_sig,
+                    "dsh_sig": core_sig, "core_text": text,
+                    "speaker": str(core_fact.get("speaker") or ""),
+                }
+                stats["facts_new"] += 1
+                continue
+            dsh_sig = _fact_sig(target)
+            if entry is None:
+                journal["exported"][entry_key] = {
+                    "dsh_id": target.get("id", mapped["id"]),
+                    "core_sig": core_sig, "dsh_sig": dsh_sig,
+                    "core_text": text, "speaker": str(core_fact.get("speaker") or ""),
+                }
+                stats["skipped"] += 1
+                continue
+            if dsh_sig != entry.get("dsh_sig") and core_sig != entry.get("core_sig"):
+                stats["conflicts"] += 1
+                if policy == "dsh-wins":
+                    applied = self._apply_dsh_fact(
+                        core_fact, target,
+                        account or self.account,
+                    )
+                    conflict = {
+                        "kind": "fact", "id": core_id, "winner": "dsh",
+                        "policy": "dsh-wins",
+                        "core_before": applied["core_before"],
+                        "new_dsh": applied["new_dsh"],
+                        "core_updated": applied["updated"],
+                        "core_revision": applied["revision"],
+                        "speaker": str(core_fact.get("speaker") or ""),
+                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    conflicts.append(conflict)
+                    self._archive_conflict(conflict)
+                    if applied["updated"]:
+                        stats["core_updates"] += 1
+                    journal["exported"][entry_key] = {
+                        "dsh_id": target.get("id", mapped["id"]),
+                        "core_sig": _fact_sig({**mapped, "text": applied["new_dsh"]}),
+                        "dsh_sig": dsh_sig, "core_text": applied["new_dsh"],
+                        "speaker": str(core_fact.get("speaker") or ""),
+                        "last_conflict": "dsh-wins",
+                    }
+                else:
+                    conflicts.append({
+                        "kind": "fact", "id": core_id,
+                        "reason": "双端同时变化；按 core-wins 用核心版本覆盖 DSH",
+                    })
+                    target.update({key: value for key, value in mapped.items()
+                                  if key != "id"})
+                    target["id"] = str(target.get("id") or mapped["id"])
+                    journal["exported"][entry_key] = {
+                        "dsh_id": target["id"], "core_sig": core_sig,
+                        "dsh_sig": core_sig, "core_text": text,
+                        "speaker": str(core_fact.get("speaker") or ""),
+                    }
+                    stats["facts_updated"] += 1
+            elif dsh_sig != entry.get("dsh_sig"):
+                journal["exported"][entry_key]["dsh_sig"] = dsh_sig
+                journal["exported"][entry_key]["dsh_text"] = str(target.get("text") or "")
+                stats["skipped"] += 1
+            elif core_sig != entry.get("core_sig"):
+                target.update({key: value for key, value in mapped.items()
+                              if key != "id"})
+                target["id"] = str(target.get("id") or mapped["id"])
+                journal["exported"][entry_key] = {
+                    "dsh_id": target["id"], "core_sig": core_sig,
+                    "dsh_sig": core_sig, "core_text": text,
+                    "speaker": str(core_fact.get("speaker") or ""),
+                }
+                stats["facts_updated"] += 1
+            else:
+                stats["skipped"] += 1
 
         if stats["cards_new"] or stats["cards_updated"]:
             _write_json(session.path / "cards.json", cards)
-        if stats["facts_new"]:
+        if stats["facts_new"] or stats["facts_updated"]:
             _write_json(session.path / "facts.json", facts)
         if conflicts:
             journal["conflicts"].extend(conflicts)

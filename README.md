@@ -64,7 +64,7 @@ E:\Jinyv-plugins/                     # 独立插件仓库集合
 | 插件契约 / 加载器 | 已完成；支持多路径扫描、依赖排序、工具/钩子/事件/定时任务、失败隔离与降级 |
 | qqbot 插件仓库 | 已完成独立仓库；外部加载后跑通 10 轮闭环 |
 | desktop-pet / video-call | 已完成独立适配器仓库；可被发现、注册、健康检查、正常降级 |
-| dsh 特殊接入 | 已完成检测、可选启停、导入/导出、journal 幂等、core-wins 冲突记录 |
+| dsh 特殊接入 | 已完成检测、可选启停、导入/导出、journal 幂等、dsh-wins 冲突记录 |
 | QQ 旧能力迁移 | 已建 6 项能力的插件侧适配入口（按顺序）；旧源码未复制，仍由 `legacy_bridge.py` 只读引用 |
 | 主仓库 plugins 清理 | ✅ 已删除四个实现副本，仅保留说明文件 |
 | dsh 安装 | ✅ `jinyv-memory dsh install --source <zip|目录>` 可安装到 DSH_HOME |
@@ -94,6 +94,11 @@ python -m jinyv_memory.cli dsh status
 python -m jinyv_memory.cli dsh import --session <会话目录>
 python -m jinyv_memory.cli dsh export --session <会话目录>
 python -m jinyv_memory.cli dsh sync --session <会话目录>
+
+# 回滚 dsh-wins 插件侧补丁
+python scripts/install_dsh_plugin.py --unpatch --target <插件安装目录>
+# Node 侧适配测试
+node --test tests/dsh_wins.test.mjs
 ```
 
 插件搜索路径：
@@ -113,8 +118,9 @@ dsh 不是 Python 插件，加载器不会扫描它。核心侧 `integrations/ds
 2. **启停**：只有配置 `start_command` 且 `auto_start=true` 才托管进程；默认不替用户启动。
 3. **导入**：DSH `cards.json/facts.json` → 核心 `event_cards/durable_facts`，核心唯一键兜底幂等。
 4. **导出**：核心记忆 → DSH 同结构文件；用 `.jinyv-bridge.json` 记录双端哈希，重复导出不产生副本。
-5. **冲突**：同一逻辑条目双端同时变化时默认 `core-wins`，冲突写入 journal，不静默覆盖；DSH 单端变化保留用户改动并记录状态。
-6. **不复制源码**：DSH 源码只存在于用户 zip / `$DSH_HOME`，主仓库与 `Jinyv-plugins` 都不持有副本。
+5. **冲突**：同一逻辑条目双端同时变化时默认 `dsh-wins`，以 DSH 文本为准；核心旧结论进入 `.jinyv-bridge.json` 与 `var/integrations/dsh/conflicts.jsonl` 修订归档，不物理删除核心记录。
+6. **插件侧生效**：安装脚本把 `scripts/dsh_wins_adapter.js` 放入插件 `lib/`，并在 `lib/index.js` 注入 `installDshWins(ctx, createStore)`；备份 `index.js.jinyv-orig`，`--unpatch` 可回滚。
+7. **不复制源码**：DSH 源码只存在于用户 zip / `$DSH_HOME`，主仓库与 `Jinyv-plugins` 都不持有副本。
 
 ## 五、迁移状态
 
@@ -140,7 +146,7 @@ dsh 不是 Python 插件，加载器不会扫描它。核心侧 `integrations/ds
 1. **QQ 旧能力下一步**：适配入口已建，但旧源码不能复制。是否改为逐模块人工重写（不复制旧文件），或接受 submodule 引用旧仓库？
 2. **三个新插件仓库远程地址**：qqbot / desktop-pet / video-call 的 GitHub 仓库名与归属？
 3. **dsh 改造版安装**：继续用 zip（已支持 `dsh install`），还是后续提供 git 仓库？
-4. **dsh 同步策略**：默认 `core-wins` 是否可接受？是否需要 `dsh-wins` 或人工合并队列？
+4. **dsh 同步策略**：已按确认改为 `dsh-wins`；`core-wins` 仅作为配置回退保留。是否需要人工合并队列待定。
 5. **是否合并到 `main`**：新架构已在 `refactor/plugin-core`；是否走 PR 合并，或继续保留分支。
 6. **桌宠/通话部署**：统一用 `external/` 或系统路径；视频通话是否强制只走宿主 API。
 7. **引擎副本策略**：vendored + 同步脚本，还是 subtree/submodule。

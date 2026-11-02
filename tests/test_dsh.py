@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DSH 特殊接入：检测、导入幂等、导出幂等、冲突（core-wins）与 journal。"""
+"""DSH 特殊接入：检测、导入幂等、导出幂等、冲突（dsh-wins）与 journal。"""
 from __future__ import annotations
 
 import json
@@ -85,19 +85,48 @@ class DshBridgeTest(unittest.TestCase):
                     if c["event_id"] == "C-1")
         self.assertEqual(card["knowledge_boundary"], "self")
 
-    def test_conflict_core_wins(self):
+    def test_conflict_dsh_wins(self):
         self.bridge.import_session("sess-a")
+        # 造一条先由核心导出、之后两端都改过的记忆
+        self.runtime.core.memory.import_external("desktop", [{
+            "event_id": "core-conflict",
+            "summary": "核心最初文本",
+            "entity_hooks": ["冲突"],
+            "rel_hooks": [],
+            "knowledge_boundary": "both",
+            "importance": 0.7,
+            "turn_start": 9,
+            "turn_end": 9,
+        }], [])
+        self.bridge.export_session("sess-a")
+        self.runtime.core.memory.db.update_card(
+            "core-conflict", "jinyu", "核心侧新文本",
+        )
         cards = json.loads((self.session_dir / "cards.json").read_text(encoding="utf-8"))
-        cards[0]["summary"] = "DSH 侧改写的摘要"
+        target = next(card for card in cards if card.get("jinyv_core_id") == "core-conflict")
+        target["summary"] = "DSH 侧新文本"
         (self.session_dir / "cards.json").write_text(
             json.dumps(cards, ensure_ascii=False), encoding="utf-8"
         )
-        result = self.bridge.import_session("sess-a")
+        result = self.bridge.export_session("sess-a")
         self.assertEqual(result["conflicts"], 1)
-        self.assertEqual(result["cards_inserted"], 0)
-        card = next(c for c in self.runtime.core.memory.recent_cards("desktop", 20)
-                    if c["event_id"] == "C-1")
-        self.assertEqual(card["summary"], "主人把秘密告诉了瑾瑜")
+        self.assertEqual(result["core_updates"], 1)
+        core_card = next(c for c in self.runtime.core.memory.recent_cards("desktop", 20)
+                         if c["event_id"] == "core-conflict")
+        self.assertEqual(core_card["summary"], "DSH 侧新文本")
+        journal = json.loads((self.session_dir / ".jinyv-bridge.json").read_text(
+            encoding="utf-8"
+        ))
+        conflict = journal["conflicts"][-1]
+        self.assertEqual(conflict["winner"], "dsh")
+        self.assertEqual(conflict["policy"], "dsh-wins")
+        self.assertEqual(conflict["core_before"], "核心侧新文本")
+        self.assertEqual(conflict["new_dsh"], "DSH 侧新文本")
+        archive = self.runtime.paths.data_dir / "integrations" / "dsh" / "conflicts.jsonl"
+        self.assertTrue(archive.exists())
+        lines = archive.read_text(encoding="utf-8").strip().splitlines()
+        self.assertTrue(any("DSH 侧新文本" in line and "核心侧新文本" in line
+                            for line in lines))
 
     def test_export_idempotency_and_journal(self):
         self.bridge.import_session("sess-a")

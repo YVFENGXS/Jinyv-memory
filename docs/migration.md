@@ -78,7 +78,8 @@
 |---|---|---|
 | 用户 zip `jinyu-memory-dsh` | `scripts/install_dsh_plugin.py` 安装到 `$DSH_HOME/plugins/` | ✅ 安装脚本实测通过；源码不入库 |
 | zip 的本地记忆仓 | `src/jinyv_memory/integrations/dsh_store.py` 只读适配 | ✅ 行为级读取 |
-| DSH ↔ 核心 | `src/jinyv_memory/integrations/dsh.py`（检测/启停/导入/导出/journal） | ✅ 特殊接入，不进插件加载器 |
+| DSH ↔ 核心 | `src/jinyv_memory/integrations/dsh.py`（检测/启停/导入/导出/journal/dsh-wins） | ✅ 特殊接入，不进插件加载器 |
+| DSH 插件侧 dsh-wins | `scripts/dsh_wins_adapter.js` + 安装器幂等注入/`--unpatch` | ✅ 可回滚补丁 |
 | 第三方 `dsh-video-storyboard` CLI | `scripts/install_storyboard.sh` + 桥接检测 `bin/storyboard.mjs` | ✅ 安装脚本；调用待 P5 |
 | 旧 `deploy/install_storyboard.sh` | `scripts/install_storyboard.sh` | ✅ 改造迁移 |
 | 第三方/改造版源码 | **不复制** | ✅ 留在 zip / `$DSH_HOME` |

@@ -13,7 +13,8 @@ account = "desktop"
 auto_start = false
 start_command = []
 stop_timeout_seconds = 5
-# core-wins：双端同时变化时保留核心版本，并把冲突写入 .jinyv-bridge.json
-conflict_policy = "core-wins"
+# dsh-wins：双端同时变化时以 DSH 文本为准，核心旧结论进入 journal/冲突归档
+# 可选 core-wins（旧的保留核心版本策略）
+conflict_policy = "dsh-wins"
 # both / import / export
 sync_mode = "both"
