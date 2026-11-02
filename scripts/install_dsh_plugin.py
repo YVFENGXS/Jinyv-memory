@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"已安装：{target}")
     print("下一步：")
     print("  1) 重启 DSH，确认插件列表出现 jinyu-memory")
-    print("  2) 在 config/plugins/dsh-video-storyboard.toml 设置 install_dir =", target)
+    print("  2) 在 config/integrations/dsh.toml 设置 plugin_dir =", target)
     print("  3) 保持源码在安装目录，不提交进 Jinyv-memory 仓库")
     return 0
 

@@ -87,7 +87,8 @@ python -m jinyv_memory.cli plugins
 # 本地对话
 python -m jinyv_memory.cli --mock chat --account owner_qq
 
-# dsh 桥接
+# dsh 安装到 DSH_HOME 与桥接
+python -m jinyv_memory.cli dsh install --source <zip|目录>
 python -m jinyv_memory.cli dsh status
 python -m jinyv_memory.cli dsh import --session <会话目录>
 python -m jinyv_memory.cli dsh export --session <会话目录>

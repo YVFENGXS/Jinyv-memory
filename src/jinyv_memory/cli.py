@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,7 +47,24 @@ def cmd_plugins(args) -> int:
     return 0
 
 
+def cmd_dsh_install(args) -> int:
+    script = Path(args.root) / "scripts" / "install_dsh_plugin.py"
+    if not script.exists():
+        print(f"安装脚本不存在：{script}", file=sys.stderr)
+        return 2
+    command = [sys.executable, str(script), "--source", args.source]
+    if args.target:
+        command.extend(["--target", args.target])
+    if args.force:
+        command.append("--force")
+    if args.dry_run:
+        command.append("--dry-run")
+    return int(subprocess.call(command))
+
+
 def cmd_dsh(args) -> int:
+    if args.dsh_command == "install":
+        return cmd_dsh_install(args)
     runtime = _runtime(args)
     account = getattr(args, "account", None) or "desktop"
     runtime.core.memory.open_session(account)
@@ -263,6 +281,11 @@ def build_parser() -> argparse.ArgumentParser:
     dsh = sub.add_parser("dsh")
     dsh_sub = dsh.add_subparsers(dest="dsh_command", required=True)
     dsh_sub.add_parser("status")
+    install = dsh_sub.add_parser("install", help="把改造版安装到 DSH_HOME/plugins")
+    install.add_argument("--source", required=True, help="zip 或已解压目录")
+    install.add_argument("--target", default=None)
+    install.add_argument("--force", action="store_true")
+    install.add_argument("--dry-run", action="store_true")
     for name in ("import", "export", "sync"):
         item = dsh_sub.add_parser(name)
         item.add_argument("--session", required=True, help="DSH 会话目录名或 id")

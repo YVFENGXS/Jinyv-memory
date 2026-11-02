@@ -1,9 +1,0 @@
-[plugin]
-id = "dsh-video-storyboard"
-name = "DSH Storyboard / Memory Bridge"
-version = "0.1.0"
-kind = "integration"
-entry = "__init__.py"
-description = "DSH 改造版与第三方视频分镜的适配层；源码独立安装，主仓库只保留读取/导入与检测。"
-optional_modules = []
-provides = ["integration.dsh", "tools.storyboard"]

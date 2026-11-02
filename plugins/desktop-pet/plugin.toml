@@ -1,9 +1,0 @@
-[plugin]
-id = "desktop-pet"
-name = "Desktop Pet Adapter"
-version = "0.1.0"
-kind = "platform-adapter"
-entry = "__init__.py"
-description = "desktop-v1 服务端适配层；客户端源码留在 YVFENGXS/Jinyu-pet，不 vendor。"
-optional_modules = ["fastapi", "uvicorn", "websockets"]
-provides = ["platform.desktop", "protocol.desktop-v1"]
