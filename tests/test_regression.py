@@ -3708,6 +3708,65 @@ def test_chapter_scan_cap_advances():
     print("R90 章节扫描上限: OK 触顶标记 / 下一轮继续推进 / 回退 keyset / 尾块并入")
 
 
+def test_fact_inherit_no_cap():
+    """R91：跨 epoch 继承不再按 500 截断——第 501 条以后的旧词条也要搬进新会话。"""
+    db = fresh("/tmp/rp_inherit_all.db")
+    with db._c() as c:
+        for i in range(600):
+            c.execute("INSERT INTO durable_facts(session_id,character_id,turn_end,fact,"
+                      "tags,importance,category,expires_at,speaker)"
+                      " VALUES('qq-u9','c1',1,?,'[]',0.5,'设定',NULL,'')",
+                      (f"旧设定 {i}",))
+    db.inherit_facts("qq-u9", "qq-u9#1", "c1")
+    with db._c() as c:
+        n = c.execute("SELECT COUNT(*) FROM durable_facts"
+                      " WHERE session_id=? AND character_id=?",
+                      ("qq-u9#1", "c1")).fetchone()[0]
+        oldest = c.execute("SELECT 1 FROM durable_facts WHERE session_id=? AND fact=?",
+                           ("qq-u9#1", "旧设定 0")).fetchone()
+    assert n == 600, n
+    assert oldest, "最旧的一条词条被截断，跨 epoch 后检索不到"
+    assert db.count_facts("qq-u9#1", "c1") == 600, db.count_facts("qq-u9#1", "c1")
+    print("R91 词条全量继承: OK 600/600 跨 epoch，最旧一条未丢")
+
+
+def test_card_pool_no_starvation():
+    """R92：同会话 600 张卡时召回池仍全量可见，最旧一张不会被 500 上限挤掉。"""
+    db = fresh("/tmp/rp_card_pool.db")
+    for i in range(600):
+        db.insert_card(_card(event_id=f"E-p{i:04d}", turn_start=i * 2 + 1,
+                             turn_end=i * 2 + 2, summary=f"旧事 {i}",
+                             idempotency_key=f"pool{i}"))
+    cards = db.all_cards("s1", "c1")
+    assert len(cards) == 600, len(cards)
+    oldest = [c for c in cards if c["event_id"] == "E-p0000"]
+    assert oldest and oldest[0]["summary"] == "旧事 0", oldest
+    print("R92 召回池全量: OK 600 张全在池中，最旧卡未被挤掉")
+
+
+def test_chapter_recall_across_epoch():
+    """R93：章节长在旧 epoch，轮换到新 epoch 后仍能通过 all_cards 读到。"""
+    db = fresh("/tmp/rp_chapter_epoch.db")
+    for i in range(5):
+        db.insert_card(_card(session_id="qq-u9#1", event_id=f"E-x{i}",
+                             turn_start=i * 2 + 1, turn_end=i * 2 + 2,
+                             summary=f"旧事 {i}", entity_hooks=["团子"],
+                             created_at=f"2026-01-0{i + 1} 00:00:00",
+                             idempotency_key=f"epoch{i}"))
+    now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    stats = dream.chapterize(db, "c1", days=30, min_cards=3, now=now)
+    assert stats["chapters"] == 1, stats
+    with db._c() as c:
+        chapter_sid = c.execute("SELECT session_id FROM event_cards"
+                                " WHERE character_id='c1' AND layer='chapter'").fetchone()[0]
+    assert chapter_sid == "qq-u9#1", chapter_sid          # 章节仍挂在旧 epoch
+    chapters = db.chapter_cards("qq-u9#2", "c1")
+    assert len(chapters) == 1 and len(chapters[0]["covers"]) == 5, chapters
+    pool = db.all_cards("qq-u9#2", "c1")
+    assert any(c.get("layer") == "chapter" for c in pool), pool
+    print("R93 章节跨 epoch 召回: OK 从 #2 仍读到 #1 生成的章节")
+
+
 def test_desktop_remote_smoke():
     """R89：桌宠/通话 remote 模式冒烟——健康检查、Bearer 鉴权、不直连主库。"""
     try:
@@ -3807,6 +3866,8 @@ if __name__ == "__main__":
                test_quotes_and_cache_telemetry, test_dream_chapter_cards,
                test_dream_chapter_paging, test_dream_chapter_failure_releases,
                test_chapter_lane_grouping, test_chapter_scan_cap_advances,
+               test_fact_inherit_no_cap, test_card_pool_no_starvation,
+               test_chapter_recall_across_epoch,
                test_desktop_remote_smoke,
                test_chat_stores_reply_when_context_build_fails):
         fn()

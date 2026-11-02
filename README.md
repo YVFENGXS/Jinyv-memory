@@ -15,7 +15,7 @@
 - 可逆摘要：事件卡除摘要外存 1–3 句逐字原话（`quotes`），需要时按 `event_id` 用 `query_memory(detail="raw")` 回捞原文
 - 章节卡：Dream 把 30 天前的明细卡按车道（跨 epoch）/受众/bot/知识边界并成 T2 章节卡；明细卡保留，仍可展开
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
-- 104 项回归测试，不依赖任何 API key
+- 107 项回归测试，不依赖任何 API key
 
 ---
 
@@ -39,7 +39,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ（走 JinyuHost）
-├── tests/test_regression.py # 104 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
+├── tests/test_regression.py # 107 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── serve.py             # 宿主 HTTP 服务：/chat /remember /recall（零依赖）
@@ -89,7 +89,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限等 104 项场景（服务器实测 18 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限、跨 epoch 召回池等 107 项场景（服务器实测 18 秒）。
 
 ## 评测结果（可复现）
 
@@ -169,7 +169,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 104 项回归
+python tests/test_regression.py                        # 107 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -392,6 +392,8 @@ NapCat 与 NoneBot 的启动顺序不敏感：反了也会在约 30 秒后自动
 | `RP_ASSOC_GATE` | `1` | `0` 时退回「每轮都联想」，仅用于消融 |
 | `RP_VEC_KW` | `1` | 钩子命中的卡也进向量池，两路 RRF 累加；`0` 关闭（消融用） |
 | `RP_VEC_POOL` | `8` | 向量候选池大小；融合后仍只注入 `RP_RECALL_CARDS` 张 |
+| `RP_CARD_POOL` | `5000` | 召回候选池：本车道最近多少张卡参与关键词/标签/向量召回；卡数超过 500 后旧卡仍可见 |
+| `RP_CHAPTER_READ` | `200` | 章节卡按车道基键跨 epoch 读取时的单次上限 |
 | `RP_QVAR` | `0` | 长句按标点拆成向量查询变体；真实语料实测降召回，默认关 |
 | `RP_QDECOMP` | `0` | 困难问句让后台拆查询；真实语料实测无增益，默认关 |
 | `RP_HOOK_MUTE` | 空 | 逗号分隔的泛钩子整词屏蔽（如 `主人,瑾瑜`）；复合钩子如「陆瑾瑜」不受影响，默认不屏蔽 |

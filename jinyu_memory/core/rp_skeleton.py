@@ -28,6 +28,12 @@ logger = logging.getLogger("rp_memory")
 
 CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]")
 
+# 召回池：不再固定「最近 500 张」，否则第 501 张以后永远检索不到。
+# 5000 只是防极端库一次读爆内存的兜底，可用 RP_CARD_POOL 调整。
+CARD_POOL = max(500, int(os.environ.get("RP_CARD_POOL") or 5000))
+# 章节卡按车道基键跨 epoch 读：一次最多注入多少张索引卡。
+CHAPTER_READ_MAX = max(1, int(os.environ.get("RP_CHAPTER_READ") or 200))
+
 
 def _fact_terms(text):
     """从一句话里取匹配长期事实的词：双字组合优先，单字兜底（去停用字）。"""
@@ -1470,18 +1476,24 @@ class DB:
                           [now] + ids + [cut])
         return picked
 
-    def inherit_facts(self, old_sid, sid, cid, limit=500):
-        """跨 epoch 继承长期事实：复制旧会话最多 limit 条，UNIQUE 自动去重。
+    def inherit_facts(self, old_sid, sid, cid, limit=None):
+        """跨 epoch 继承长期事实：默认复制旧会话全部词条，UNIQUE 自动去重。
 
-        默认 500，等于整库继承——轮换不能把老设定丢掉，否则「永久不忘」就是假的。
+        不能按固定 500 截断：旧 epoch 超过 500 条时，最旧的词条会留在旧会话，
+        而读路径不跨 epoch，那些词条从此检索不到。
         turn_end 记 0，让继承来的事实排在本 epoch 新事实之后（新→旧展示）。
         """
+        sql = ("SELECT fact, tags, importance, category, expires_at, speaker,"
+               " mentions, verified, emotion, authority, attention_hits,"
+               " last_used_at FROM durable_facts"
+               " WHERE session_id=? AND character_id=?"
+               " ORDER BY id DESC")
+        params = [old_sid, cid]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
         with self._c() as c:
-            rows = c.execute("SELECT fact, tags, importance, category, expires_at, speaker,"
-                             " mentions, verified, emotion, authority, attention_hits,"
-                             " last_used_at FROM durable_facts"
-                             " WHERE session_id=? AND character_id=?"
-                             " ORDER BY id DESC LIMIT ?", (old_sid, cid, limit)).fetchall()
+            rows = c.execute(sql, params).fetchall()
             for r in reversed(rows):
                 # mentions/verified 跟着事实一起继承：显著性是对这件事的累计观察，不该因轮换清零。
                 # 四因子同样原样带走：权威 1.0 的词条不能因为换了 epoch 就开始衰减，
@@ -1975,16 +1987,51 @@ class DB:
         out = [_card(r) for r in rows]
         return [card for card in out if audience_ok(card["audience"], sid)]
 
-    def all_cards(self, sid, cid, limit=500):
-        """召回用：本车道事件卡 + 同主体其它账号的长期卡（按人合并）。"""
+    def all_cards(self, sid, cid, limit=None):
+        """召回用：本车道事件卡 + 同主体其它账号的长期卡（按人合并）。
+
+        默认取到 RP_CARD_POOL（5000）而不是最近的 500 张：卡数超过 500 后，
+        旧卡也要继续参与关键词 / 标签 / 向量召回，不能从池子里消失。
+        章节卡另按车道基键跨 epoch 取（见 chapter_cards），不占这里的名额。
+        """
+        cap = CARD_POOL if limit is None else max(1, int(limit))
         cond, args = _sid_filter(sid, longterm=True)
         with self._c() as c:
             rows = c.execute(f"SELECT * FROM event_cards WHERE character_id=? AND {cond}"
                              " AND retracted_at IS NULL"
                              " ORDER BY turn_end DESC LIMIT ?",
-                             [cid] + args + [limit]).fetchall()
+                             [cid] + args + [cap]).fetchall()
         out = [_card(r) for r in rows]
-        return [card for card in out if audience_ok(card["audience"], sid)]
+        cards = [card for card in out if audience_ok(card["audience"], sid)]
+        have = {card["event_id"] for card in cards}
+        cards += [card for card in self.chapter_cards(sid, cid)
+                  if card["event_id"] not in have]
+        return cards
+
+    def chapter_cards(self, sid, cid, limit=None):
+        """按车道基键读章节卡：章节可能挂在本轮之前关闭的 epoch 会话上。
+
+        由于读路径不跨 epoch，章节只靠 session_id 过滤会随轮换失踪；
+        这里用 lane_base 把同一条车道的章节索引统一捞出来。
+        """
+        cap = CHAPTER_READ_MAX if limit is None else max(1, int(limit))
+        lanes = {lane_base(x) for x in memory_sids(sid)}
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT * FROM event_cards WHERE character_id=?"
+                " AND retracted_at IS NULL AND COALESCE(layer,'event')='chapter'"
+                " ORDER BY turn_end DESC", (cid,)).fetchall()
+        out = []
+        for r in rows:
+            card = _card(r)
+            if lane_base(card.get("session_id")) not in lanes:
+                continue
+            if not audience_ok(card.get("audience"), sid):
+                continue
+            out.append(card)
+            if len(out) >= cap:
+                break
+        return out
 
     def add_recall_trace(self, sid, cid, turn_idx, version, query,
                          recalled=(), excluded=(), cross=(), strict=(), dropped=0,
