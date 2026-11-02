@@ -129,17 +129,22 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 - 可选依赖：nonebot2 / nonebot-adapter-onebot / httpx；缺依赖时对应能力降级。
 - 提醒与主人绑定已有 unittest 覆盖；旧 `__init__.py` 的主动话题/命令/轮换仍未复制。
 
-### desktop-pet（独立仓库 `YVFENGXS/Jinyu-pet`）
-- 客户端是 Electron 薄壳，**不复制源码**；主仓库只提供服务端适配层与协议真源。
-- 本轮接口：`handle_hello` / `handle_text` / `desktop.status` / `desktop.say`（推送未实现，明确返回未连接）。
-- 健康：`client_dir` 未配置或依赖缺失 → `degraded`。
-- 协议：`docs/protocol/desktop-v1.md`（旧仓库迁移，客户端只钉版本）。
+### host-api
+- 零依赖 `ThreadingHTTPServer` 插件：`/health`、`/chat`、`/remember`、`/recall`。
+- 除 `/health` 外要求 `Authorization: Bearer $JINYV_HOST_API_TOKEN`；未配置 token 时插件降级、不启动。
+- 给桌宠、通话服务与 DSH 提供统一写入通道；测试覆盖鉴权、写入、召回、对话。
 
-### video-call（独立仓库 `YVFENGXS/jinyu-video-call`）
+### desktop-pet（插件子目录；客户端上游 `YVFENGXS/Jinyu-pet`）
+- 客户端是 Electron 薄壳，**不复制源码**；本目录只放服务端适配层与协议实现。
+- 已迁 `protocol.py`（信封/标记/气泡）与 `server.py`（FastAPI desktop-v1：health / say / WS）。
+- `serve=true` 且安装 fastapi/uvicorn/websockets 时启动 WS；否则降级；`client_dir` 仅用于客户端检测。
+- 协议：`docs/protocol/desktop-v1.md`。
+
+### video-call（插件子目录；服务上游 `YVFENGXS/jinyu-video-call`）
 - 服务自带一份 `jinyu_memory/core` 作为本地模式依赖；主仓库**不复制**其舞台/ASR/TTS/视觉代码。
-- 推荐部署：通话服务只走宿主 API（`RP_HOST_BASE` + `RP_HOST_TOKEN`），单写者留在主进程；否则两个进程直连同一 SQLite 会互抢游标。
-- 本轮接口：`memory_context` / `record_turn` / `video_call.status` / `video_call.say`（跨窗口发话未实现）。
-- 健康：`repo_dir` 未配置或依赖缺失 → `degraded`。
+- 已迁 `bridge.py`：`/health`、`/call/turn`、`/call/say`，stdlib urllib，Bearer 令牌。
+- 推荐部署：通话服务只走宿主 API（`RP_HOST_BASE` + `RP_HOST_TOKEN`），单写者留在主进程。
+- `video_call.turn` 会把通话回复写回共享记忆；mock HTTP 测试覆盖 health/turn/say。
 
 ### dsh-video-storyboard（特殊接入，不是 Python 插件）
 - **勘察结论**：用户提供的 zip 是 `jinyu-memory-dsh`（DSH 宿主的本地记忆插件，JS/cordis），不是第三方分镜工具 `dsh-video-storyboard` 的源码。
@@ -153,16 +158,25 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 - **安装**：`scripts/install_dsh_plugin.py --source <zip|dir>` 校验后安装到 `$DSH_HOME/plugins/jinyu-memory-dsh`；第三方 CLI 由 `scripts/install_storyboard.sh` 固定 ref 安装。
 - 已验证：dsh zip 自带 Node 测试 15/15；桥接导入/导出/幂等/冲突测试通过。
 
+## 7.5 部署基础设施
+
+- `deploy/jinyv-memory.service`：systemd 单元，`python -m jinyv_memory.cli run`。
+- `deploy/install.sh`：venv + `pip install -e ".[qqbot,desktop,video]"` + systemd。
+- `deploy/install_plugins.sh`：克隆/更新单一插件仓库到 `/opt/jinyv-plugins`，写入 `JINYV_PLUGIN_PATHS`。
+- `deploy/install_desktop_adapter.sh` / `install_call_adapter.sh`：安装可选依赖、生成令牌、打印配置项。
+- `deploy/jinyv-memory.env.example`：只含占位符，不含真实密钥。
+- 第三方分镜仍用 `scripts/install_storyboard.sh`；桌宠/通话上游源码不复制。
+
 ## 8. 分阶段实施
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0（本轮） | core 迁移 + 契约 + 多路径加载器 + 外部 qqbot 闭环 + QQ 能力迁移 + 外部适配器 + dsh 桥接 + 自检/测试 | `selfcheck` 22 项、`unittest` 15 项通过 |
+| P0（本轮） | core 迁移 + 契约 + 多路径加载器 + 外部 qqbot 闭环 + QQ 能力迁移 + host-api/桌宠/通话桥 + dsh + 部署脚本 | `selfcheck` 22 项、`unittest` 20 项通过 |
 | P0.5（本轮） | 主仓库 `plugins/` 副本已删除；8 个 QQ 能力已迁入 `qqbot/features/` 并改写导入；dsh 支持 CLI 安装 | `git status` 干净；提醒/主人绑定测试通过 |
-| P1 | 把 104 项旧回归迁到新结构；`tools/serve.py` 宿主 HTTP API 插件化；环境变量完全对齐 | 旧回归全绿；QQ/桌宠/通话不回归 |
+| P1 | 104 项旧回归兼容运行（需授权 sys.modules 兼容层或重写）；环境变量完全对齐 | 旧回归全绿；现有 20 项不回归 |
 | P2 | qqbot 旧入口接线：主动话题/命令/轮换；富消息/链接视频等接入 NoneBot matcher | 逐模块行为等价对照 |
-| P3 | desktop-v1 服务端插件（包装 `desktop_server.py`），Jinyu-pet 联调 | 协议 fixtures + 断线重连 |
-| P4 | video-call 宿主桥 + 独立服务联调；禁止双写 SQLite | 通话一轮落库、召回一致 |
+| P3 | desktop-v1 服务实机联调（代码与协议已迁），FastAPI 依赖安装 | 协议 fixtures + 断线重连 |
+| P4 | video-call 服务实机联调（HTTP 桥已迁）；禁止双写 SQLite | 通话一轮落库、召回一致 |
 | P5 | DSH 改造版安装/导入验收；第三方分镜 CLI 检测与调用 | Node 测试 + 导入幂等 |
 | P6 | 清理旧入口、文档、推送分支 | 评审通过 |
 

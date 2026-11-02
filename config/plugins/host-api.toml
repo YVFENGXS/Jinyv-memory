@@ -1,0 +1,7 @@
+# 宿主 HTTP API
+enabled = true
+host = "127.0.0.1"
+port = 8710
+account = "owner_qq"
+# 留空读环境变量 JINYV_HOST_API_TOKEN；未设置则不启动（降级）
+token = ""

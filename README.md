@@ -34,13 +34,14 @@ E:\Jinyv-memory/                      # 主仓库：core / 契约 / 加载器 / 
 │   ├── plugins/*.toml                # 插件配置（实现不在主仓库）
 │   └── integrations/dsh.toml         # dsh 特殊接入配置
 ├── plugins/                          # 仅 README；实现副本已删除
-├── tests/                            # 15 项回归
+├── tests/                            # 20 项回归
 └── docs/                             # 架构 / 契约 / 迁移 / desktop-v1 协议
 
 E:\Jinyv-plugins/                     # 单一插件 git 仓库（main）
 ├── qqbot/                            # QQ 适配层 + features 能力入口
-├── desktop-pet/                      # 桌宠服务端适配层
-├── video-call/                       # 视频通话适配层
+├── desktop-pet/                      # 桌宠 desktop-v1 服务端适配层
+├── video-call/                       # 视频通话适配层 + HTTP 桥
+├── host-api/                         # 宿主 HTTP API（/chat /remember /recall）
 └── .repo-history/                    # 原子仓库历史备份（gitignore）
 # dsh 源码不在 Jinyv-plugins：保留在用户 zip / $DSH_HOME/plugins/jinyu-memory-dsh
 ```
@@ -75,7 +76,12 @@ git -C E:\Jinyv-plugins push -u origin main
 | 主仓库 plugins 清理 | ✅ 已删除四个实现副本，仅保留说明文件 |
 | dsh 安装 | ✅ `jinyv-memory dsh install --source <zip|目录>` 可安装到 DSH_HOME |
 | 推送 | ✅ 已推送 `refactor/plugin-core`（分支最新提交）；`main` 未动 |
-| 自检 / 测试 | selfcheck 22 项、unittest 15 项通过；dsh zip 自带 Node 测试 15/15 通过 |
+| 宿主 HTTP API | ✅ `host-api` 插件：health / chat / remember / recall，Bearer 鉴权 |
+| 桌宠 WebSocket | ✅ desktop-v1 协议与服务代码（FastAPI 可选依赖，未装时降级） |
+| 通话联调 | ✅ `video-call` HTTP 桥 + mock 服务测试 |
+| 部署脚本 | ✅ `deploy/` systemd、安装、插件、桌宠/通话适配脚本 |
+| 104 项旧回归 | ❌ 兼容运行器被安全策略拒绝，当前保留 20 项新回归 |
+| 自检 / 测试 | selfcheck 22 项、unittest 20 项通过；dsh zip 自带 Node 测试 15/15 通过 |
 
 ## 三、快速开始
 
@@ -85,7 +91,7 @@ $env:PYTHONPATH = "E:\Jinyv-memory\src"
 # 离线自检：外部插件发现 + qqbot 闭环 + dsh 桥接
 python -m jinyv_memory.cli selfcheck
 
-# 15 项回归
+# 20 项回归
 python -m unittest discover -s tests -t . -v
 
 # 插件健康（含 dsh 特殊接入）

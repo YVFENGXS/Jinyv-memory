@@ -66,12 +66,12 @@
 
 | 旧位置/外部仓库 | 新位置 | 状态 |
 |---|---|---|
-| 主仓库 `desktop_server.py` | `E:\Jinyv-plugins\desktop-pet\__init__.py` | 🟡 结构 + `handle_hello/handle_text` + 健康检查；未起 WS |
+| 主仓库 `desktop_server.py` | `desktop-pet/protocol.py` + `server.py` | ✅ desktop-v1 信封/气泡/WS 服务代码；FastAPI 可选依赖未装时降级 |
 | `docs/protocol/desktop-v1.md` | 已复制 | ✅ |
-| `deploy/install_desktop_adapter.sh` | 待迁 `scripts/install_desktop_adapter.sh` | ⬜ P3 |
+| `deploy/install_desktop_adapter.sh` | `deploy/install_desktop_adapter.sh` | ✅ 依赖安装 + 令牌生成 |
 | 独立仓库 `YVFENGXS/Jinyu-pet` | 客户端原仓库不动；配置指向本地克隆 | ✅ |
-| 独立仓库 `YVFENGXS/jinyu-video-call` | `E:\Jinyv-plugins\video-call` 适配层；服务源码不复制 | 🟡 结构 + 适配接口 |
-| 通话仓库自带 `jinyu_memory/core/` | 保持外部；推荐只走 `RP_HOST_BASE/TOKEN` | ⬜ P4 |
+| 独立仓库 `YVFENGXS/jinyu-video-call` | `E:\Jinyv-plugins\video-call` 适配层 + `bridge.py` | ✅ health/turn/say mock 联调 |
+| 通话仓库自带 `jinyu_memory/core/` | 保持外部；推荐只走宿主 API | 🟡 服务实机联调待做 |
 
 ### 2.4 DSH / 视频分镜
 
@@ -92,9 +92,10 @@
 | `bot.py`（11 行 NoneBot 启动） | `jinyv_memory.cli` + `E:\Jinyv-plugins\qqbot\nonebot_adapter.py` | 🟡 需真实 NoneBot 环境验证 |
 | `requirements.txt` | `pyproject.toml`（core 零依赖；插件 extras） | ✅ |
 | `.env.example` | `.env.example` | 🟡 重新整理，未做旧变量全量对照 |
-| `tools/serve.py`（宿主 HTTP API） | 计划 `plugins/host-api` 或 core 内置 HTTP | ⬜ P1 |
-| `tests/test_regression.py`（104 项） | 计划 `tests/test_regression.py` 逐项迁移 | ⬜ P1 |
-| `deploy/*.service` | 计划 `deploy/` | ⬜ P6 |
+| `tools/serve.py`（宿主 HTTP API） | `E:\Jinyv-plugins\host-api` | ✅ health/chat/remember/recall + 鉴权测试 |
+| `tests/test_regression.py`（104 项） | 兼容运行器方案被安全策略拒绝 | ❌ 待授权；当前 20 项新回归 |
+| `deploy/*.service` | `deploy/jinyv-memory.service` | ✅ systemd 单元 |
+| `deploy/install_*.sh` | `deploy/install*.sh` | ✅ 主仓库/插件/桌宠/通话安装脚本 |
 
 ## 3. 分阶段实施计划
 
@@ -105,7 +106,7 @@
 - 插件实现移到单一插件仓库 `E:\Jinyv-plugins` 的三个子目录。
 - qqbot 外部加载并跑通最小闭环 + NoneBot 可选降级。
 - dsh 特殊接入：检测/可选启停/导入/导出/journal/冲突。
-- 自检 22 项、unittest 15 项、DSH Node 测试 15 项。
+- 自检 22 项、unittest 20 项、DSH Node 测试 15 项。
 - 已完成：主仓库 `plugins/` 副本删除；qqbot 仓库按顺序建立旧能力适配入口；dsh CLI 安装。
 - 8 个 QQ 能力模块已复制到 `qqbot/features/`，内部导入改为包内相对导入；旧目录只作为 `legacy_entry` 回退。
 

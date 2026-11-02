@@ -1,0 +1,17 @@
+[Unit]
+Description=Jinyv-memory 记忆核心与插件运行时
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jinyv
+WorkingDirectory=/opt/jinyv-memory
+EnvironmentFile=-/etc/jinyv-memory.env
+ExecStart=/opt/jinyv-memory/.venv/bin/python -m jinyv_memory.cli run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
