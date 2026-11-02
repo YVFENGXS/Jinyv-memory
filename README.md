@@ -9,7 +9,7 @@
 
 > **远程现状**
 > `https://github.com/YVFENGXS/Jinyv-memory` 的 `main` 仍是旧实现（HEAD `8efba10`）。
-> 新架构已推送到新分支 `refactor/plugin-core`（`3e02b6c`），**没有 force-push main**。
+> 新架构已推送到新分支 `refactor/plugin-core`（分支最新提交），**没有 force-push main**。
 
 ## 一、当前仓库布局
 
@@ -68,7 +68,7 @@ E:\Jinyv-plugins/                     # 独立插件仓库集合
 | QQ 旧能力迁移 | 已建 6 项能力的插件侧适配入口（按顺序）；旧源码未复制，仍由 `legacy_bridge.py` 只读引用 |
 | 主仓库 plugins 清理 | ✅ 已删除四个实现副本，仅保留说明文件 |
 | dsh 安装 | ✅ `jinyv-memory dsh install --source <zip|目录>` 可安装到 DSH_HOME |
-| 推送 | ✅ 已推送 `refactor/plugin-core`（`3e02b6c`）；`main` 未动 |
+| 推送 | ✅ 已推送 `refactor/plugin-core`（分支最新提交）；`main` 未动 |
 | 自检 / 测试 | selfcheck 22 项、unittest 14 项通过；dsh zip 自带 Node 测试 15/15 通过 |
 
 ## 三、快速开始

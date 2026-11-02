@@ -177,5 +177,5 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 
 ## 10. 远程仓库策略
 
-远程 `main` 仍是旧实现。新架构已推送到独立分支 `refactor/plugin-core`（`3e02b6c`），
+远程 `main` 仍是旧实现。新架构已推送到独立分支 `refactor/plugin-core`（分支最新提交），
 **没有 force-push `main`**。是否合并到 `main` 走 PR 评审，不做强制推送。
