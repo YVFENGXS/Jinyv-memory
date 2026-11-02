@@ -352,6 +352,8 @@ def note_stage(sid, stage):
 
 STAGE_TAG = re.compile(
     r"\[\[\s*(表情|收起|动作|重置|待机|转头|歪头|抬头|低头|点头)\s*[:：]?\s*([^\]]*?)\s*\]\]")
+# 模型偶尔漏掉「表情:」直接写 [[流泪]]，这里兜底认一下裸名字
+STAGE_BARE = re.compile(r"\[\[\s*([^\]]{1,24}?)\s*\]\]")
 STAGE_SPLIT = re.compile(r"[、,，/|]+")
 
 
@@ -427,6 +429,20 @@ def parse_stage(reply):
         return ""
 
     clean = STAGE_TAG.sub(take, str(reply or ""))
+
+    def take_bare(match):
+        name = match.group(1).strip()
+        if name in STAGE_EXPRESSIONS:
+            if name not in stage["expr"]:
+                stage["expr"].append(name)
+        elif name in STAGE_MOTIONS:
+            stage["motion"] = name
+        elif name:
+            ignored.append(name)
+        return ""
+
+    # 打错 / 漏前缀的标签一律删掉，表情动作能认就认，别让方括号漏给主人看
+    clean = STAGE_BARE.sub(take_bare, clean)
     clean = re.sub(r"[ \t]+\n", "\n", clean)
     clean = re.sub(r"\n{2,}", "\n", clean).strip()
     if ignored:
