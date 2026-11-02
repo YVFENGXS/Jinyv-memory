@@ -6,7 +6,7 @@ P2 追加章节卡：把 30 天前的明细卡按车道/受众/知识边界合�
 """
 from __future__ import annotations
 
-import hashlib, logging, os, uuid
+import hashlib, logging, os, sqlite3, uuid
 from datetime import datetime, timedelta, timezone
 
 from rp_skeleton import lane_base
@@ -17,8 +17,11 @@ DEFAULT_AT = (3, 30)          # 本地时间 03:30
 CHAPTER_DAYS = max(1, int(os.environ.get("RP_CHAPTER_DAYS") or 30))
 CHAPTER_MIN = max(2, int(os.environ.get("RP_CHAPTER_MIN") or 3))
 CHAPTER_MAX = max(1, int(os.environ.get("RP_CHAPTER_MAX") or 4))
-# 单页取 400 张；已覆盖的卡靠 offset 翻页跳过，避免「最早 400 张全被覆盖后
-# 第 401 张永远取不到」。扫描上限防止一次整理把整库翻一遍。
+# 一章最多覆盖多少张明细卡：8-12 张时摘要还能把首/中/尾都写进去；
+# 一整组几十上百张时不切分，章节正文只能反映最早几张。
+CHAPTER_GROUP_MAX = max(2, int(os.environ.get("RP_CHAPTER_GROUP_MAX") or 10))
+# 单页取 400 张；已覆盖的卡由 SQL 直接排除，offset 只用于「未覆盖卡仍然很多」时翻页。
+# 扫描上限只防一次整理把整库翻一遍；触顶会记 scan_capped 并留到下次。
 CHAPTER_LIMIT = max(1, int(os.environ.get("RP_CHAPTER_LIMIT") or 400))
 CHAPTER_SCAN = max(CHAPTER_LIMIT, int(os.environ.get("RP_CHAPTER_SCAN") or 8000))
 
@@ -50,32 +53,79 @@ def _union(cards, key, limit):
 
 
 def _chapter_summary(cards, limit=240):
-    """章节正文只做「日期 + 各明细首句」的确定性拼接，不调模型、不新增信息。"""
-    parts = []
+    """章节正文只做「日期 + 各明细首句」的确定性拼接，不调模型、不新增信息。
+
+    预算按卡数均分：切章后一般 8-10 张，每张都能分到至少 20 字，
+    不会出现「前几张写满 240 字、后半段完全没信息」。
+    """
+    rows = []
     for card in cards:
         text = " ".join(str(card.get("summary") or "").split())
-        if not text:
-            continue
-        when = _mmdd(card.get("created_at"))
-        parts.append(f"「{when}」{text[:60]}" if when else text[:60])
+        if text:
+            rows.append((_mmdd(card.get("created_at")), text))
+    if not rows:
+        return ""
+    share = max(20, (limit - 24) // len(rows))
+    parts = [f"「{when}」{text[:share]}" if when else text[:share]
+             for when, text in rows]
     text = "；".join(parts)
     if len(text) > limit:
         text = text[:limit - 1] + "…"
     return text
 
 
-def _chapter_cards(db, cid, cutoff, covers):
-    """分页取候选并跳过已覆盖卡：fixes 固定 LIMIT 400 后永远看不到第 401 张。"""
-    cards, offset = [], 0
-    while offset < CHAPTER_SCAN:
+def _utc_stamp(stamp=None):
+    """统一成 UTC：外部传 naive 时间按本机时区理解，避免和 UTC 的 created_at 差 8 小时。"""
+    if stamp is None:
+        return datetime.now(timezone.utc)
+    if stamp.tzinfo is None:
+        return stamp.astimezone(timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _chapter_cards_sql(db, cid, cutoff):
+    """SQL 已排除覆盖卡，这里只负责翻页和扫描上限。"""
+    cards, offset, capped = [], 0, False
+    while True:
         page = db.chapter_candidates(cid, cutoff, limit=CHAPTER_LIMIT, offset=offset)
+        if not page:
+            break
+        cards.extend(page)
+        if len(page) < CHAPTER_LIMIT:
+            break
+        offset += CHAPTER_LIMIT
+        if offset >= CHAPTER_SCAN:
+            capped = True
+            break
+    return cards, capped
+
+
+def _chapter_cards_py(db, cid, cutoff):
+    """老 SQLite 没有 JSON1 时的回退：逐页取、在 Python 里跳过 covers。"""
+    covers = db.chapter_covers(cid)
+    cards, offset, capped = [], 0, False
+    while True:
+        page = db.chapter_candidates(cid, cutoff, limit=CHAPTER_LIMIT, offset=offset,
+                                     skip_covered=False)
         if not page:
             break
         cards.extend(c for c in page if c["event_id"] not in covers)
         if len(page) < CHAPTER_LIMIT:
             break
         offset += CHAPTER_LIMIT
-    return cards
+        if offset >= CHAPTER_SCAN:
+            capped = True
+            break
+    return cards, capped
+
+
+def _chapter_cards(db, cid, cutoff):
+    """取章节原料：优先用 SQL 排除已覆盖卡，老库回退到 Python 过滤。"""
+    try:
+        return _chapter_cards_sql(db, cid, cutoff)
+    except sqlite3.OperationalError:
+        logger.warning("章节候选不能用 SQL 排除已覆盖卡（SQLite 缺 JSON1），回退 Python 过滤")
+        return _chapter_cards_py(db, cid, cutoff)
 
 
 def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
@@ -92,15 +142,18 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
     days = CHAPTER_DAYS if days is None else max(1, int(days))
     min_cards = CHAPTER_MIN if min_cards is None else max(2, int(min_cards))
     max_chapters = CHAPTER_MAX if max_chapters is None else max(1, int(max_chapters))
-    stamp = now or datetime.now(timezone.utc)
+    stamp = _utc_stamp(now)
     cutoff = (stamp - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    cards = _chapter_cards(db, cid, cutoff, db.chapter_covers(cid))
+    cards, capped = _chapter_cards(db, cid, cutoff)
     groups = {}
     for card in cards:
         key = (lane_base(card.get("session_id")), card.get("audience") or "",
                card.get("bot_id") or "", card.get("knowledge_boundary") or "both")
         groups.setdefault(key, []).append(card)
-    stats = {"chapters": 0, "cards": 0}
+    stats = {"chapters": 0, "cards": 0, "scan_capped": bool(capped)}
+    if capped:
+        logger.warning("Dream 章节候选达到扫描上限 %d 张（已覆盖卡已由 SQL 排除），"
+                       "剩余留到下次整理", CHAPTER_SCAN)
     ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     for (lane, audience, bot_id, boundary), group in ordered:
         if stats["chapters"] >= max_chapters:
@@ -108,45 +161,54 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
         if len(group) < min_cards:
             continue
         group = sorted(group, key=lambda c: (c.get("turn_start") or 0, c.get("turn_end") or 0))
-        ids = [c["event_id"] for c in group]
-        summary = _chapter_summary(group)
-        if not summary:
-            continue
-        subjects = [str(c.get("subject") or "").strip() for c in group]
-        subjects = [s for s in subjects if s]
-        subject = max(set(subjects), key=subjects.count) if subjects else ""
-        # 章节落在组里最新的真实会话（epoch）上，轮换后仍和普通卡走同一条读路径；
-        # 日期取被覆盖卡的最大时间，而不是插入时的「今天」。
-        newest = max(group, key=lambda c: (str(c.get("created_at") or ""),
-                                           int(c.get("turn_end") or 0)))
-        stamps = [str(c.get("created_at") or "") for c in group if c.get("created_at")]
-        card = {
-            "event_id": f"E-{uuid.uuid4().hex[:8]}",
-            "session_id": newest.get("session_id") or lane, "character_id": cid,
-            "turn_start": min(int(c.get("turn_start") or 0) for c in group),
-            "turn_end": max(int(c.get("turn_end") or 0) for c in group),
-            "summary": summary, "state_changes": {}, "quotes": [],
-            "entity_hooks": _union(group, "entity_hooks", 8),
-            "rel_hooks": _union(group, "rel_hooks", 4),
-            "knowledge_boundary": boundary, "subject": subject,
-            "importance": max(float(c.get("importance") or 0.5) for c in group),
-            "precision": "normal", "conflict_flags": [],
-            "audience": audience, "bot_id": bot_id,
-            "layer": "chapter", "covers": ids,
-            "created_at": max(stamps) if stamps else "",
-            "idempotency_key": "chapter:" + hashlib.sha1(
-                "|".join(sorted(ids)).encode()).hexdigest()[:24],
-        }
-        if dry_run:
-            stats["chapters"] += 1
-            stats["cards"] += len(group)
-            continue
-        if db.insert_card(card):
-            stats["chapters"] += 1
-            stats["cards"] += len(group)
-            logger.info("Dream 章节卡 lane=%s 覆盖=%d 区间=%d-%d 日期=%s",
-                        lane, len(group), card["turn_start"], card["turn_end"],
-                        card["created_at"] or "now")
+        # 大组切章：一整段 30 天的旧事不塞进一张 240 字的摘要，
+        # 每章最多 CHAPTER_GROUP_MAX 张，保证摘要能覆盖到这一段的头尾。
+        chunks = [group[i:i + CHAPTER_GROUP_MAX]
+                  for i in range(0, len(group), CHAPTER_GROUP_MAX)]
+        for chunk in chunks:
+            if stats["chapters"] >= max_chapters:
+                break
+            if len(chunk) < min_cards:
+                continue
+            ids = [c["event_id"] for c in chunk]
+            summary = _chapter_summary(chunk)
+            if not summary:
+                continue
+            subjects = [str(c.get("subject") or "").strip() for c in chunk]
+            subjects = [s for s in subjects if s]
+            subject = max(set(subjects), key=subjects.count) if subjects else ""
+            # 章节落在组里最新的真实会话（epoch）上，轮换后仍和普通卡走同一条读路径；
+            # 日期取被覆盖卡的最大时间，而不是插入时的「今天」。
+            newest = max(chunk, key=lambda c: (str(c.get("created_at") or ""),
+                                               int(c.get("turn_end") or 0)))
+            stamps = [str(c.get("created_at") or "") for c in chunk if c.get("created_at")]
+            card = {
+                "event_id": f"E-{uuid.uuid4().hex[:8]}",
+                "session_id": newest.get("session_id") or lane, "character_id": cid,
+                "turn_start": min(int(c.get("turn_start") or 0) for c in chunk),
+                "turn_end": max(int(c.get("turn_end") or 0) for c in chunk),
+                "summary": summary, "state_changes": {}, "quotes": [],
+                "entity_hooks": _union(chunk, "entity_hooks", 8),
+                "rel_hooks": _union(chunk, "rel_hooks", 4),
+                "knowledge_boundary": boundary, "subject": subject,
+                "importance": max(float(c.get("importance") or 0.5) for c in chunk),
+                "precision": "normal", "conflict_flags": [],
+                "audience": audience, "bot_id": bot_id,
+                "layer": "chapter", "covers": ids,
+                "created_at": max(stamps) if stamps else "",
+                "idempotency_key": "chapter:" + hashlib.sha1(
+                    "|".join(sorted(ids)).encode()).hexdigest()[:24],
+            }
+            if dry_run:
+                stats["chapters"] += 1
+                stats["cards"] += len(chunk)
+                continue
+            if db.insert_card(card):
+                stats["chapters"] += 1
+                stats["cards"] += len(chunk)
+                logger.info("Dream 章节卡 lane=%s 覆盖=%d 区间=%d-%d 日期=%s",
+                            lane, len(chunk), card["turn_start"], card["turn_end"],
+                            card["created_at"] or "now")
     return stats
 
 
@@ -159,7 +221,8 @@ def run(mw, cid, dry_run=False, day=None, min_facts=20, max_sessions=8, now=None
     stamp = now or datetime.now()
     day = day or stamp.strftime("%Y-%m-%d")
     stats = {"day": day, "dry_run": bool(dry_run), "expired": [], "sessions": 0,
-             "groups": 0, "chapters": 0, "chapter_cards": 0, "skipped": ""}
+             "groups": 0, "chapters": 0, "chapter_cards": 0, "scan_capped": False,
+             "skipped": ""}
     if not dry_run and not mw.db.dream_claim(cid, day):
         stats["skipped"] = "already_done"      # 今天已经整理过：不重复跑
         return stats
@@ -186,6 +249,7 @@ def run(mw, cid, dry_run=False, day=None, min_facts=20, max_sessions=8, now=None
         chapter = chapterize(mw.db, cid, dry_run=dry_run, now=now)
         stats["chapters"] = int(chapter.get("chapters") or 0)
         stats["chapter_cards"] = int(chapter.get("cards") or 0)
+        stats["scan_capped"] = bool(chapter.get("scan_capped"))
     except Exception:
         if not dry_run:
             mw.db.dream_release(cid, day)       # 失败放开占坑，当天还能再试

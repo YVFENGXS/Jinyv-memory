@@ -254,6 +254,12 @@ def stage_inventory():
             label = MOTION_LABELS.get(base)
             if label and label not in motions:
                 motions.append(label)
+    except FileNotFoundError:
+        # 模型文件不随仓库分发，fresh clone 缺 models/jinyu 时只降级表情/动作清单，
+        # 不影响读屏、语音和记忆链路，所以不打异常堆栈。
+        print("[call] 未找到 Live2D 模型清单 web/live2d/models/jinyu/，"
+              "表情/动作候选为空（通话与记忆不受影响）")
+        expressions, motions = [], []
     except Exception as exc:              # noqa: BLE001
         print(f"[call] stage inventory failed: {type(exc).__name__}: {exc}")
         expressions, motions = [], []

@@ -15,7 +15,7 @@
 - 可逆摘要：事件卡除摘要外存 1–3 句逐字原话（`quotes`），需要时按 `event_id` 用 `query_memory(detail="raw")` 回捞原文
 - 章节卡：Dream 把 30 天前的明细卡按会话/受众并成 T2 章节卡；明细卡保留，仍可展开
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
-- 99 项回归测试，不依赖任何 API key
+- 103 项回归测试，不依赖任何 API key
 
 ---
 
@@ -39,7 +39,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ（走 JinyuHost）
-├── tests/test_regression.py # 99 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
+├── tests/test_regression.py # 103 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── serve.py             # 宿主 HTTP 服务：/chat /remember /recall（零依赖）
@@ -89,7 +89,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡等 99 项场景（服务器实测 18 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡等 103 项场景（服务器实测 18 秒）。
 
 ## 评测结果（可复现）
 
@@ -169,7 +169,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 99 项回归
+python tests/test_regression.py                        # 103 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -237,6 +237,12 @@ ssh -N -L 127.0.0.1:8787:127.0.0.1:8787 -i .deploy_key ubuntu@HOST
 回环连接可设 `RP_DESKTOP_TRUST_LOCAL=1` 免令牌（隧道本身即认证）；对外暴露时必须配 `RP_DESKTOP_TOKEN` 并加 TLS。桌宠客户端自己会拉起这条隐藏隧道（右键菜单里也能断开/重连），一般不需要手动开。
 
 渠道隔离：`desktop_server.py` 调模型时会在 `PERSONA["core"]` 后面追加一段「当前渠道：桌面桌宠」，允许模型在句首写 `[[act:动作词]]` / `[[mood:表情词]]`（词表与客户端 `body.js` 的 `KIT_MOTIONS` / `KIT_EXPRESSIONS` 一致）。`reply_filter` 在落库前把标记取出、清掉正文，只把动作塞进 `pet.say.actions`、把表情塞进首条气泡的 `emotion`；QQ 插件不追加这段说明，读到的历史也是纯文字，两边不会串味。
+
+### 视频通话：call_server（同仓副本）
+
+本仓保留一份 `call_server.py` 供服务器上的 `rp-call.service` 使用；独立维护的通话项目见 [jinyu-video-call](https://github.com/YVFENGXS/jinyu-video-call)。
+
+Live2D 模型文件不随仓库分发：fresh clone 时 `web/live2d/models/jinyu/` 为空，通话、读屏、语音和记忆都能正常跑，只是表情/动作候选清单为空（启动会打印一行提示，不影响记忆链路）。需要舞台指令时，自行把 `大肥鱼.model3.json` 和贴图放进该目录；模型版权与使用条件归原作者。
 
 ### 其它框架：JinyuHost 与 HTTP 写入通道
 

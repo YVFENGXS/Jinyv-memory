@@ -3579,7 +3579,8 @@ def test_dream_chapter_cards():
 
 
 def test_dream_chapter_paging():
-    """R86：最早 400 张已被章节覆盖时，分页仍能取到第 401 张之后的卡。"""
+    """R86：最早 400 张已被章节覆盖时，分页仍能取到第 401 张之后的卡；
+    同时验证大组切章后摘要能覆盖到这一段的后半段。"""
     db = fresh("/tmp/rp_chapter_page.db")
     all_ids = [f"E-{i:04d}" for i in range(500)]
     covered = all_ids[:400]
@@ -3592,13 +3593,18 @@ def test_dream_chapter_paging():
                              entity_hooks=["团子"], created_at="2026-01-01 00:00:00",
                              idempotency_key=f"pg{i}"))
     now = datetime(2026, 11, 2, tzinfo=timezone.utc)
-    stats = dream.chapterize(db, "c1", days=30, min_cards=3, max_chapters=1, now=now)
-    assert stats["chapters"] == 1 and stats["cards"] == 100, stats
-    chapter = [c for c in db.all_cards("s1", "c1") if c.get("layer") == "chapter"
-               and c["event_id"] != "E-pre"][0]
-    assert set(chapter["covers"]) == set(all_ids[400:]), chapter["covers"][:3]
+    stats = dream.chapterize(db, "c1", days=30, min_cards=3, max_chapters=20, now=now)
+    assert stats["cards"] == 100, stats
+    assert stats["chapters"] == -(-100 // dream.CHAPTER_GROUP_MAX), stats
+    chapters = [c for c in db.all_cards("s1", "c1") if c.get("layer") == "chapter"
+                and c["event_id"] != "E-pre"]
+    assert set().union(*[set(c["covers"]) for c in chapters]) == set(all_ids[400:])
+    assert all(len(c["covers"]) <= dream.CHAPTER_GROUP_MAX for c in chapters), chapters
+    # 覆盖最后一张的章节，摘要里要有后半段的「旧事 499」，不能只写前几张
+    tail = [c for c in chapters if "E-0499" in c["covers"]][0]
+    assert "旧事 499" in tail["summary"], tail["summary"]
     assert dream.chapterize(db, "c1", days=30, min_cards=3, now=now)["chapters"] == 0
-    print("R86 章节分页: OK 越过已覆盖的 400 张，取到第 401 张之后")
+    print("R86 章节分页: OK 越过已覆盖的 400 张 / 大组切章 / 摘要覆盖尾段")
 
 
 def test_dream_chapter_failure_releases():
