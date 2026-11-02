@@ -8,9 +8,8 @@
 - 桌宠 `Jinyu-pet`、通话 `jinyu-video-call`、dsh `jinyu-memory-dsh` 的原仓库/源码保持不动。
 
 > **远程现状**
-> `https://github.com/YVFENGXS/Jinyv-memory` 不是空仓库（旧实现 HEAD `8efba10`）。
-> 本地 `E:\Jinyv-memory` 是独立新历史，分支 `refactor/plugin-core`，**未推送**。
-> 建议推新分支，不 force-push `main`。
+> `https://github.com/YVFENGXS/Jinyv-memory` 的 `main` 仍是旧实现（HEAD `8efba10`）。
+> 新架构已推送到新分支 `refactor/plugin-core`（`45f739f`），**没有 force-push main**。
 
 ## 一、当前仓库布局
 
@@ -69,7 +68,7 @@ E:\Jinyv-plugins/                     # 独立插件仓库集合
 | QQ 旧能力迁移 | 已建 6 项能力的插件侧适配入口（按顺序）；旧源码未复制，仍由 `legacy_bridge.py` 只读引用 |
 | 主仓库 plugins 清理 | ✅ 已删除四个实现副本，仅保留说明文件 |
 | dsh 安装 | ✅ `jinyv-memory dsh install --source <zip|目录>` 可安装到 DSH_HOME |
-| 推送 | ❌ GitHub 443 连接失败，未推送；本地提交完整 |
+| 推送 | ✅ 已推送 `refactor/plugin-core`（`45f739f`）；`main` 未动 |
 | 自检 / 测试 | selfcheck 22 项、unittest 14 项通过；dsh zip 自带 Node 测试 15/15 通过 |
 
 ## 三、快速开始
@@ -135,7 +134,6 @@ dsh 不是 Python 插件，加载器不会扫描它。核心侧 `integrations/ds
 - QQ 旧能力（`richmsg / linkmeta / bili_live / reminder / owner_gate / asr / mcp_client / task_supervisor`、主动话题/命令/轮换）仍在旧仓库；qqbot 仓库已按顺序建立适配入口 `features/__init__.py`，但**源码没有复制**。执行环境安全策略仍拒绝整块复制旧实现，需要改为逐模块人工改写或引入 submodule。
 - 主仓库 `plugins/` 已删除实现副本，只保留 `plugins/README.md`。
 - 104 项旧回归、宿主 HTTP API、桌宠 WebSocket 服务、通话联调、部署脚本。
-- 推送：GitHub 连接失败，未 push。
 
 ## 六、待确认决策
 
@@ -143,7 +141,7 @@ dsh 不是 Python 插件，加载器不会扫描它。核心侧 `integrations/ds
 2. **三个新插件仓库远程地址**：qqbot / desktop-pet / video-call 的 GitHub 仓库名与归属？
 3. **dsh 改造版安装**：继续用 zip（已支持 `dsh install`），还是后续提供 git 仓库？
 4. **dsh 同步策略**：默认 `core-wins` 是否可接受？是否需要 `dsh-wins` 或人工合并队列？
-5. **网络恢复后推送**：`refactor/plugin-core` 已提交但 GitHub 443 不可达；是否稍后重试，或由你在本机执行推送命令。
+5. **是否合并到 `main`**：新架构已在 `refactor/plugin-core`；是否走 PR 合并，或继续保留分支。
 6. **桌宠/通话部署**：统一用 `external/` 或系统路径；视频通话是否强制只走宿主 API。
 7. **引擎副本策略**：vendored + 同步脚本，还是 subtree/submodule。
 8. **QQ 迁移优先级已执行顺序**：`richmsg → linkmeta → reminder → owner_gate → asr → bili_live`；是否继续按此顺序人工重写。

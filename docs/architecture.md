@@ -177,12 +177,5 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 
 ## 10. 远程仓库策略
 
-远程已有旧实现历史。本轮本地仓库是独立新历史，**不 push、不 force**。推荐：
-
-```powershell
-cd E:\Jinyv-memory
-git remote add origin https://github.com/YVFENGXS/Jinyv-memory.git
-git push -u origin refactor/plugin-core
-```
-
-待确认后再决定是否把新架构合并进 `main`（届时用 PR，不做 force-push）。
+远程 `main` 仍是旧实现。新架构已推送到独立分支 `refactor/plugin-core`（`45f739f`），
+**没有 force-push `main`**。是否合并到 `main` 走 PR 评审，不做强制推送。
