@@ -48,16 +48,17 @@ def cmd_plugins(args) -> int:
 
 def cmd_dsh(args) -> int:
     runtime = _runtime(args)
-    runtime.core.memory.open_session(args.account or "desktop")
+    account = getattr(args, "account", None) or "desktop"
+    runtime.core.memory.open_session(account)
     try:
         if args.dsh_command == "status":
             result = runtime.dsh.status()
         elif args.dsh_command == "import":
-            result = runtime.dsh.import_session(args.session, args.account)
+            result = runtime.dsh.import_session(args.session, account)
         elif args.dsh_command == "export":
-            result = runtime.dsh.export_session(args.session, args.account, args.limit)
+            result = runtime.dsh.export_session(args.session, account, args.limit)
         elif args.dsh_command == "sync":
-            result = runtime.dsh.sync_session(args.session, args.account, args.limit)
+            result = runtime.dsh.sync_session(args.session, account, args.limit)
         else:
             raise SystemExit(f"未知 dsh 子命令：{args.dsh_command}")
         print(json.dumps(result, ensure_ascii=False, indent=2))
