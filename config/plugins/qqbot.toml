@@ -7,4 +7,5 @@ reply_cooldown_seconds = 0
 nonebot = "auto"
 # 插件实现：E:/Jinyv-plugins/qqbot（远程待确认）
 # 旧能力迁移过渡：只读指向旧包目录；留空 = 不启用 legacy 桥
-legacy_source_dir = ""
+# 这是本机只读引用，不是源码副本；物理改写后再移除
+legacy_source_dir = "E:/rp_memory_project/jinyu-memory/jinyu_memory"

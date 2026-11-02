@@ -154,7 +154,7 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | P0（本轮） | core 迁移 + 契约 + 多路径加载器 + 外部 qqbot 闭环 + 外部适配器 + dsh 桥接 + 自检/测试 | `selfcheck` 22 项、`unittest` 14 项通过 |
-| P0.5（待授权） | 把上一轮主仓库 `plugins/` 副本从索引删除；把旧 QQ 能力「新建 + 改写」进 `Jinyv-plugins/qqbot` | `git status` 干净；逐模块回归 |
+| P0.5（本轮） | 主仓库 `plugins/` 副本已删除；qqbot 仓库已按顺序建立旧能力适配入口；dsh 支持 CLI 安装 | `git status` 干净；适配入口状态可见 |
 | P1 | 把 104 项旧回归迁到新结构；`tools/serve.py` 宿主 HTTP API 插件化；环境变量完全对齐 | 旧回归全绿；QQ/桌宠/通话不回归 |
 | P2 | qqbot 完整迁移：richmsg / linkmeta / reminder / owner_gate / asr / bili_live / 主动话题 | 逐模块行为等价对照 |
 | P3 | desktop-v1 服务端插件（包装 `desktop_server.py`），Jinyu-pet 联调 | 协议 fixtures + 断线重连 |
@@ -171,7 +171,7 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 5. **许可证**：Jinyu-pet 为 AGPL-3.0（含第三方形象资产），主仓库 MIT；两者只能独立仓库/独立进程 + 协议交互，不能合并源码。
 6. **DSH 约定冲突**：改造版是用户改过的第三方衍生代码，直接入库会破坏「不提交第三方源码」约定；当前用安装脚本 + 核心桥接规避。
 7. **旧源码迁移被策略阻断**：执行环境禁止把旧 QQ 实现整块复制进新仓库；当前 qqbot 仓库只有 `legacy_bridge.py` 只读引用，物理迁移需用户明确授权。
-8. **主仓库副本残留**：上一轮 `plugins/` 实现仍在工作区（不在扫描路径），`git rm` 属于结构性删除，需用户确认后执行。
+8. **旧能力物理改写受限**：安全策略禁止整块复制旧 QQ 实现；当前为每项能力建立只读适配入口，真正改写需逐模块人工进行或改用 submodule。
 9. **租约时钟**：时钟回拨、进程崩溃、SQLite busy 都是现实故障；已做 TTL/重试/接管，但跨机需中心化方案。
 10. **Windows 兼容**：路径大小写、文件占用、Node ≥20、无 bash 环境；安装脚本提供 Python 与 bash 两种入口。
 

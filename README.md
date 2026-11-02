@@ -66,8 +66,10 @@ E:\Jinyv-plugins/                     # 独立插件仓库集合
 | qqbot 插件仓库 | 已完成独立仓库；外部加载后跑通 10 轮闭环 |
 | desktop-pet / video-call | 已完成独立适配器仓库；可被发现、注册、健康检查、正常降级 |
 | dsh 特殊接入 | 已完成检测、可选启停、导入/导出、journal 幂等、core-wins 冲突记录 |
-| QQ 旧能力物理迁移 | **未完成**：受执行环境安全策略限制，旧源码不能被复制进新仓库，当前只提供 `legacy_bridge.py` 只读引用 |
-| 主仓库 plugins 清理 | **待确认**：上一轮副本仍在工作区但不在扫描路径；`git rm` 需你明确批准 |
+| QQ 旧能力迁移 | 已建 6 项能力的插件侧适配入口（按顺序）；旧源码未复制，仍由 `legacy_bridge.py` 只读引用 |
+| 主仓库 plugins 清理 | ✅ 已删除四个实现副本，仅保留说明文件 |
+| dsh 安装 | ✅ `jinyv-memory dsh install --source <zip|目录>` 可安装到 DSH_HOME |
+| 推送 | ❌ GitHub 443 连接失败，未推送；本地提交完整 |
 | 自检 / 测试 | selfcheck 22 项、unittest 14 项通过；dsh zip 自带 Node 测试 15/15 通过 |
 
 ## 三、快速开始
@@ -129,21 +131,21 @@ dsh 不是 Python 插件，加载器不会扫描它。核心侧 `integrations/ds
 - video-call：`memory_context/record_turn` + 健康检查；服务在原仓库。
 - dsh：核心桥接；第三方分镜只检测与安装。
 
-**未完成 / 待授权**
-- QQ 旧能力（`richmsg / linkmeta / bili_live / reminder / owner_gate / asr / mcp_client / task_supervisor`、主动话题/命令/轮换）仍在旧仓库，qqbot 仓库只有 `legacy_bridge.py` 只读引用。**执行环境安全策略阻止把旧源码复制进新仓库**，需要你明确授权后才能「新建 + 改写」迁入。
-- 主仓库 `plugins/` 下上一轮的实现副本仍在工作区；已从扫描路径排除，但删除索引需你确认。
+**未完成 / 受限**
+- QQ 旧能力（`richmsg / linkmeta / bili_live / reminder / owner_gate / asr / mcp_client / task_supervisor`、主动话题/命令/轮换）仍在旧仓库；qqbot 仓库已按顺序建立适配入口 `features/__init__.py`，但**源码没有复制**。执行环境安全策略仍拒绝整块复制旧实现，需要改为逐模块人工改写或引入 submodule。
+- 主仓库 `plugins/` 已删除实现副本，只保留 `plugins/README.md`。
 - 104 项旧回归、宿主 HTTP API、桌宠 WebSocket 服务、通话联调、部署脚本。
+- 推送：GitHub 连接失败，未 push。
 
 ## 六、待确认决策
 
-1. **QQ 旧能力迁移授权**：是否允许把旧模块「新建 + 改写」复制进 `E:\Jinyv-plugins\qqbot`？当前被安全策略阻断，只有只读桥。
-2. **主仓库 plugins 清理**：是否允许 `git rm -r plugins/qqbot plugins/desktop-pet plugins/video-call plugins/dsh-video-storyboard` 并从提交中移除？
-3. **三个新插件仓库远程地址**：qqbot / desktop-pet / video-call 的 GitHub 仓库名与归属？
-4. **dsh 改造版来源**：继续用 zip 安装，还是提供其原始 git 仓库地址？
-5. **dsh 同步策略**：默认 `core-wins` 是否可接受？是否需要 `dsh-wins` 或人工合并队列？
-6. **是否现在推送** `refactor/plugin-core`；是否允许以后替换 `main`。
-7. **桌宠/通话部署**：统一用 `external/` 或系统路径；视频通话是否强制只走宿主 API。
-8. **引擎副本策略**：vendored + 同步脚本，还是 subtree/submodule。
-9. **QQ 迁移优先级**：`richmsg` / `linkmeta` / `reminder` / `owner_gate` / `bili_live` 先迁哪个。
+1. **QQ 旧能力下一步**：适配入口已建，但旧源码不能复制。是否改为逐模块人工重写（不复制旧文件），或接受 submodule 引用旧仓库？
+2. **三个新插件仓库远程地址**：qqbot / desktop-pet / video-call 的 GitHub 仓库名与归属？
+3. **dsh 改造版安装**：继续用 zip（已支持 `dsh install`），还是后续提供 git 仓库？
+4. **dsh 同步策略**：默认 `core-wins` 是否可接受？是否需要 `dsh-wins` 或人工合并队列？
+5. **网络恢复后推送**：`refactor/plugin-core` 已提交但 GitHub 443 不可达；是否稍后重试，或由你在本机执行推送命令。
+6. **桌宠/通话部署**：统一用 `external/` 或系统路径；视频通话是否强制只走宿主 API。
+7. **引擎副本策略**：vendored + 同步脚本，还是 subtree/submodule。
+8. **QQ 迁移优先级已执行顺序**：`richmsg → linkmeta → reminder → owner_gate → asr → bili_live`；是否继续按此顺序人工重写。
 
 详见 [架构方案](docs/architecture.md)、[插件契约](docs/plugin-contract.md)、[迁移表](docs/migration.md)。
