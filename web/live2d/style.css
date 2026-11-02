@@ -117,7 +117,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 20px;
+  padding: calc(12px + env(safe-area-inset-top, 0px)) calc(20px + env(safe-area-inset-right, 0px)) 12px calc(20px + env(safe-area-inset-left, 0px));
   pointer-events: none;
   user-select: none;
 }
@@ -306,8 +306,8 @@ body {
 
 .self-view {
   position: absolute;
-  top: 74px;
-  right: 18px;
+  top: calc(74px + env(safe-area-inset-top, 0px));
+  right: calc(18px + env(safe-area-inset-right, 0px));
   z-index: 4;
   width: 176px;
   aspect-ratio: 16 / 9;
@@ -561,7 +561,7 @@ body {
 .call-dock {
   position: absolute;
   left: 50%;
-  bottom: 18px;
+  bottom: calc(18px + env(safe-area-inset-bottom, 0px));
   transform: translateX(-50%);
   z-index: 6;
   display: flex;
@@ -751,7 +751,7 @@ body {
 
 @media (max-width: 860px) {
   .callbar {
-    padding: 10px 14px;
+    padding: calc(10px + env(safe-area-inset-top, 0px)) calc(14px + env(safe-area-inset-right, 0px)) 10px calc(14px + env(safe-area-inset-left, 0px));
   }
 
   .call-avatar {
@@ -774,14 +774,14 @@ body {
   }
 
   .self-view {
-    top: 64px;
-    right: 12px;
+    top: calc(64px + env(safe-area-inset-top, 0px));
+    right: calc(12px + env(safe-area-inset-right, 0px));
     width: 122px;
     border-radius: 12px;
   }
 
   #stage[data-panel="true"] .self-view {
-    right: 12px;
+    right: calc(12px + env(safe-area-inset-right, 0px));
   }
 
   .status {
@@ -817,7 +817,7 @@ body {
   }
 
   .call-dock {
-    bottom: 12px;
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     gap: 6px;
     padding: 8px;
     border-radius: 22px;
@@ -838,5 +838,17 @@ body {
 
   .dock-talk {
     width: 58px;
+  }
+}
+
+/* 系统要求减少动效时，停掉呼吸、旋转、淡入等动画 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

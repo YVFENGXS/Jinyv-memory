@@ -33,6 +33,8 @@ MAX_SIDE = max(640, _env_int("RP_SCREEN_MAX_SIDE", 1280))
 JPEG_QUALITY = max(60, min(95, _env_int("RP_SCREEN_JPEG_QUALITY", 88)))
 TEXT_LIMIT = max(600, _env_int("RP_SCREEN_TEXT_LIMIT", 3000))
 MAX_SEGMENTS = max(1, min(5, _env_int("RP_SCREEN_SEGMENTS", 3)))
+# 解码前先看像素数：超大图直接拒绝，避免在缩放前就展开成巨量内存
+MAX_PIXELS = max(1_000_000, _env_int("RP_SCREEN_MAX_PIXELS", 40_000_000))
 GLM_TIMEOUT = float(os.environ.get("RP_SCREEN_GLM_TIMEOUT") or 25)
 MODEL_TIMEOUT = float(os.environ.get("RP_SCREEN_MODEL_TIMEOUT") or 45)
 
@@ -137,7 +139,10 @@ def _mime_of(data):
 # ---------- 预处理：降采样 + 长图切段 ----------
 
 def prepare_jpeg(data):
-    """统一转成 RGB JPEG，长边缩到 MAX_SIDE；Pillow 缺失时原样返回。"""
+    """统一转成 RGB JPEG，长边缩到 MAX_SIDE；Pillow 缺失时原样返回。
+
+    先看像素数再解码；JPEG 先用 draft 在解码阶段降采样，避免超大图先展开再缩小。
+    """
     if not data:
         return data
     try:
@@ -147,6 +152,13 @@ def prepare_jpeg(data):
     try:
         with Image.open(BytesIO(data)) as im:
             im.seek(0)
+            width, height = im.size
+            if width <= 0 or height <= 0:
+                return data
+            if width * height > MAX_PIXELS:
+                raise ValueError("画面太大，已拒绝")
+            if im.format == "JPEG" and max(width, height) > MAX_SIDE:
+                im.draft("RGB", (MAX_SIDE, MAX_SIDE))
             out = im.convert("RGB")
             if max(out.size) > MAX_SIDE:
                 out.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
@@ -154,6 +166,8 @@ def prepare_jpeg(data):
             out.save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
             got = buf.getvalue()
             return got or data
+    except ValueError:
+        raise
     except Exception:                     # noqa: BLE001  损坏帧按原图尝试
         return data
 
@@ -161,6 +175,7 @@ def prepare_jpeg(data):
 def split_tall(jpeg_bytes):
     """长截图（高:宽 >= 1.5）按竖条切段，最多 MAX_SEGMENTS 段，段间留 8% 重叠。
 
+    按原始尺寸切段，缩放留给每段单独做：整张长图先缩小再切，每段会窄到看不清字。
     普通横屏只有一段，不会多花调用。
     """
     try:
@@ -170,7 +185,11 @@ def split_tall(jpeg_bytes):
     try:
         with Image.open(BytesIO(jpeg_bytes)) as im:
             width, height = im.size
-            if width <= 0 or height < width * 1.5:
+            if width <= 0 or height <= 0:
+                return [jpeg_bytes]
+            if width * height > MAX_PIXELS:
+                raise ValueError("画面太大，已拒绝")
+            if height < width * 1.5:
                 return [jpeg_bytes]
             count = min(MAX_SEGMENTS, max(2, round(height / (width * 1.2))))
             band = height / count
@@ -186,6 +205,8 @@ def split_tall(jpeg_bytes):
                 out.save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
                 segments.append(buf.getvalue())
             return segments or [jpeg_bytes]
+    except ValueError:
+        raise
     except Exception:                     # noqa: BLE001
         return [jpeg_bytes]
 
@@ -406,12 +427,17 @@ def read_frame(data, focus=""):
     if not (_glm_key() or _front_key()):
         raise NoVisionKey("缺少视觉密钥：请设置 RP_GLM_KEY 或 RP_FRONT_KEY")
 
-    jpeg = prepare_jpeg(data)
-    segments = split_tall(jpeg)
+    segments = split_tall(data)
     parts = []
     for index, segment in enumerate(segments):
+        # 先切段、再逐段缩放：长截图每一段都能保持可读的宽度
+        segment = prepare_jpeg(segment)
+        if not segment:
+            continue
         content, provider = _vision_call(segment, _prompt_for(focus, index, len(segments)))
         parts.append(_parse(content, provider, index))
+    if not parts:
+        raise ValueError("画面太大，已拒绝")
     merged = _merge(parts)
     merged["mode"] = "screen"
     return merged
@@ -449,6 +475,8 @@ def read_camera(data, focus=""):
         raise NoVisionKey("缺少视觉密钥：请设置 RP_GLM_KEY 或 RP_FRONT_KEY")
 
     jpeg = prepare_jpeg(data)
+    if not jpeg:
+        raise ValueError("画面太大，已拒绝")
     prompt = CAMERA_PROMPT.replace("{limit}", str(TEXT_LIMIT))
     focus = re.sub(r"\s+", " ", str(focus or "")).strip()[:120]
     if focus:

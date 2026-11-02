@@ -11,6 +11,8 @@
   };
   var MAX_QUESTION = 200;
   var LABEL = { screen: "屏幕", camera: "摄像头" };
+  var FETCH_TIMEOUT_MS = 90000;   // 服务端等视觉模型时可能很慢，但不能永远卡住
+  var HEALTH_TIMEOUT_MS = 8000;
 
   var screenBtn = document.getElementById("view-screen");
   var cameraBtn = document.getElementById("view-camera");
@@ -38,6 +40,7 @@
   var lastSentAt = 0;
   var apiBase = null;
   var apiTried = false;
+  var viewSeq = 0;          // 每次开/关画面递增，晚到的授权结果直接作废
 
   // 读屏、摄像头、语音用同一个会话键，这样通话时能拿到刚看的那一帧
   function sessionId() {
@@ -81,6 +84,36 @@
     cameraBtn.textContent = MODE === "camera" ? "关闭摄像头" : "摄像头";
   }
 
+  function beginTimeout(ms) {
+    if (!window.AbortController) {
+      return { signal: undefined, done: function () {} };
+    }
+    var ctrl = new AbortController();
+    var timer = window.setTimeout(function () { ctrl.abort(); }, ms);
+    return {
+      signal: ctrl.signal,
+      done: function () { window.clearTimeout(timer); }
+    };
+  }
+
+  function timedFetch(url, options, ms) {
+    var guard = beginTimeout(ms);
+    var opts = options || {};
+    if (guard.signal) {
+      opts.signal = guard.signal;
+    }
+    return fetch(url, opts).then(function (resp) {
+      guard.done();
+      return resp;
+    }, function (error) {
+      guard.done();
+      if (error && error.name === "AbortError") {
+        throw new Error("请求超时，稍后再试");
+      }
+      throw error;
+    });
+  }
+
   function resolveApi() {
     if (apiBase) {
       return Promise.resolve(apiBase);
@@ -106,7 +139,7 @@
         return Promise.resolve(null);
       }
       var base = unique[at];
-      return fetch(base + "/health", { cache: "no-store" })
+      return timedFetch(base + "/health", { cache: "no-store" }, HEALTH_TIMEOUT_MS)
         .then(function (resp) {
           if (!resp.ok) {
             throw new Error("HTTP " + resp.status);
@@ -133,12 +166,12 @@
     });
   }
 
-  function postJson(base, path, body) {
-    return fetch(base + path, {
+  function postJson(base, path, body, timeoutMs) {
+    return timedFetch(base + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
-    }).then(function (resp) {
+    }, timeoutMs || FETCH_TIMEOUT_MS).then(function (resp) {
       return resp.json().catch(function () {
         return { ok: false, error: "HTTP " + resp.status };
       }).then(function (data) {
@@ -307,6 +340,10 @@
     if (!stream || !MODE) {
       return Promise.resolve(false);
     }
+    // 页面在后台就不截帧上传；只有明确要求补一帧（说话前/回到前台）才放行
+    if (document.hidden && !force) {
+      return Promise.resolve(false);
+    }
     if (!force && !autoScan) {
       return Promise.resolve(false);
     }
@@ -348,13 +385,14 @@
 
   function restartTimer() {
     stopTimer();
-    if (!MODE) {
+    if (!MODE || document.hidden) {
       return;
     }
     timer = window.setInterval(function () { scan(false); }, SCAN[MODE].interval);
   }
 
   function stopView(silent) {
+    viewSeq += 1;              // 让还在等授权/等待元数据的旧请求作废
     stopTimer();
     if (stream) {
       stream.getTracks().forEach(function (track) { track.stop(); });
@@ -382,6 +420,7 @@
       return;
     }
     stopView(true);
+    var seq = viewSeq;
     resolveApi();
     var request;
     if (mode === "camera") {
@@ -409,6 +448,11 @@
     }
 
     request.then(function (got) {
+      if (seq !== viewSeq) {
+        // 授权期间用户又点了别的画面：这条流已经过期，立刻关掉摄像头/共享指示灯
+        got.getTracks().forEach(function (track) { track.stop(); });
+        return false;
+      }
       stream = got;
       MODE = mode;
       videoEl.srcObject = stream;
@@ -428,15 +472,26 @@
         }
         videoEl.onloadedmetadata = function () { resolve(); };
         videoEl.play().catch(function () {});
+      }).then(function () {
+        return seq === viewSeq;
       });
-    }).then(function () {
-      return videoEl.play().catch(function () {});
-    }).then(function () {
-      lastSig = null;
-      lastSentAt = 0;
-      scan(true);
-      restartTimer();
+    }).then(function (live) {
+      if (!live) {
+        return;
+      }
+      return videoEl.play().catch(function () {}).then(function () {
+        if (seq !== viewSeq) {
+          return;
+        }
+        lastSig = null;
+        lastSentAt = 0;
+        scan(true);
+        restartTimer();
+      });
     }).catch(function (error) {
+      if (seq !== viewSeq) {
+        return;
+      }
       stopView();
       if (error && error.name === "NotAllowedError") {
         setState("已取消" + LABEL[mode], "idle");
@@ -468,7 +523,13 @@
         if (!base) {
           throw new Error("通话服务未启动：请运行 python call_server.py");
         }
-        var body = { session: SESSION, question: question, mode: mode };
+        var body = {
+          session: SESSION,
+          question: question,
+          mode: mode,
+          // 没开画面就明确告诉服务端，别让它回退到十分钟前的旧帧
+          view: MODE || "none"
+        };
         if (shot) {
           body.image = shot.image;
         }
@@ -525,9 +586,13 @@
 
   // 切回这个页面 / 窗口获得焦点时立刻补一帧，避免后台被浏览器降频后画面停在旧状态
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) {
-      scan(true);
+    if (document.hidden) {
+      // 页面看不见就停表，别在后台一直截帧上传
+      stopTimer();
+      return;
     }
+    scan(true);
+    restartTimer();
   });
   window.addEventListener("focus", function () { scan(true); });
 

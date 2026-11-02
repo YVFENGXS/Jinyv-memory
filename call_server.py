@@ -26,6 +26,7 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import hmac
 import json
 import os
@@ -113,6 +114,21 @@ READY_TTL = max(30, int(float(os.environ.get("RP_CALL_READY_TTL") or 90)))
 # 队列里超过这个秒数的话不再播：避免刷新页面后突然把几分钟前的旧话讲出来。
 INBOX_TTL = max(30, int(float(os.environ.get("RP_CALL_INBOX_TTL") or 120)))
 PASS_RE = re.compile(r"\[\[\s*pass\s*\]\]", re.I)
+MAP_MAX = max(32, int(float(os.environ.get("RP_CALL_MAX_SESSIONS") or 512)))
+
+
+def _cap_map(mapping):
+    """按插入顺序丢掉最老的键，防止任意 session 把内存撑大。"""
+    if len(mapping) <= MAP_MAX:
+        return
+    for key in list(mapping)[:len(mapping) - MAP_MAX]:
+        mapping.pop(key, None)
+
+
+def _fingerprint(text):
+    """日志里不留原话，只记长度和哈希前缀，排查时还能对上号。"""
+    raw = str(text or "").encode("utf-8")
+    return f"len={len(raw)} sha={hashlib.sha1(raw).hexdigest()[:8]}"
 
 
 def window_authed(host, supplied):
@@ -145,6 +161,10 @@ def _prune():
 def touch(sid):
     LIVE[sid] = time.time()
     _prune()
+    # 所有以 session 为键的表都设总量上限，防止被随机 sid 撑大
+    for table in (LIVE, INBOX, INBOX_READY, STAGE_STATE, READINGS,
+                  RECENT, LAST_USER, LAST_PROACTIVE, LAST_SAY):
+        _cap_map(table)
 
 
 def live_sessions():
@@ -767,11 +787,6 @@ async def proactive_reply(sid, view):
     return text[:120], stage, "speak"
 
 
-def _brief(text, limit=300):
-    """一行日志：折叠换行，保留问题与回复原文。"""
-    return " ".join(str(text or "").split())[:limit]
-
-
 async def voice_reply(text, sid="", view=""):
     """一句话 → (回答文本, 模式)。真实模型失败时退回本地兜底，不让通话中断。"""
     prompt = (view_note(sid, view) + stage_state_note(sid) + proactive_note(sid)
@@ -923,6 +938,7 @@ async def vision_ask(request: Request):
     sid = session_id(body)
     touch(sid)
     mode = "camera" if str(body.get("mode") or "").strip().lower() == "camera" else "screen"
+    view = str(body.get("view") or "").strip().lower()[:8]
     question = str(body.get("question") or "").strip()[:MAX_QUESTION]
     if not question:
         return err(400, "缺少 question")
@@ -942,6 +958,9 @@ async def vision_ask(request: Request):
             return err(502, f"读画面失败：{type(exc).__name__}")
         remember(sid, reading)
     if reading is None:
+        if view == "none":
+            # 前端明确说「没开画面」：不要拿十分钟前的旧帧冒充当前画面
+            return err(400, "当前没有打开画面：请先点「摄像头」或「共享屏幕」")
         cached = latest_readings(sid, mode)
         reading = cached[-1] if cached else None
     if not reading:
@@ -1028,7 +1047,7 @@ async def call_turn(request: Request):
     if not text:
         return err(400, "缺少 text 或 audio")
 
-    print(f"[call] 主人：{_brief(text, 200)}", flush=True)
+    print(f"[call] 主人：{_fingerprint(text)}", flush=True)
     LAST_USER[sid] = time.time()
     remember_talk(sid, text, "")
     view = str(body.get("view") or "").strip().lower()[:8]
@@ -1049,7 +1068,7 @@ async def call_turn(request: Request):
                    "first_audio": int((time.perf_counter() - started) * 1000)},
             "note": "",
         }
-    print(f"[call] 瑾瑜：{_brief(reply)}", flush=True)
+    print(f"[call] 瑾瑜：{_fingerprint(reply)}", flush=True)
     remember_talk(sid, "", reply)
     note_stage(sid, stage)
     first, rest = cv.split_sentences(cv.speakable(reply))
@@ -1135,7 +1154,7 @@ async def call_say(request: Request):
         # 页面只打 /stage/state 的旧脚本不会来取队列，这条会过期；明确记一笔，别让人以为已经说到
         print("[call] 注意：通话页没在收队列（可能没刷新），这条话可能播不出来",
               flush=True)
-    print(f"[call] 瑾瑜（来自{str(body.get('source') or 'qq')}）：{_brief(text)}",
+    print(f"[call] 瑾瑜（来自{str(body.get('source') or 'qq')}）：{_fingerprint(text)}",
           flush=True)
     return {"ok": True, "sessions": len(targets), "inbox_ready": ready}
 

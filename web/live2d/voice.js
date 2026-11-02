@@ -40,6 +40,9 @@
   var lastUrls = [];
   var firstMs = 0;
   var pendingIncoming = [];
+  var audioGen = 0;        // 每次打断/开新录音递增，晚到的 TTS 回包直接丢弃
+  var turnGen = 0;         // 每轮对话递增，旧轮补合成的语音不再插播
+  var FETCH_TIMEOUT_MS = 90000;   // 服务端等模型/ASR 时可能很慢，但不能永远卡住
 
   // 免提：麦克风一直开着，检测到人声自动录一句，停顿后自动发送
   var handsFree = false;
@@ -84,6 +87,36 @@
     stateEl.dataset.state = state || "idle";
   }
 
+  function beginTimeout(ms) {
+    if (!window.AbortController) {
+      return { signal: undefined, done: function () {} };
+    }
+    var ctrl = new AbortController();
+    var timer = window.setTimeout(function () { ctrl.abort(); }, ms);
+    return {
+      signal: ctrl.signal,
+      done: function () { window.clearTimeout(timer); }
+    };
+  }
+
+  function timedFetch(url, options, ms) {
+    var guard = beginTimeout(ms);
+    var opts = options || {};
+    if (guard.signal) {
+      opts.signal = guard.signal;
+    }
+    return fetch(url, opts).then(function (resp) {
+      guard.done();
+      return resp;
+    }, function (error) {
+      guard.done();
+      if (error && error.name === "AbortError") {
+        throw new Error("请求超时，稍后再试");
+      }
+      throw error;
+    });
+  }
+
   function resolveApi() {
     if (apiBase) {
       return Promise.resolve(apiBase);
@@ -109,7 +142,7 @@
         return Promise.resolve(null);
       }
       var base = unique[at];
-      return fetch(base + "/health", { cache: "no-store" })
+      return timedFetch(base + "/health", { cache: "no-store" }, 8000)
         .then(function (resp) {
           if (!resp.ok) {
             throw new Error("HTTP " + resp.status);
@@ -129,12 +162,12 @@
     return tryNext(0);
   }
 
-  function postJson(base, path, body) {
-    return fetch(base + path, {
+  function postJson(base, path, body, timeoutMs) {
+    return timedFetch(base + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
-    }).then(function (resp) {
+    }, timeoutMs || FETCH_TIMEOUT_MS).then(function (resp) {
       return resp.json().catch(function () {
         return { ok: false, error: "HTTP " + resp.status };
       }).then(function (data) {
@@ -317,6 +350,7 @@
   }
 
   function stopPlayback() {
+    audioGen += 1;             // 作废还在合成中的旧语音，避免录音时突然插播
     queue = [];
     playing = false;
     wasSpeaking = false;
@@ -424,15 +458,23 @@
     replyEl.textContent = text;
     applyStage(item.stage);
     setState(item.origin === "proactive" ? "瑾瑜主动开口…" : "瑾瑜从别的窗口说话…", "loading");
+    var gen = audioGen;
     resolveApi().then(function (base) {
       return base ? postJson(base, "/call/tts", { text: text }) : null;
     }).then(function (data) {
+      if (gen !== audioGen) {
+        // 用户已经开始录音/新的一轮，旧话不再插播
+        return;
+      }
       if (data && data.audio) {
         enqueue(data.audio);
       } else {
         setState("收到瑾瑜的话（没合成出声音）", "idle");
       }
     }).catch(function () {
+      if (gen !== audioGen) {
+        return;
+      }
       setState("收到瑾瑜的话（语音合成失败）", "idle");
     });
   }
@@ -450,8 +492,8 @@
     if (!apiBase) {
       return;
     }
-    fetch(apiBase + "/call/inbox?session=" + encodeURIComponent(SESSION),
-          { cache: "no-store" })
+    timedFetch(apiBase + "/call/inbox?session=" + encodeURIComponent(SESSION),
+          { cache: "no-store" }, 10000)
       .then(function (resp) { return resp.ok ? resp.json() : null; })
       .then(function (data) {
         if (!data || !data.ok || !data.items || !data.items.length) {
@@ -522,6 +564,7 @@
     busy = true;
     proactiveAt = Date.now();
     stopPlayback();
+    var gen = ++turnGen;
     lastUrls = [];
     replayBtn.hidden = true;
     asrEl.hidden = true;
@@ -566,11 +609,19 @@
         resolveApi().then(function (base) {
           return base ? postJson(base, "/call/tts", { text: rest }) : null;
         }).then(function (more) {
+          if (gen !== turnGen) {
+            // 用户已经开了新的一轮：旧句子不再补播
+            return;
+          }
           if (more && more.audio) {
             enqueue(more.audio);
           }
           flushPending();
-        }).catch(function () { flushPending(); });
+        }).catch(function () {
+          if (gen === turnGen) {
+            flushPending();
+          }
+        });
       } else {
         flushPending();
       }
@@ -710,6 +761,32 @@
 
   talkBtn.addEventListener("contextmenu", function (event) {
     event.preventDefault();
+  });
+
+  // 键盘等价操作：聚焦按钮后按住空格/回车录音，松开即发送
+  talkBtn.addEventListener("keydown", function (event) {
+    if (event.key !== " " && event.key !== "Enter") {
+      return;
+    }
+    event.preventDefault();
+    if (event.repeat || recording) {
+      return;
+    }
+    if (handsFree) {
+      hfStop(null);
+    }
+    startRecord(false);
+  });
+
+  ["keyup", "blur"].forEach(function (name) {
+    talkBtn.addEventListener(name, function (event) {
+      if (name === "keyup" && event.key !== " " && event.key !== "Enter") {
+        return;
+      }
+      if (recording) {
+        stopRecord();
+      }
+    });
   });
 
   replayBtn.addEventListener("click", function () {
