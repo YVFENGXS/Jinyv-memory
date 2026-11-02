@@ -1,0 +1,9 @@
+[plugin]
+id = "qqbot"
+name = "QQ Bot (OneBot v11)"
+version = "0.1.0"
+kind = "platform-adapter"
+entry = "__init__.py"
+description = "把 QQ 消息接成记忆核心的一轮对话；NoneBot2 可选，未安装时降级为工具/钩子。"
+optional_modules = ["nonebot", "nonebot.adapters.onebot.v11"]
+provides = ["platform.qq", "tools.memory"]

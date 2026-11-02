@@ -1,0 +1,24 @@
+# 记忆核心配置（不含密钥）
+[core]
+# 离线自检/测试置 true；线上走 RP_FRONT_KEY / RP_BACK_KEY
+mock_llm = false
+keep_recent = 2
+archive_batch = 2
+max_tokens = 64000
+output_reserve = 4096
+profile = "cl100k"
+recall_limit = 4
+guard_retry = 1
+shutdown_timeout = 60
+social = false
+# 默认库在 var/core/rp_memory.db；如需沿用线上库，写绝对路径
+# db_path = ""
+
+[persona]
+# 留空使用迁移来的 jinyu_memory persona 单源
+name = ""
+core = ""
+
+[llm]
+# env = 读 RP_* 环境变量；mock = 离线假模型
+mode = "env"

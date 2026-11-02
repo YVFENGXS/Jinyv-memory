@@ -1,0 +1,8 @@
+# 桌宠服务端适配器（客户端在独立仓库 YVFENGXS/Jinyu-pet）
+enabled = true
+account = "desktop"
+# 客户端目录只用于健康检查，不复制源码进主仓库
+client_dir = ""
+service_url = "ws://127.0.0.1:8787/desktop/v1/ws"
+# 是否在本进程内拉起 desktop-v1 服务（本轮未实现，保留开关）
+serve = false

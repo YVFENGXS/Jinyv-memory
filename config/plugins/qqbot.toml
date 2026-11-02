@@ -1,0 +1,7 @@
+# QQ 插件（OneBot v11 / NoneBot2）
+enabled = true
+default_account = "owner_qq"
+# 适配层默认不额外节流；线上可在平台侧或迁移阶段恢复
+reply_cooldown_seconds = 0
+# auto = 装了 nonebot 就接消息入口，没装则降级为工具/钩子
+nonebot = "auto"

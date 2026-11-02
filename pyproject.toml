@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jinyv-memory"
+version = "0.1.0"
+description = "以记忆核心为主体、外围能力插件化的瑾瑜记忆运行时"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+qqbot = ["nonebot2>=2.0", "nonebot-adapter-onebot>=2.4"]
+desktop = ["fastapi>=0.110", "uvicorn>=0.27", "websockets>=12"]
+video = ["fastapi>=0.110"]
+
+[project.scripts]
+jinyv-memory = "jinyv_memory.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

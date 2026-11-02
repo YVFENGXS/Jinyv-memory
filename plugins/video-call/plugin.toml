@@ -1,0 +1,9 @@
+[plugin]
+id = "video-call"
+name = "Video Call Adapter"
+version = "0.1.0"
+kind = "platform-adapter"
+entry = "__init__.py"
+description = "视频通话服务适配层；服务源码留在 YVFENGXS/jinyu-video-call，不 vendor。"
+optional_modules = ["fastapi"]
+provides = ["platform.video-call", "tools.call"]

@@ -1,0 +1,9 @@
+# DSH 改造版：插件 + 独立安装脚本，不把第三方/改造源码提交进主仓库
+enabled = true
+account = "desktop"
+# 留空时读 DSH_HOME，再退到 ~/.dsh
+dsh_home = ""
+# 第三方视频分镜 CLI 安装目录；留空时读 RP_STORYBOARD_DIR
+storyboard_dir = ""
+# 安装脚本默认目标（实际安装由 scripts/install_dsh_plugin.py 完成）
+install_dir = ""

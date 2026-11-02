@@ -1,0 +1,8 @@
+# 视频通话适配器（服务在独立仓库 YVFENGXS/jinyu-video-call）
+enabled = true
+account = "video_call"
+repo_dir = ""
+service_url = "http://127.0.0.1:8790"
+token = ""
+# 是否由本进程拉起 call_server（本轮未实现，保留开关）
+serve = false

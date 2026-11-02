@@ -1,0 +1,38 @@
+# 多账号 / 多平台车道。key 是插件调用时使用的 lane 名。
+[defaults]
+platform = "qq"
+kind = "private"
+character = "jinyu"
+continuity = "jinyu-main"
+bot_id = "qq-main"
+role = "primary"
+# 默认车道；不填则取第一条 primary
+account = "owner_qq"
+
+[accounts.owner_qq]
+platform = "qq"
+account = "10001"
+kind = "private"
+session = "qq-u10001"
+owner = true
+role = "primary"
+
+# 桌宠与 QQ 主私聊共享同一条记忆；写入来源仍是 desktop。
+[accounts.desktop]
+platform = "desktop"
+account = "local"
+kind = "private"
+bot_id = "desktop-local"
+session = "qq-u10001"
+continuity = "jinyu-main"
+role = "observer"
+
+# 视频通话默认也是观察者：只记不回，避免和主号抢回复。
+[accounts.video_call]
+platform = "video-call"
+account = "local"
+kind = "private"
+bot_id = "video-call-local"
+session = "qq-u10001"
+continuity = "jinyu-main"
+role = "observer"

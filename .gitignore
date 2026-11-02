@@ -1,0 +1,13 @@
+# 运行数据与密钥
+var/
+secrets/
+external/
+.tmp/
+*.db
+*.db-wal
+*.db-shm
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
