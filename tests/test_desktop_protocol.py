@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -10,7 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-PROTOCOL_PATH = Path(r"E:\Jinyv-plugins\desktop-pet\protocol.py")
+PLUGINS = Path(os.environ.get("JINYV_PLUGINS_DIR") or (ROOT.parent / "Jinyv-plugins"))
+PROTOCOL_PATH = PLUGINS / "desktop-pet" / "protocol.py"
 
 
 def _load_protocol():

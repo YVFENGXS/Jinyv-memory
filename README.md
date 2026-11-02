@@ -34,7 +34,7 @@ E:\Jinyv-memory/                      # 主仓库：core / 契约 / 加载器 / 
 │   ├── plugins/*.toml                # 插件配置（实现不在主仓库）
 │   └── integrations/dsh.toml         # dsh 特殊接入配置
 ├── plugins/                          # 仅 README；实现副本已删除
-├── tests/                            # 20 项回归
+├── tests/                            # 104 项旧回归 + unittest
 └── docs/                             # 架构 / 契约 / 迁移 / desktop-v1 协议
 
 E:\Jinyv-plugins/                     # 单一插件 git 仓库（main）
@@ -51,16 +51,16 @@ E:\Jinyv-plugins/                     # 单一插件 git 仓库（main）
 | 仓库 | 远程地址 | 本地路径 | 状态 |
 |---|---|---|---|
 | 主仓库 | `https://github.com/YVFENGXS/Jinyv-memory` | `E:\Jinyv-memory` | 已推送 `refactor/plugin-core` |
-| 插件仓库 | `https://github.com/YVFENGXS/jinyv-plugins` | `E:\Jinyv-plugins` | 本地已建 main；远程尚不存在 |
+| 插件仓库 | `https://github.com/YVFENGXS/jinyv-plugins` | `E:\Jinyv-plugins` | 已推送 `main`（`e55ec94`） |
 | 桌宠客户端 | `https://github.com/YVFENGXS/Jinyu-pet` | `E:\rp_memory_project\rp-desktop-pet` | 原仓库不动，插件仓库只放适配层 |
 | 视频通话服务 | `https://github.com/YVFENGXS/jinyu-video-call` | `E:\rp_memory_project\jinyu-video-call` | 原仓库不动，插件仓库只放适配层 |
 | dsh 改造版 | 用户 zip，无已知远程 | `$DSH_HOME/plugins/jinyu-memory-dsh` | 源码不复制、不改动 |
 | 第三方分镜 | `https://github.com/SAOS-3624/dsh-video-storyboard` | `var/vendor/dsh-video-storyboard` | 独立安装，固定 ref |
 
-插件仓库远程尚不存在。在 GitHub 创建空仓库后执行：
+插件仓库远程已创建并推送 `main`。后续改动：
 
 ```powershell
-git -C E:\Jinyv-plugins push -u origin main
+git -C E:\Jinyv-plugins push origin main
 ```
 
 ## 二、本轮完成情况
@@ -72,16 +72,17 @@ git -C E:\Jinyv-plugins push -u origin main
 | desktop-pet / video-call | 已在单一插件仓库；可被发现、注册、健康检查、正常降级 |
 | dsh 特殊接入 | 已完成检测、可选启停、导入/导出、journal 幂等、dsh-wins 冲突记录 |
 | QQ 旧能力迁移 | ✅ 8 个能力模块已复制到 `qqbot/features/` 并改写内部导入；提醒/主人绑定有测试覆盖 |
-| 单一插件仓库 | ✅ `E:\Jinyv-plugins` 已合并为一个 git 仓库；远程 `jinyv-plugins` 尚不存在 |
+| 单一插件仓库 | ✅ `E:\Jinyv-plugins` 已合并为一个 git 仓库并推送 `main` |
 | 主仓库 plugins 清理 | ✅ 已删除四个实现副本，仅保留说明文件 |
 | dsh 安装 | ✅ `jinyv-memory dsh install --source <zip|目录>` 可安装到 DSH_HOME |
 | 推送 | ✅ 已推送 `refactor/plugin-core`（分支最新提交）；`main` 未动 |
 | 宿主 HTTP API | ✅ `host-api` 插件：health / chat / remember / recall，Bearer 鉴权 |
 | 桌宠 WebSocket | ✅ desktop-v1 协议与服务代码（FastAPI 可选依赖，未装时降级） |
 | 通话联调 | ✅ `video-call` HTTP 桥 + mock 服务测试 |
-| 部署脚本 | ✅ `deploy/` systemd、安装、插件、桌宠/通话适配脚本 |
-| 104 项旧回归 | ❌ 兼容运行器被安全策略拒绝，当前保留 20 项新回归 |
-| 自检 / 测试 | selfcheck 22 项、unittest 20 项通过；dsh zip 自带 Node 测试 15/15 通过 |
+| 部署脚本 | ✅ `deploy/` systemd、安装、插件、桌宠/通话适配脚本；适配脚本支持 `embedded / local / server` |
+| 桌宠 / 通话双模 | ✅ `core_mode=embedded` 同进程；`local` 本机 host-api；`server` 远程 host-api；桌宠可独立运行 `standalone.py`；部署脚本同名参数 |
+| 104 项旧回归 | ✅ C 方案：`tests/test_regression.py` 复制旧测试逻辑并改写导入，104 项全部通过 |
+| 自检 / 测试 | selfcheck 22 项、unittest 24 项、104 项旧回归通过；dsh zip 自带 Node 测试 15/15 通过 |
 
 ## 三、快速开始
 
@@ -91,8 +92,11 @@ $env:PYTHONPATH = "E:\Jinyv-memory\src"
 # 离线自检：外部插件发现 + qqbot 闭环 + dsh 桥接
 python -m jinyv_memory.cli selfcheck
 
-# 20 项回归
+# unittest 回归
 python -m unittest discover -s tests -t . -v
+
+# 104 项旧回归（C 方案迁移版）
+python tests/test_regression.py
 
 # 插件健康（含 dsh 特殊接入）
 python -m jinyv_memory.cli plugins
@@ -151,12 +155,12 @@ dsh 不是 Python 插件，加载器不会扫描它。核心侧 `integrations/ds
 **未完成 / 受限**
 - 旧 `__init__.py` 中的主动话题/命令/轮换（`legacy_entry`）尚未复制；如需启用，把 `legacy_source_dir` 指向旧包目录作为回退。
 - 8 个能力的 NoneBot/富消息实际接线仍按 P2 逐模块对照，当前先保证可导入、可测试、最小闭环不回归。
-- 104 项旧回归、宿主 HTTP API、桌宠 WebSocket 服务、通话联调、部署脚本。
+- Linux 实机部署与真实桌宠/通话端联调尚未执行。
 
 ## 六、待确认决策
 
 1. **QQ 旧入口下一步**：8 个能力模块已迁入；主动话题/命令/轮换仍在旧 `__init__.py`，是否继续拆分为 `legacy/` 子模块？
-2. **插件仓库远程**：`https://github.com/YVFENGXS/jinyv-plugins` 尚不存在；请在 GitHub 创建空仓库后执行 README 中的 push 命令。
+2. **插件仓库远程**：`https://github.com/YVFENGXS/jinyv-plugins` 已创建并推送 `main`；后续改动继续推同一分支。
 3. **dsh 改造版安装**：继续用 zip（已支持 `dsh install`），还是后续提供 git 仓库？
 4. **dsh 同步策略**：已按确认改为 `dsh-wins`；`core-wins` 仅作为配置回退保留。是否需要人工合并队列待定。
 5. **是否合并到 `main`**：新架构已在 `refactor/plugin-core`；是否走 PR 合并，或继续保留分支。

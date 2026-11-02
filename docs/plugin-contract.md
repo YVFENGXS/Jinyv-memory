@@ -167,7 +167,7 @@ class MemoryAPI:
     def open_session(lane: Lane | str | None = None) -> Lane
     def close_session(lane: Lane | str | None = None) -> None
     def chat(lane, text, *, speaker="", source="", persona=None,
-             store_input=None, store_reply=None,
+             store_input=None, store_reply=None,  # store_reply: Callable[[str], str]
              reply_lease=False, lease_owner="") -> str
     def remember(lane, text, *, speaker="", importance=0.7, turn=None) -> int
     def write_turn(lane, role: str, content: str, *, source="") -> int

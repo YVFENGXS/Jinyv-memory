@@ -1,11 +1,17 @@
 # 视频通话适配器（服务在独立仓库 YVFENGXS/jinyu-video-call）
 enabled = true
 account = "video_call"
-# 适配器实现：E:/Jinyv-plugins/video-call（远程待确认）
+# 适配器实现：E:/Jinyv-plugins/video-call
 # 服务原仓库：https://github.com/YVFENGXS/jinyu-video-call
 # 本地服务克隆（只读检测）：E:/rp_memory_project/jinyu-video-call
 repo_dir = ""
 service_url = "http://127.0.0.1:8790"
 token = ""
+# 记忆核心接入：embedded（同进程）| local（本机 host-api）| server（远程 host-api）
+core_mode = "embedded"
+# local 留空默认 http://127.0.0.1:8710；server 必填
+core_url = ""
+# core_token 留空读 JINYV_HOST_API_TOKEN
+core_token = ""
 # 是否由本进程拉起 call_server（本轮未实现，保留开关）
 serve = false

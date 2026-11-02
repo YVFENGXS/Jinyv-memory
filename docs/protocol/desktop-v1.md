@@ -1,6 +1,6 @@
 # 金羽桌宠协议 desktop-v1（草案）
 
-> 状态：Draft，未实现、未上线
+> 状态：Draft；服务端适配层已实现（embedded / local / server 三种记忆核心接入）
 > 真源：本文件为唯一真源，客户端仓库只钉版本与能力位，不复制正文
 > 适用：`jinyu-memory` 服务端 ↔ 用户本地桌宠客户端（Windows 优先）
 > 日期：2026-10-31
@@ -28,7 +28,7 @@
 
 | 角色 | 说明 |
 |---|---|
-| Server | 记忆核心、LLM、披露层、提醒、租约所在方 |
+| Server | 记忆核心、LLM、披露层、提醒、租约所在方；可本机或远程 |
 | Device | 用户本地桌宠客户端，持设备令牌 |
 | Principal | 真人主体；v1 仅 `owner` 可配对 |
 
@@ -42,6 +42,7 @@
 ## 3. 传输与连接生命周期
 
 - 端点：`wss://<host>/desktop/v1/ws`
+- 服务端可独立进程运行（`desktop-pet/standalone.py`），通过 host-api 连本地或远程记忆核心
 - 认证：`Authorization: Bearer <device_token>`；令牌 32 字节随机数，仅在配对成功时下发一次
 - 建立连接后 10 秒内必须发送 `hello`，否则服务端关闭（4001）
 - 心跳：服务端每 30 秒发 `ping`，客户端回 `pong`；连续 2 次无响应判定掉线

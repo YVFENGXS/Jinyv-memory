@@ -34,7 +34,7 @@
 主仓库不持有插件实现。所有插件放在单一外部仓库 `E:\Jinyv-plugins`，每个插件是其中一个子目录：
 
 ```
-E:\Jinyv-plugins\        # git 仓库 main；远程 YVFENGXS/jinyv-plugins（待创建）
+E:\Jinyv-plugins\        # git 仓库 main；远程 YVFENGXS/jinyv-plugins（已推送）
 ├── qqbot\              # 适配层 + features 能力入口
 ├── desktop-pet\        # 桌宠服务端适配层（客户端在原仓库 Jinyu-pet）
 ├── video-call\         # 通话适配层（服务在原仓库 jinyu-video-call）
@@ -44,6 +44,17 @@ E:\Jinyv-plugins\        # git 仓库 main；远程 YVFENGXS/jinyv-plugins（待
 dsh 不在此目录：它是 JS/cordis 特殊插件，源码留在用户 zip / `$DSH_HOME`，
 主仓库只保留 `integrations/dsh.py` 桥接。加载器支持多个 `search_paths`，
 按顺序扫描；`plugin id` 重复只记录冲突，不覆盖已发现插件。
+
+桌宠与通话的记忆接入分三种模式（`config/plugins/*.toml` 的 `core_mode`）：
+
+| 模式 | 记忆入口 | 适用 |
+|---|---|---|
+| `embedded` | 进程内 `MemoryAPI` | 核心与适配层同进程（默认） |
+| `local` | `http://127.0.0.1:8710` 宿主 API | 桌宠独立进程连本机核心 |
+| `server` | 配置的 `core_url` 宿主 API | 桌宠/通话连远程核心 |
+
+三种模式共用 host-api 的 `/chat`、`/recall`、`/remember`；`store_reply` 让通话原文
+覆盖生成的回复落库。桌宠独立进程入口为 `desktop-pet/standalone.py`。
 
 ### 核心职责
 - `contract.py`：唯一的契约真源，插件只依赖它和 `MemoryAPI`。
@@ -171,12 +182,12 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0（本轮） | core 迁移 + 契约 + 多路径加载器 + 外部 qqbot 闭环 + QQ 能力迁移 + host-api/桌宠/通话桥 + dsh + 部署脚本 | `selfcheck` 22 项、`unittest` 20 项通过 |
+| P0（本轮） | core 迁移 + 契约 + 多路径加载器 + 外部 qqbot 闭环 + QQ 能力迁移 + host-api/桌宠/通话桥 + dsh + 部署脚本 | `selfcheck` 22 项、`unittest` 24 项通过 |
 | P0.5（本轮） | 主仓库 `plugins/` 副本已删除；8 个 QQ 能力已迁入 `qqbot/features/` 并改写导入；dsh 支持 CLI 安装 | `git status` 干净；提醒/主人绑定测试通过 |
-| P1 | 104 项旧回归兼容运行（需授权 sys.modules 兼容层或重写）；环境变量完全对齐 | 旧回归全绿；现有 20 项不回归 |
+| P1（本轮） | C 方案迁移 104 项旧回归：复制旧测试逻辑，显式改写导入；桌宠/通话 `core_mode` 双模；部署脚本 `local/server` | 104 项旧回归全绿；`unittest` 24 项不回归 |
 | P2 | qqbot 旧入口接线：主动话题/命令/轮换；富消息/链接视频等接入 NoneBot matcher | 逐模块行为等价对照 |
-| P3 | desktop-v1 服务实机联调（代码与协议已迁），FastAPI 依赖安装 | 协议 fixtures + 断线重连 |
-| P4 | video-call 服务实机联调（HTTP 桥已迁）；禁止双写 SQLite | 通话一轮落库、召回一致 |
+| P3 | desktop-v1 服务实机联调（代码与协议已迁），FastAPI 依赖安装 | 协议 fixtures + 断线重连 + `standalone.py` 连本地/远程核心 |
+| P4 | video-call 服务实机联调（HTTP 桥已迁）；禁止双写 SQLite | 通话一轮落库、召回一致、`core_mode` 可切换 |
 | P5 | DSH 改造版安装/导入验收；第三方分镜 CLI 检测与调用 | Node 测试 + 导入幂等 |
 | P6 | 清理旧入口、文档、推送分支 | 评审通过 |
 
@@ -188,12 +199,15 @@ manifest 字段：`id / name / version / entry / kind / description / requires /
 4. **多进程双写**：桌宠/通话若直连同一 SQLite，会互抢归档游标；必须坚持宿主 API 或单写者。
 5. **许可证**：Jinyu-pet 为 AGPL-3.0（含第三方形象资产），主仓库 MIT；两者只能独立仓库/独立进程 + 协议交互，不能合并源码。
 6. **DSH 约定冲突**：改造版是用户改过的第三方衍生代码，直接入库会破坏「不提交第三方源码」约定；当前用安装脚本 + 核心桥接规避。
-7. **旧源码迁移被策略阻断**：执行环境禁止把旧 QQ 实现整块复制进新仓库；当前 qqbot 仓库只有 `legacy_bridge.py` 只读引用，物理迁移需用户明确授权。
-8. **旧能力物理改写受限**：安全策略禁止整块复制旧 QQ 实现；当前为每项能力建立只读适配入口，真正改写需逐模块人工进行或改用 submodule。
+7. **旧源码迁移口径**：QQ 8 个能力已按用户授权复制进 `qqbot/features/` 并改写导入；旧仓库文件始终只读。
+8. **旧回归迁移口径**：C 方案保留旧测试逻辑，只在导入层改写为新 engine / 插件模块；不通过 `sys.modules` 劫持模拟旧模块名。
 9. **租约时钟**：时钟回拨、进程崩溃、SQLite busy 都是现实故障；已做 TTL/重试/接管，但跨机需中心化方案。
 10. **Windows 兼容**：路径大小写、文件占用、Node ≥20、无 bash 环境；安装脚本提供 Python 与 bash 两种入口。
 
 ## 10. 远程仓库策略
 
-远程 `main` 仍是旧实现。新架构已推送到独立分支 `refactor/plugin-core`（分支最新提交），
+主仓库远程 `main` 仍是旧实现。新架构已推送到独立分支 `refactor/plugin-core`（分支最新提交），
 **没有 force-push `main`**。是否合并到 `main` 走 PR 评审，不做强制推送。
+
+插件仓库 `https://github.com/YVFENGXS/jinyv-plugins` 已创建并推送 `main`；
+后续插件改动继续推同一分支。

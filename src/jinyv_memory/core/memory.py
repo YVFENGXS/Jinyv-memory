@@ -14,7 +14,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from ..accounts import AccountRegistry, Lane
 from ..errors import LeaseBusy, MemoryError
@@ -103,7 +103,8 @@ class MemoryAPI:
     # ------------------------------------------------------------ 对话
     def chat(self, lane: Lane | str | None, text: str, *, speaker: str = "",
              source: str = "", persona: Mapping[str, Any] | None = None,
-             store_input: str | None = None, store_reply: str | None = None,
+             store_input: str | None = None,
+             store_reply: Callable[[str], str] | None = None,
              reply_lease: bool = False, lease_owner: str = "") -> str:
         """完整一轮：落 turns → 拼上下文 → 生成 → 落回复 → 后台归档。"""
         lane = self.open_session(self._resolve(lane))

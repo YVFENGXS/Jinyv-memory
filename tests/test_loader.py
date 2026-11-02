@@ -60,7 +60,8 @@ class LoaderTest(unittest.TestCase):
             rows = {row["id"]: row for row in runtime.loader.health()}
             self.assertIn(rows["qqbot"]["state"], {"degraded", "running"})
             self.assertEqual(rows["desktop-pet"]["state"], "degraded")
-            self.assertEqual(rows["video-call"]["state"], "degraded")
+            # video-call 只要配了 service_url 即可就绪，不再强制要求本地 repo_dir
+            self.assertEqual(rows["video-call"]["state"], "running")
         finally:
             runtime.shutdown()
 

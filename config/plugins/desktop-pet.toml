@@ -1,10 +1,18 @@
 # 桌宠服务端适配器（客户端在独立仓库 YVFENGXS/Jinyu-pet）
 enabled = true
 account = "desktop"
-# 适配器实现：E:/Jinyv-plugins/desktop-pet（远程待确认）
+# 适配器实现：E:/Jinyv-plugins/desktop-pet
 # 客户端原仓库：https://github.com/YVFENGXS/Jinyu-pet
 # 本地客户端克隆（只读检测）：E:/rp_memory_project/rp-desktop-pet
 client_dir = ""
 service_url = "ws://127.0.0.1:8787/desktop/v1/ws"
-# 是否在本进程内拉起 desktop-v1 服务（本轮未实现，保留开关）
+# 记忆核心接入：embedded（同进程）| local（本机 host-api）| server（远程 host-api）
+core_mode = "embedded"
+# local 留空默认 http://127.0.0.1:8710；server 必填
+core_url = ""
+# core_token 留空读 JINYV_HOST_API_TOKEN
+core_token = ""
+# 是否在本进程内拉起 desktop-v1 服务
 serve = false
+host = "127.0.0.1"
+port = 8787

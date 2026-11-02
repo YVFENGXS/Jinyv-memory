@@ -80,6 +80,18 @@ class HostAPITest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data["reply"])
 
+    def test_chat_store_reply_and_session(self):
+        status, data = self._request("/chat", {
+            "text": "通话里说的话", "store_reply": "通话页原文",
+            "session": "host-test", "speaker": "主人",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(data["reply"])
+        lane = self.runtime.core.accounts.get("owner_qq").with_session("host-test")
+        stored = [turn["content"] for turn in self.runtime.core.memory.turns(lane)
+                  if turn["role"] == "assistant"]
+        self.assertEqual(stored[-1], "通话页原文")
+
     def test_auth_required(self):
         status, data = self._request("/remember", {"text": "x"}, auth=False)
         self.assertEqual(status, 401)

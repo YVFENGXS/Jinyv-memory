@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 import unittest
@@ -13,7 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-BRIDGE_PATH = Path(r"E:\Jinyv-plugins\video-call\bridge.py")
+PLUGINS = Path(os.environ.get("JINYV_PLUGINS_DIR") or (ROOT.parent / "Jinyv-plugins"))
+BRIDGE_PATH = PLUGINS / "video-call" / "bridge.py"
 
 
 def _load_bridge_class():

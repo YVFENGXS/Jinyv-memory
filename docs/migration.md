@@ -9,17 +9,18 @@
 5. 不复制第三方完整表结构与命名，只吸收行为级机制。
 6. 插件实现不进主仓库：统一放在单一插件仓库 `E:\Jinyv-plugins` 的子目录，
    主仓库只保留 core、契约、加载器、配置与测试。
-7. 本轮执行环境的安全策略禁止把旧 QQ 实现整块复制进新仓库，因此 qqbot 旧能力
-   先提供 `legacy_bridge.py` 只读引用；物理迁移需用户明确授权。
+7. 旧 QQ 的 8 个能力已按用户授权复制进 `qqbot/features/`，只改写内部导入；
+   旧仓库文件保持只读、未修改。`legacy_entry` 仍通过 `legacy_bridge.py` 只读回退。
 
 ## 1.5 外部插件仓库布局
 
 | 本地路径 | 角色 | 远程地址 | 状态 |
 |---|---|---|---|
-| `E:\Jinyv-plugins` | 单一插件仓库（main） | `https://github.com/YVFENGXS/jinyv-plugins` | 本地已建；远程尚不存在 |
+| `E:\Jinyv-plugins` | 单一插件仓库（main） | `https://github.com/YVFENGXS/jinyv-plugins` | 已推送 `main`（`e55ec94`） |
 | `E:\Jinyv-plugins\qqbot` | QQ 适配层 + legacy 只读桥 | 同上 | 已提交 |
-| `E:\Jinyv-plugins\desktop-pet` | 桌宠服务端适配层 | 上游 `YVFENGXS/Jinyu-pet` | 已提交，不复制客户端源码 |
-| `E:\Jinyv-plugins\video-call` | 视频通话适配层 | 上游 `YVFENGXS/jinyu-video-call` | 已提交，不复制服务源码 |
+| `E:\Jinyv-plugins\desktop-pet` | 桌宠服务端适配层 | 上游 `YVFENGXS/Jinyu-pet` | 已提交；`embedded / local / server` 双模 + `standalone.py` |
+| `E:\Jinyv-plugins\video-call` | 视频通话适配层 | 上游 `YVFENGXS/jinyu-video-call` | 已提交；`embedded / local / server` 双模 |
+| `E:\Jinyv-plugins\host-api` | 宿主 HTTP API | 无上游 | 已提交；chat/remember/recall + Bearer |
 | `$DSH_HOME\plugins\jinyu-memory-dsh` | DSH 特殊插件（JS/cordis） | 用户 zip，无已知远程 | 源码不复制、不改动 |
 | `var/vendor/dsh-video-storyboard` | 第三方分镜 CLI | `https://github.com/SAOS-3624/dsh-video-storyboard` | 独立安装，固定 ref |
 
@@ -92,8 +93,11 @@
 | `bot.py`（11 行 NoneBot 启动） | `jinyv_memory.cli` + `E:\Jinyv-plugins\qqbot\nonebot_adapter.py` | 🟡 需真实 NoneBot 环境验证 |
 | `requirements.txt` | `pyproject.toml`（core 零依赖；插件 extras） | ✅ |
 | `.env.example` | `.env.example` | 🟡 重新整理，未做旧变量全量对照 |
-| `tools/serve.py`（宿主 HTTP API） | `E:\Jinyv-plugins\host-api` | ✅ health/chat/remember/recall + 鉴权测试 |
-| `tests/test_regression.py`（104 项） | 兼容运行器方案被安全策略拒绝 | ❌ 待授权；当前 20 项新回归 |
+| `tools/serve.py`（宿主 HTTP API） | `E:\Jinyv-plugins\host-api` | ✅ health/chat/remember/recall + Bearer 鉴权 |
+| `desktop_server.py`（桌宠服务） | `E:\Jinyv-plugins\desktop-pet\server.py` + `standalone.py` | ✅ desktop-v1 协议；`core_mode` 双模 |
+| `call_server.py`（通话服务桥） | `E:\Jinyv-plugins\video-call\bridge.py` | ✅ health/turn/say；`core_mode` 双模 |
+| `tools/why.py`（召回留痕） | `E:\Jinyv-memory\tools\why.py` | ✅ R69 证据链复核 |
+| `tests/test_regression.py`（104 项） | `E:\Jinyv-memory\tests\test_regression.py`（C 方案：复制测试逻辑 + 改写导入） | ✅ 104 项全部通过 |
 | `deploy/*.service` | `deploy/jinyv-memory.service` | ✅ systemd 单元 |
 | `deploy/install_*.sh` | `deploy/install*.sh` | ✅ 主仓库/插件/桌宠/通话安装脚本 |
 
@@ -103,17 +107,19 @@
 - 新仓库、git 新历史（未 push）。
 - core 13 模块迁移 + `MemoryAPI` + 租约/幂等。
 - 插件契约、多路径加载器、事件/工具/钩子/调度四套注册表。
-- 插件实现移到单一插件仓库 `E:\Jinyv-plugins` 的三个子目录。
+- 插件实现移到单一插件仓库 `E:\Jinyv-plugins` 的四个子目录（qqbot / desktop-pet / video-call / host-api）。
 - qqbot 外部加载并跑通最小闭环 + NoneBot 可选降级。
 - dsh 特殊接入：检测/可选启停/导入/导出/journal/冲突。
-- 自检 22 项、unittest 20 项、DSH Node 测试 15 项。
+- 自检 22 项、unittest 24 项、104 项旧回归、DSH Node 测试 15 项。
 - 已完成：主仓库 `plugins/` 副本删除；qqbot 仓库按顺序建立旧能力适配入口；dsh CLI 安装。
 - 8 个 QQ 能力模块已复制到 `qqbot/features/`，内部导入改为包内相对导入；旧目录只作为 `legacy_entry` 回退。
 
-### P1：核心行为对齐
-- 迁 104 项回归，确认 DB schema、水位线、披露、承诺、Dream 与旧版逐项一致。
-- `tools/serve.py` 宿主 API 插件化（视频通话/桌宠依赖）。
-- `.env` 旧变量与新配置的映射表；启动脚本兼容。
+### P1（本轮已完成）：核心行为对齐
+- ✅ 104 项旧回归已按 C 方案迁入并通过，确认 DB schema、水位线、披露、承诺、Dream 与旧版逐项一致。
+- ✅ `tools/serve.py` 已插件化为 `host-api`；桌宠/通话通过 `/chat` `/recall` `/remember` 接入。
+- ✅ 桌宠/通话支持 `embedded|local|server` 三种记忆核心接入；桌宠可独立进程运行。
+- ✅ 部署脚本支持 `local/server` 参数。
+- 待补：`.env` 旧变量与新配置的完整映射表。
 - 验收：旧回归全绿；qqbot 闭环不变。
 
 ### P2：QQ 外围逐模块搬
