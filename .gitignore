@@ -27,9 +27,6 @@ tts_cache/
 login_qrcode.png
 *.log
 
-# Live2D 公皮资产（不入库，按授权要求仅本地使用）
-web/live2d/models/
-
 # 编辑器 / 系统
 .idea/
 .vscode/

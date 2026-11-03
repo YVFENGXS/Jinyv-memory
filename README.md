@@ -245,7 +245,7 @@ ssh -N -L 127.0.0.1:8787:127.0.0.1:8787 -i .deploy_key ubuntu@HOST
 
 本仓保留一份 `call_server.py` 供服务器上的 `rp-call.service` 使用；独立维护的通话项目见 [jinyu-video-call](https://github.com/YVFENGXS/jinyu-video-call)。
 
-Live2D 模型文件不随仓库分发：fresh clone 时 `web/live2d/models/jinyu/` 为空，通话、读屏、语音和记忆都能正常跑，只是表情/动作候选清单为空（启动会打印一行提示，不影响记忆链路）。需要舞台指令时，自行把 `大肥鱼.model3.json` 和贴图放进该目录；模型版权与使用条件归原作者。
+Live2D 通话页不再随本仓分发：页面（含 `models/`）由独立项目维护。`call_server.py` 默认仍从本仓的 `web/live2d` 找页面；把 `RP_CALL_WEB` 指向独立项目的 `web/live2d` 即可。页面缺席时读屏、语音和记忆链路仍能跑，只是没有舞台可渲染。
 
 ### 其它框架：JinyuHost 与 HTTP 写入通道
 
@@ -675,7 +675,7 @@ sqlite3 /opt/qqbot/data/rp_memory.db ".backup '/opt/qqbot/backup/rp-$(date +%F).
 - **dsh-bili-humanism**（B站账号接入规范，上游文档，不随仓库分发）——本仓库 B站写操作的边界直接照它来：只开白名单接口、风控命中就持久暂停、发出后回读核验、失败不自动重试、只能人工 `/bili unlock` 解除；评论带图走视频笔记也是按它的思路补的。感谢作者把「哪些能自动、哪些必须人来」写成了可执行的规则。
 - **[bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)** —— 评论、视频笔记、动态图片上传、扫码登录这些接口的字段、返回码与请求头，全部对照这份社区文档实现；没有它，这些接口只能靠抓包猜。
 - **[dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard)** —— 视频分镜（第三方组件，不随本仓库分发，脚本按上游固定提交拉取）。
-- **[Live2D Cubism Core](https://www.live2d.com/en/sdk/)**、**[PixiJS](https://pixijs.com/)**、**[pixi-live2d-display](https://github.com/guansss/pixi-live2d-display)** —— 通话页 Live2D 渲染使用的运行时与开源库。
+- **[Live2D Cubism Core](https://www.live2d.com/en/sdk/)**、**[PixiJS](https://pixijs.com/)**、**[pixi-live2d-display](https://github.com/guansss/pixi-live2d-display)** —— 独立通话项目 jinyu-video-call 的 Live2D 渲染使用的运行时与开源库。
 - **DeepSeek-chan（大肥鱼）Live2D 模型** —— 原画 / 拆分：神宫凉子，Live2D 建模：霓虹猫_NeonNeko；模型不随仓库分发，版权与使用条件归原作者。
 - **[NoneBot2](https://nonebot.dev/)**、**[OneBot v11](https://github.com/botuniverse/onebot-11)**、**[NapCatQQ](https://github.com/NapNeko/NapCatQQ)** —— QQ 侧接入的全部基础设施。
 - **[AstrBot](https://github.com/AstrBotDevs/AstrBot)** —— 上下文管理、重试退避、临时文件清理等工程实践的参考（未复制代码，许可证差异见下方）。

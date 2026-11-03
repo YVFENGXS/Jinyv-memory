@@ -8,6 +8,7 @@
   python call_server.py --env-file %USERPROFILE%/.rp-pet/call.env
 
 页面：http://127.0.0.1:8790/
+  页面目录由 RP_CALL_WEB 指定，默认 ./web/live2d（独立通话项目 jinyu-video-call 自带该目录）
 接口：
   GET  /health                  → 视觉/模型/语音识别/语音合成/舞台名册是否就绪
   POST /vision/frame {session, image, mode?} → 读一帧屏幕 / 摄像头
@@ -210,7 +211,7 @@ if not host_configured() and os.environ.get("RP_DB") and not ALLOW_LOCAL_DB:
 EPOCH_SECONDS = max(0, int(float(os.environ.get("RP_SESSION_EPOCH_HOURS") or 48) * 3600))
 EPOCH_FLUSH = max(1.0, float(os.environ.get("RP_EPOCH_FLUSH_SECONDS") or 8))
 
-WEB_DIR = ROOT / "web" / "live2d"
+WEB_DIR = Path(os.environ.get("RP_CALL_WEB") or (ROOT / "web" / "live2d"))
 MAX_IMAGE_BYTES = max(1, int(float(os.environ.get("RP_SCREEN_MAX_MB") or 8))) * 1024 * 1024
 MAX_QUESTION = 300
 READING_TTL = 600
