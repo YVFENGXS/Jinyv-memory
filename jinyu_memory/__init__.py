@@ -63,7 +63,8 @@
   RP_IMG_TEXT_LIMIT                 选填，视觉判读抄录图中文字的上限（字符），默认 4000
   RP_IMG_NOTE_TEXT                  选填，OCR 注入前台的字数上限，默认 4000
   RP_ADMIN_QQ                       选填，允许 /persona /memory /merge /save /tags /find /img
-                                    /sticker /fix /voice /testrich /social /imgat 的 QQ
+                                    /sticker /fix /voice /testrich /social /imgat /plan /diary
+                                    /autonomy 的 QQ
   RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
   RP_FACT_MERGE_MIN                 选填，会话事实达到多少条才自动合并，默认 20
   RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
@@ -163,6 +164,8 @@ from linkmeta import (                                      # noqa: E402
     zoom_note,
 )
 import owner_gate                                           # noqa: E402
+import autonomy as autonomy_mod                              # noqa: E402
+import music as music_mod                                    # noqa: E402
 import persona as persona_mod                               # noqa: E402
 import reminder                                             # noqa: E402
 from persona import PERSONA                                 # noqa: E402
@@ -229,6 +232,15 @@ SEARCH_ON = (os.environ.get("RP_SEARCH") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 SEARCH_DAILY = max(1, int(float(os.environ.get("RP_SEARCH_DAILY") or 30)))
 _search_day = {"day": "", "n": 0}
+# 听音乐：本地量测音频（语音/文件/直链/B站/YouTube），不上传、不猜情绪；
+# 链接下载有每日上限与大小上限，具体阈值在 music.py 里。
+MUSIC_ON = (os.environ.get("RP_MUSIC") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+# 自主作息：整点报点 / 日计划 / 自己醒来。默认关闭，RP_AUTONOMY=1 开启。
+AUTONOMY_ON = (os.environ.get("RP_AUTONOMY") or "0").strip().lower() not in {
+    "0", "false", "no", "off"}
+AUTONOMY_DIGEST = (os.environ.get("RP_AUTONOMY_DIGEST") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
 IDLE_NUDGE_MIN = float(os.environ.get("RP_IDLE_NUDGE_MINUTES") or 60)
 PROACTIVE_ON = (os.environ.get("RP_PROACTIVE") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
@@ -319,6 +331,11 @@ _nudge_count = {}         # "日期:sid" -> 当天主动开口次数（按天限
 _poke_at = {}             # "sid:uid" -> 上次回戳时间（冷却，防两个机器人来回戳）
 _silent_count = {}        # sid -> 连续选择不回话的轮数（超限强制开口）
 _last_media = {}          # sid -> 最近一张图片的 URL/bytes 摘要，供 /save 使用
+_last_music = {}          # sid -> 最近一次可分析的音频路径，供「再听听副歌」复用
+_autonomy_sid = ""        # 自主作息的目标会话（默认 RP_SESSION 的主私聊）
+_autonomy_uid = 0
+_autonomy_gid = 0
+_autonomy_path: Optional[Path] = None
 _sent_images = {}         # sid -> 这个会话已经搜图发过的直链（去重，最多 40 条）
 _sent_msgs = {}           # sid -> 发出的消息 [{label,mid,at,preview}]，撤回按编号找
 _sent_seq = {}            # sid -> 已发出的条数（M1、M2…）
@@ -355,16 +372,23 @@ def _bind_core_log() -> None:
         lg.propagate = False                    # 避免再被 root 的 handler 重复打印
 
 
-def _tool_set_reminder(args, sid, cid, ctx=None) -> str:
-    """工具 set_reminder：由模型判断「该不该提醒」，正则只留兜底。"""
+def _reminder_uid(sid: str, ctx=None) -> int:
+    """当前会话对应的 QQ 号：工具里拿不到 ctx 时从 qq-u<uid> 会话号兜底。"""
     ctx = ctx or {}
     uid = int(ctx.get("user_id") or 0)
-    gid = int(ctx.get("group_id") or 0)
     if not uid and str(sid).startswith("qq-u"):
         try:
             uid = int(str(sid)[4:])
         except ValueError:
             uid = 0
+    return uid
+
+
+def _tool_set_reminder(args, sid, cid, ctx=None) -> str:
+    """工具 set_reminder：由模型判断「该不该提醒」，正则只留兜底。"""
+    ctx = ctx or {}
+    uid = _reminder_uid(sid, ctx)
+    gid = int(ctx.get("group_id") or 0)
     if not reminder.ready() or not uid:
         return "当前场景无法登记提醒。"
     plan = reminder.schedule_text(str((args or {}).get("when") or ""),
@@ -379,6 +403,60 @@ def _tool_set_reminder(args, sid, cid, ctx=None) -> str:
                 f"重复={label or '无'} 内容={plan.get('content')!r}")
     head = f"已登记（{label}）" if label else "已登记"
     return f"{head}：{plan.get('content') or '到点提醒'}，将在 {plan['when']} 提醒。"
+
+
+def _tool_list_reminders(args, sid, cid, ctx=None) -> str:
+    """列出待办提醒：模型自查名额、拿编号去改或删。"""
+    uid = _reminder_uid(sid, ctx)
+    if not reminder.ready() or not uid:
+        return "当前场景看不到提醒。"
+    rows = reminder.list_pending(uid)
+    if not rows:
+        return f"现在没有待办提醒（0/{reminder.MAX_PENDING}）。"
+    lines = []
+    for r in rows:
+        tag = reminder.repeat_label(r.get("repeat"))
+        what = str(r.get("text") or "（提醒一下）")[:40]
+        lines.append(f"#{r['id']} {reminder.fmt_when(r['due_ts'])}"
+                     + (f"【{tag}】" if tag else "") + f" {what}")
+    return f"待办提醒 {len(rows)}/{reminder.MAX_PENDING}：\n" + "\n".join(lines)
+
+
+def _tool_edit_reminder(args, sid, cid, ctx=None) -> str:
+    """改一条待办的内容或时间；编号来自 list_reminders。"""
+    uid = _reminder_uid(sid, ctx)
+    if not reminder.ready() or not uid:
+        return "当前场景改不了提醒。"
+    try:
+        rid = int((args or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        rid = 0
+    if not rid:
+        return "id 要填数字，先用 list_reminders 查编号。"
+    res = reminder.update(uid, rid,
+                          when=str((args or {}).get("when") or ""),
+                          text=str((args or {}).get("what") or ""))
+    if not res.get("ok"):
+        return str(res.get("error") or "没改成。")
+    tag = reminder.repeat_label(res.get("repeat"))
+    return (f"已改 #{rid}：{res.get('text') or '（提醒一下）'}"
+            f"｜{res.get('when')}" + (f"（{tag}）" if tag else ""))
+
+
+def _tool_cancel_reminder(args, sid, cid, ctx=None) -> str:
+    """取消一条或全部待办，立刻释放名额。"""
+    uid = _reminder_uid(sid, ctx)
+    if not reminder.ready() or not uid:
+        return "当前场景取消不了提醒。"
+    if bool((args or {}).get("all")):
+        return reminder.cancel(uid, "all")
+    try:
+        rid = int((args or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        rid = 0
+    if not rid:
+        return "id 要填数字，先用 list_reminders 查编号；清空就传 all=true。"
+    return reminder.cancel(uid, str(rid))
 
 
 def _win_headers() -> dict:
@@ -895,6 +973,37 @@ def _tool_web_search(args, sid, cid, ctx=None) -> str:
         return f"联网搜索没成功（{exc}），别硬编，如实告诉主人这次没查到。"
 
 
+def _tool_music(args, sid, cid, ctx=None) -> str:
+    """工具 music_analyze：本地量测音频，给模型一份可追溯、带局限的听歌报告。"""
+    if not MUSIC_ON:
+        return "听音乐已关闭（RP_MUSIC=0）。"
+    reason = music_mod.available()
+    if "numpy" in reason:
+        return reason + "；让管理员在机器人 venv 里装完再听。"
+    args = args or {}
+
+    def _flag(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    source = str(args.get("source") or "").strip()
+    fallback = str((ctx or {}).get("music_path") or _last_music.get(sid) or "")
+    try:
+        path, note = music_mod.resolve(source, fallback)
+        _last_music[sid] = str(path)
+        text = music_mod.analyze_file(
+            path, start=str(args.get("start") or ""),
+            end=str(args.get("end") or ""),
+            detail=_flag(args.get("detail")), brief=_flag(args.get("brief")))
+        return f"{note}\n{text}" if note else text
+    except music_mod.MusicError as exc:
+        return f"没听成：{exc}"
+    except Exception as exc:                     # noqa: BLE001  分析失败如实降级
+        logger.warning(f"[music] 分析失败 sid={sid} source={source[:80]!r}: {exc}")
+        return f"音乐分析失败了（{exc}），如实告诉主人这次没听成，不要编听感。"
+
+
 def _mcp_handler(mgr, tool_name: str):
     """MCP 工具的同步适配器：异常交给 _run_tool 统一降级。"""
     def handler(args, sid, cid, ctx=None) -> str:
@@ -914,10 +1023,13 @@ def _install_tools(inst) -> None:
         "设置定时提醒：主人要你到点提醒，或你自己答应在某个时刻做某件事"
         "（例如零点后发说说）时调用。能用钟点就直接写钟点，别自己算还剩多久："
         "零点、24:00、23:59、明天0点、今晚12点、下午3点半；"
-        "也可以写相对时长，如 20分钟、2小时40分钟、1天2小时。"
+        "也可以写相对时长，如 20分钟、2小时40分钟、1天2小时、1年"
+        "（一次性提醒最长 366 天，跨年照常触发）。"
         "要每天/每周/每月重复的事，when 写 每天21点、每周一21点、每月5日21点，"
         "后台发完会自动登记下一次；到点 2 分钟后还会复查你有没有真的做"
-        "（发说说、搜图、发表情包都要真调工具，只回一句不算）。",
+        "（发说说、搜图、发表情包都要真调工具，只回一句不算）。"
+        "名额满了先用 list_reminders 看哪条占着，再 cancel_reminder 腾位置，"
+        "不要叫主人自己去清。",
         {"type": "object",
          "properties": {"when": {"type": "string",
                                  "description": "钟点（零点、24:00、明天0点）、相对时长（20分钟、2小时40分钟）或重复写法（每天21点、每周一21点、每月5日21点）"},
@@ -925,6 +1037,33 @@ def _install_tools(inst) -> None:
                                  "description": "到点要说或要做的事，写清楚"}},
          "required": ["when", "what"]},
         _tool_set_reminder)
+    inst.register_tool(
+        "list_reminders",
+        "查看主人的待办提醒：编号、时间、内容、重复规则，以及当前占了几格（上限 10）。"
+        "主人问「你都有什么提醒」、提醒加不进去、或你要改/删某条之前，先调这个拿编号。",
+        {"type": "object", "properties": {}},
+        _tool_list_reminders)
+    inst.register_tool(
+        "edit_reminder",
+        "修改一条还没发出的待办：id 来自 list_reminders；when 换时间（写法同 set_reminder），"
+        "what 换内容；只填一个就只改那一项。自己的计划要改时间时直接改这条，不要新加一条。",
+        {"type": "object",
+         "properties": {"id": {"type": "integer", "description": "待办编号"},
+                        "when": {"type": "string",
+                                 "description": "新的时间；不改就留空"},
+                        "what": {"type": "string",
+                                 "description": "新的内容；不改就留空"}},
+         "required": ["id"]},
+        _tool_edit_reminder)
+    inst.register_tool(
+        "cancel_reminder",
+        "取消待办：id 取消一条（编号来自 list_reminders），all=true 清空全部；"
+        "取消后名额立刻释放。主人说不用提醒了、或它已经过期占着位置时调用。",
+        {"type": "object",
+         "properties": {"id": {"type": "integer", "description": "待办编号"},
+                        "all": {"type": "boolean",
+                                "description": "true 表示清空全部待办"}}},
+        _tool_cancel_reminder)
     inst.register_tool(
         "search_image",
         "搜一张图并直接发给主人：先拿到这张图的画面描述，再组织回复。"
@@ -1050,6 +1189,31 @@ def _install_tools(inst) -> None:
                                       "description": "搜索关键词，几个词就够（如「量子纠缠 通俗解释」）"}},
              "required": ["query"]},
             _tool_web_search)
+    if MUSIC_ON:
+        inst.register_tool(
+            "music_analyze",
+            "听一段音频并给出本地测量报告：主人刚发的语音、QQ 音频/视频文件、"
+            "本地音频文件路径、音频直链、B站/YouTube 链接都能听。"
+            "source 留空 = 本条语音/音频文件或本会话上一首；"
+            "只想听某一段时写 start/end（秒数或 1:30），一次最多 120 秒。"
+            "返回响度/峰值/贴顶、BPM 候选、调性候选、能量走势、频段比例和明确局限；"
+            "默认短报告，detail=true 才展开候选与变化点，brief=true 更短。"
+            "这是测量不是听感：不要凭报告断言歌手情绪、具体乐器或有没有人唱；"
+            "网易云/QQ音乐链接不能直接下，让主人先发音频文件，或换 B站/YouTube/直链。"
+            "一次只分析一首，报告里的 dB 和百分比不用逐条念。",
+            {"type": "object",
+             "properties": {
+                 "source": {"type": "string",
+                            "description": "音频链接、本地路径；留空=本条语音/上一首"},
+                 "start": {"type": "string",
+                           "description": "起始位置，秒数（63）或 1:05"},
+                 "end": {"type": "string",
+                         "description": "结束位置，秒数（95）或 1:35；最多 120 秒"},
+                 "detail": {"type": "boolean",
+                            "description": "true=展开候选与变化点，默认 false"},
+                 "brief": {"type": "boolean",
+                           "description": "true=更短，只保留关键测量"}}},
+            _tool_music)
     if mcp_mgr is None:
         return
     for spec in mcp_mgr.tool_specs():
@@ -1160,6 +1324,134 @@ def _install_host_routes() -> None:
     logger.info("[jinyu] 宿主接口就绪 /jinyu/chat（Bearer 校验，source=qq/desk/video）")
 
 
+def _autonomy_target() -> tuple:
+    """自主作息说给谁听：优先 RP_AUTONOMY_SESSION，其次 RP_SESSION 的主私聊。"""
+    raw = (os.environ.get("RP_AUTONOMY_SESSION")
+           or os.environ.get("RP_SESSION") or "").strip()
+    if not raw:                             # 没配会话就落到管理员第一个 QQ
+        raw = (os.environ.get("RP_ADMIN_QQ") or "").split(",")[0].strip()
+        raw = f"qq-u{raw}" if raw.isdigit() else ""
+    try:
+        gid = int(float(os.environ.get("RP_AUTONOMY_GROUP") or 0))
+    except (TypeError, ValueError):
+        gid = 0
+    if raw.startswith("qq-u"):
+        try:
+            return raw, int(raw[4:]), gid
+        except ValueError:
+            return "", 0, gid
+    return "", 0, gid
+
+
+def _autonomy_chat(messages, max_tokens=400):
+    """前台模型 JSON 调用；必须走模型自己的客户端，别复用正在对话的锁。"""
+    if mw_plain is None:
+        return "{}"
+    return mw_plain.front.chat(messages, temperature=0.8,
+                               max_tokens=int(max_tokens), json_mode=True)
+
+
+async def _autonomy_send(text: str) -> bool:
+    if not _autonomy_uid:
+        return False
+    return await _send_to(str(text or ""), user_id=_autonomy_uid,
+                          group_id=_autonomy_gid)
+
+
+def _autonomy_recent() -> dict:
+    """给自主作息读最近对话；只读，不触发会话轮换。"""
+    out = {"last_user": "", "last_user_ts": 0.0, "recent": ""}
+    if mw_plain is None or not _autonomy_sid:
+        return out
+    try:
+        sid = mw_plain.db.latest_sid(_autonomy_sid, CID)
+        hi = mw_plain.db.max_turn(sid, CID)
+        rows = mw_plain.db.get_turns(sid, CID, max(1, hi - 6))
+    except Exception as exc:                    # noqa: BLE001 读不到就当没有
+        logger.info(f"[jinyu] 自主读最近对话失败: {exc}")
+        return out
+    users = [r for r in rows if str(r.get("role")) == "user"]
+    if users:
+        out["last_user"] = str(users[-1].get("content") or "")[:120]
+        try:
+            stamp = str(users[-1].get("created_at") or "")
+            if stamp:
+                out["last_user_ts"] = datetime.strptime(
+                    stamp, "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    out["recent"] = "；".join(
+        f"{'你' if r.get('role') == 'assistant' else '主人'}:"
+        f"{str(r.get('content') or '')[:80]}" for r in rows[-4:])
+    return out
+
+
+def _autonomy_action(name: str, args: dict) -> str:
+    """醒来时可用的动作白名单；外部内容只当资料，不当指令。"""
+    if mw_plain is None or not _autonomy_sid:
+        return "自主动作不可用。"
+    args = args or {}
+    ctx = {"user_id": _autonomy_uid, "group_id": _autonomy_gid,
+           "channel": "qq", "sends": [], "music_path": ""}
+    query = str(args.get("query") or "").strip()
+    try:
+        if name == "recall":
+            return mw_plain._tool_query_memory(
+                {"query": query}, _autonomy_sid, CID, ctx)
+        if name == "recent":
+            data = _autonomy_recent()
+            return data.get("recent") or "最近没有对话。"
+        if name == "tidy_memory":
+            import dream
+            stats = dream.run(mw_plain, CID)
+            return (f"记忆整理：过期 {len(stats.get('expired') or [])} 条，"
+                    f"合并 {stats.get('groups', 0)} 组，"
+                    f"新章节 {stats.get('chapters', 0)} 张。"
+                    + (f"（{stats['skipped']}）" if stats.get("skipped") else ""))
+        if name == "web_search":
+            return _tool_web_search({"query": query}, _autonomy_sid, CID, ctx)
+        if name == "search_image":
+            url, info = image_search_info(query)
+            if not url:
+                return "没找到合适的图，换个更具体的画面词再试。"
+            desc = str(info.get("desc") or "").strip()
+            kind = str(info.get("kind") or "图片").strip()
+            logger.info(f"[jinyu] 自主识图 sid={_autonomy_sid}"
+                        f" 词={query!r} 画面={desc!r}")
+            return (f"看了一张{kind}，画面是「{desc}」。"
+                    "只是你自己看的，不用发出去，也不要编图里没有的东西。")
+        if name.startswith("bili"):
+            if not BILI_TOOL_ON:
+                return "B站工具已关闭。"
+            action = {"bili_search": "search", "bili_popular": "popular",
+                      "bili_watch": "watch"}.get(name, "search")
+            return _tool_bili({"action": action, "query": query},
+                              _autonomy_sid, CID, ctx)
+    except Exception as exc:                    # noqa: BLE001 单个动作失败只降级
+        return f"动作执行失败：{exc}"
+    return "未知动作。"
+
+
+def _start_autonomy(db_path: Path) -> None:
+    global _autonomy_sid, _autonomy_uid, _autonomy_gid, _autonomy_path
+    sid, uid, gid = _autonomy_target()
+    if not sid or not uid:
+        logger.info("[jinyu] 自主作息未启用：缺 RP_AUTONOMY_SESSION / RP_SESSION"
+                    "（需要 qq-u<主人QQ号>）")
+        return
+    _autonomy_sid, _autonomy_uid, _autonomy_gid = sid, uid, gid
+    _autonomy_path = db_path.with_name("autonomy.db")
+    autonomy_mod.init(_autonomy_path, sid, uid, gid, CID)
+    autonomy_mod.bind(chat=_autonomy_chat, send=_autonomy_send,
+                      action=_autonomy_action, recent=_autonomy_recent,
+                      persona=PERSONA.get("core") or "")
+    if autonomy_mod.start():
+        logger.info(f"[jinyu] 自主作息 启用｜{autonomy_mod.status()}")
+    else:
+        logger.info("[jinyu] 自主作息 未启动（事件循环不可用）")
+
+
 @driver.on_startup
 async def _startup():
     global mw, mw_plain, mw_social, SOCIAL_DB, mcp_mgr
@@ -1168,6 +1460,7 @@ async def _startup():
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _social_load(db_path.with_name("social_state.json"))
     _img_state_load(db_path.with_name("media_state.json"))
+    music_mod.configure(db_path.with_name("music_cache"))
     mw_plain = RPContextMiddleware(
         from_env("front"), from_env("back"), DB(str(db_path)),
         max_tokens=int(os.environ.get("RP_MAX_TOKENS") or 64000),
@@ -1210,6 +1503,12 @@ async def _startup():
     logger.info("[jinyu] 语音转写 "
                 + (f"启用 model={asr_model()}" if asr_enabled()
                    else "未启用（未配置 RP_ASR_KEY）"))
+    if MUSIC_ON:
+        _music_reason = music_mod.available()
+        logger.info("[jinyu] 听音乐 启用（本地分析，不上传音频）"
+                    + (f"；{_music_reason}" if _music_reason else ""))
+    else:
+        logger.info("[jinyu] 听音乐 未启用（RP_MUSIC=0）")
     if embedding.enabled():
         logger.info(f"[jinyu] 语义召回 启用 model={embedding.model_name()} "
                     f"dim={embedding.dim()}")
@@ -1256,6 +1555,11 @@ async def _startup():
     if BALANCE_ALERT > 0:
         asyncio.create_task(_balance_loop())
     asyncio.create_task(asyncio.to_thread(sweep_tts_cache, True))   # 启动时清一次 TTS 缓存
+    if AUTONOMY_ON:
+        try:
+            _start_autonomy(db_path)
+        except Exception as exc:                # noqa: BLE001 自主坏了不能拖垮聊天
+            logger.warning(f"[jinyu] 自主作息启动失败: {exc}")
     _install_host_routes()
 
 
@@ -2100,7 +2404,7 @@ def _reply_segments(raw) -> list:
     return segs
 
 
-async def _reply_bits(bot, raw) -> list:
+async def _reply_bits(bot, raw, audio_paths=None) -> list:
     """把一条被引用消息渲染成人话：文字原样、图片判读、卡片摘要、语音转写。"""
     bits = []
     segs = _reply_segments(raw)
@@ -2135,6 +2439,21 @@ async def _reply_bits(bot, raw) -> list:
             bits.append(note)
             logger.info(f"[jinyu] 引用卡片已展开 "
                         f"标题={info.get('title') or info.get('desc')!r}")
+        elif stype == "file":
+            name = str(sdata.get("file") or sdata.get("name") or "")
+            url = str(sdata.get("url") or "")
+            if not _is_audio_file(s):
+                bits.append(f"（文件：{name[:60] or '未命名'}）")
+                continue
+            if audio_paths is None or not url.startswith("http"):
+                bits.append(f"（引用了音频文件：{name[:50] or '未命名'}）")
+                continue
+            try:
+                path = await asyncio.to_thread(music_mod.save_url, url)
+                audio_paths.append(str(path))
+                bits.append(f"「音频文件：{name[:50] or '未命名'}」")
+            except Exception:                 # noqa: BLE001  文件过期/过大都只降级
+                bits.append("（引用的音频文件没取到）")
         elif stype == "record":
             text = ""
             try:
@@ -2149,8 +2468,8 @@ async def _reply_bits(bot, raw) -> list:
     return bits
 
 
-async def _expand_reply(event: MessageEvent) -> str:
-    """把「引用」展开成人话：引用了谁、原文是什么、引用的图里有什么。
+async def _expand_reply(event: MessageEvent, audio_paths=None) -> str:
+    """把「引用」展开成人话：引用了谁、原文是什么、引用的图/文件里有什么。
 
     NoneBot v11 适配器会把 reply 段从 event.message 里摘走、把原消息放进
     event.reply（onebot/v11/bot.py 的 _check_reply），所以在 message 里找
@@ -2166,7 +2485,7 @@ async def _expand_reply(event: MessageEvent) -> str:
         who = (getattr(sender, "nickname", "") or
                str(getattr(sender, "user_id", "") or "某人"))
         try:
-            bits = await _reply_bits(bot, getattr(reply, "message", None))
+            bits = await _reply_bits(bot, getattr(reply, "message", None), audio_paths)
         except Exception:                     # noqa: BLE001   展开失败只降级
             bits = []
         notes.append(f"（引用 {who} 的消息：{'；'.join(bits)}）" if bits
@@ -2187,7 +2506,7 @@ async def _expand_reply(event: MessageEvent) -> str:
             continue
         sender = src.get("sender") or {}
         who = sender.get("nickname") or str(sender.get("user_id") or "某人")
-        bits = await _reply_bits(bot, src.get("message"))
+        bits = await _reply_bits(bot, src.get("message"), audio_paths)
         notes.append(f"（引用 {who} 的消息：{'；'.join(bits)}）" if bits
                      else f"（引用了 {who} 的一条消息）")
     if notes:
@@ -2205,9 +2524,14 @@ def _has_voice(event: MessageEvent) -> bool:
     return any(seg.type == "record" for seg in event.message)
 
 
-async def _voice_notes(event: MessageEvent) -> str:
-    """把消息里的语音转成文字注记；未启用或失败时降级成「没听清」。"""
-    if not asr_enabled():
+async def _voice_notes(event: MessageEvent,
+                       audio_paths: Optional[list] = None) -> str:
+    """把消息里的语音转成文字注记；未启用或失败时降级成「没听清」。
+
+    audio_paths 非空时，原始音频同时落到音乐缓存，供 music_analyze 复用；
+    这样即使没配 ASR，模型也能「听」主人刚发的语音。
+    """
+    if not asr_enabled() and audio_paths is None:
         return ""
     notes = []
     for seg in event.message:
@@ -2215,16 +2539,72 @@ async def _voice_notes(event: MessageEvent) -> str:
             continue
         try:
             raw = await fetch_voice(get_bot(), seg.data or {})
-            text = await asyncio.to_thread(asr_transcribe, raw) if raw else ""
+            if raw and audio_paths is not None:
+                try:
+                    audio_paths.append(str(music_mod.save_bytes(raw, "qq")))
+                except Exception as exc:          # noqa: BLE001  缓存失败不影响转写
+                    logger.info(f"[jinyu] 语音缓存失败 user={event.user_id}: {exc}")
+            text = (await asyncio.to_thread(asr_transcribe, raw)
+                    if raw and asr_enabled() else "")
             if text:
                 logger.info(f"[jinyu] 语音转写 {len(text)} 字 user={event.user_id}")
-            else:
+            elif asr_enabled():
                 logger.info(f"[jinyu] 语音未转写 user={event.user_id} audio={len(raw)}B")
         except Exception as exc:                  # noqa: BLE001  转写失败不影响回复
             logger.info(f"[jinyu] 语音转写失败 user={event.user_id}: {exc}")
             text = ""
-        notes.append(f"（语音说：{text[:300]}）" if text
-                     else "（发来一条语音，没听清）")
+        if not asr_enabled():
+            notes.append("（发来一条语音，没转成文字）")
+        else:
+            notes.append(f"（语音说：{text[:300]}）" if text
+                         else "（发来一条语音，没听清）")
+    return "".join(notes)
+
+
+# QQ 文件段里哪些后缀当音频处理；mp4/mkv 等也收，交给 ffmpeg 取音轨
+_FILE_AUDIO = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg",
+               ".opus", ".amr", ".wma", ".mp4", ".m4v", ".mov",
+               ".webm", ".mkv"}
+
+
+def _is_audio_file(seg) -> bool:
+    """文件段是不是音频/视频：先看文件名后缀，没后缀再看 URL。"""
+    data = dict(seg.data or {})
+    name = str(data.get("file") or data.get("name") or "")
+    suffix = Path(name).suffix.lower()
+    if suffix:
+        return suffix in _FILE_AUDIO
+    url = str(data.get("url") or "").split("?")[0].lower()
+    return any(url.endswith(ext) for ext in _FILE_AUDIO)
+
+
+async def _audio_file_note(event: MessageEvent,
+                           audio_paths: Optional[list] = None) -> str:
+    """把 QQ 文件段的音频/视频下载到音乐缓存，供 music_analyze 直接听。"""
+    if audio_paths is None:
+        return ""
+    notes = []
+    for seg in event.message:
+        if seg.type != "file":
+            continue
+        data = dict(seg.data or {})
+        url = str(data.get("url") or "")
+        name = str(data.get("file") or data.get("name") or "")
+        suffix = Path(name).suffix.lower()
+        if suffix and suffix not in _FILE_AUDIO:
+            continue
+        if not url.startswith("http"):
+            continue
+        try:
+            path = await asyncio.to_thread(music_mod.save_url, url)
+            audio_paths.append(str(path))
+            notes.append(f"（发来音频文件：{name[:50] or '未命名'}）")
+        except music_mod.MusicError as exc:
+            logger.info(f"[jinyu] 音频文件跳过 user={event.user_id}: {exc}")
+            notes.append("（音频文件没取到，可能太大或已过期）")
+        except Exception as exc:                  # noqa: BLE001  下载失败不影响回复
+            logger.info(f"[jinyu] 音频文件失败 user={event.user_id}: {exc}")
+            notes.append("（音频文件没取到）")
     return "".join(notes)
 
 
@@ -3531,6 +3911,25 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         base = _sid(event).split("#")[0]
         await matcher.finish(_memory_report(arg, mw.db.latest_sid(base, CID)))
         return True
+    if cmd in ("plan", "计划"):
+        if not (AUTONOMY_ON and autonomy_mod.ready()):
+            await matcher.finish("自主作息没开（RP_AUTONOMY=0）。")
+        report = await asyncio.to_thread(autonomy_mod.plan_text, arg)
+        await matcher.finish(report or "这一天的计划还没生成。")
+        return True
+    if cmd in ("diary", "日记"):
+        if not (AUTONOMY_ON and autonomy_mod.ready()):
+            await matcher.finish("自主作息没开（RP_AUTONOMY=0）。")
+        n = int(arg) if arg.isdigit() else 6
+        report = await asyncio.to_thread(autonomy_mod.diary_text, n)
+        await matcher.finish(report)
+        return True
+    if cmd in ("autonomy", "自主", "作息"):
+        if not (AUTONOMY_ON and autonomy_mod.ready()):
+            await matcher.finish("自主作息没开（RP_AUTONOMY=0）。")
+        report = await asyncio.to_thread(autonomy_mod.status)
+        await matcher.finish(report)
+        return True
     if cmd == "voice" and arg:
         audio = await tts_audio(arg)
         if not audio:
@@ -3915,11 +4314,18 @@ def _strip_speaker_prefix(reply: str, name: str) -> str:
 @matcher.handle()
 async def _handle(event: MessageEvent):
     text = await _plain_with_mentions(event)
+    if AUTONOMY_ON:
+        autonomy_mod.note_master_active()       # 主人来了：报点让位、醒来降级
     has_img = any(seg.type in ("image", "mface") for seg in event.message)
     has_voice = _has_voice(event)
     has_card = any(seg.type == "json" for seg in event.message)   # 分享卡片常常没有文字
+    has_audio_file = MUSIC_ON and any(
+        seg.type == "file" and _is_audio_file(seg) for seg in event.message)
+    has_reply = (getattr(event, "reply", None) is not None
+                 or any(seg.type == "reply" for seg in event.message))
     is_group = isinstance(event, GroupMessageEvent)
-    if not text and not has_img and not has_voice and not has_card:
+    if not text and not has_img and not has_voice and not has_card \
+            and not has_audio_file and not has_reply:
         return
     if mw is None:
         _media_futs.pop(str(event.message_id), None)
@@ -3984,20 +4390,34 @@ async def _handle(event: MessageEvent):
 
     async def _qnote() -> str:
         try:
-            return await _expand_reply(event)
+            return await _expand_reply(event, voice_paths)
         except Exception:                     # noqa: BLE001   引用展开失败不影响回复
             logger.info(f"[jinyu] 引用展开失败 user={event.user_id}")
             return ""
 
+    voice_paths = [] if MUSIC_ON else None
+
     async def _vnote() -> str:
         try:
-            return await _voice_notes(event)
+            return await _voice_notes(event, voice_paths)
         except Exception:                     # noqa: BLE001   转写失败不影响回复
             logger.info(f"[jinyu] 语音转写失败 user={event.user_id}")
             return ""
 
-    infos, quote_note, voice_note = await asyncio.gather(
-        _media(), _qnote(), _vnote())
+    async def _fnote() -> str:
+        try:
+            return await _audio_file_note(event, voice_paths)
+        except Exception:                     # noqa: BLE001   文件下载失败不影响回复
+            logger.info(f"[jinyu] 音频文件失败 user={event.user_id}")
+            return ""
+
+    infos, quote_note, voice_note, file_note = await asyncio.gather(
+        _media(), _qnote(), _vnote(), _fnote())
+    if file_note:
+        voice_note += file_note
+    if voice_paths:
+        # 本轮语音/音频文件可被 music_analyze 直接听，不用再给路径
+        _last_music[sid] = voice_paths[-1]
     link_note = ""
     try:
         # 引用里也常有链接：主人回复旧消息说「再看看这个视频」时，URL 只在引文里
@@ -4034,6 +4454,10 @@ async def _handle(event: MessageEvent):
     persona = dict(PERSONA)
     if rich_enabled():
         persona["core"] = persona["core"] + rich_hint()
+    if AUTONOMY_ON and AUTONOMY_DIGEST:
+        _self_digest = autonomy_mod.digest()
+        if _self_digest:
+            persona["core"] = persona["core"] + "\n" + _self_digest
     sent_hint = _recent_hint(sid)      # 2 分钟内可撤回的消息编号，供 recall_message 选
     if sent_hint:
         persona["core"] = persona["core"] + sent_hint
@@ -4059,7 +4483,8 @@ async def _handle(event: MessageEvent):
                        else (_speaker(event) if is_group else ""))
             tool_ctx = {"user_id": int(event.user_id),
                         "group_id": int(getattr(event, "group_id", 0) or 0),
-                        "reminded": False, "channel": "qq", "sends": []}
+                        "reminded": False, "channel": "qq", "sends": [],
+                        "music_path": _last_music.get(sid, "") if MUSIC_ON else ""}
             reply = await asyncio.to_thread(
                 mw.chat, text, persona, session_sid, CID,
                 (lambda r: _strip_speaker_prefix(r, speaker)) if speaker else None,

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>瑾瑜 · 视频通话</title>
-  <link rel="stylesheet" href="style.css?v=20261102b">
+  <link rel="stylesheet" href="style.css?v=20261102d">
 </head>
 <body>
   <main id="stage" data-room="day" data-panel="false">
@@ -113,6 +113,13 @@
       </footer>
     </aside>
 
+    <div id="peer-line" class="peer-line" hidden></div>
+
+    <form id="phone-chat" class="phone-chat" autocomplete="off">
+      <input id="phone-chat-text" type="text" maxlength="300" placeholder="打字和瑾瑜说…" enterkeyhint="send">
+      <button id="phone-chat-send" type="submit">发送</button>
+    </form>
+
     <nav class="call-dock" aria-label="通话操作">
       <button id="view-camera" class="dock-btn dock-camera" type="button" aria-pressed="false">摄像头</button>
       <button id="view-screen" class="dock-btn dock-screen" type="button" aria-pressed="false">屏幕</button>
@@ -131,8 +138,8 @@
   <script src="vendor/pixi.min.js"></script>
   <script src="vendor/live2dcubismcore.min.js"></script>
   <script src="vendor/pixi-live2d-display-cubism4.min.js"></script>
-  <script src="app.js?v=20261101o"></script>
-  <script src="screen.js?v=20261102b"></script>
-  <script src="voice.js?v=20261102b"></script>
+  <script src="app.js?v=20261101p"></script>
+  <script src="screen.js?v=20261102c"></script>
+  <script src="voice.js?v=20261102e"></script>
 </body>
 </html>

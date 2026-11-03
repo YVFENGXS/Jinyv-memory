@@ -22,6 +22,7 @@ for _p in (_ROOT, _ROOT / "jinyu_memory", _ROOT / "jinyu_memory" / "core", _ROOT
 import dream
 import embedding
 import llm
+import music
 import retriever
 import summarizer
 from rp_skeleton import (DB, RPContextMiddleware, est_tokens, _human_gap,
@@ -1563,6 +1564,43 @@ def test_reminder_claim_cas():
     finally:
         reminder.close()
     print("R43 提醒 CAS: OK 五态 / 租约重抢 / 令牌失效 / 重试有界 / 重复任务只排一次")
+
+
+def test_reminder_one_year():
+    """R98：一次性提醒最长一年；跨年按本地日历算，不再卡 7 天。"""
+    import reminder
+    from datetime import datetime
+
+    path = "/tmp/rp_remind_year.db"
+    for suffix in ("", "-wal", "-shm"):
+        Path(path + suffix).unlink(missing_ok=True)
+    reminder.init(path)
+    try:
+        # 366 天整接受，367 天拒绝（一年上限）
+        plan = reminder.schedule("qq-g1", 8, 1, 366 * 86400, "一年后")
+        assert plan["ok"], plan
+        bad = reminder.schedule("qq-g1", 8, 1, 367 * 86400, "超一年")
+        assert not bad["ok"] and "366" in bad["error"], bad
+
+        # 模型写「1年」也要能解析（365 天）
+        year = reminder.schedule_text("1年", "跨年提醒", "qq-g1", 8, 1)
+        assert year["ok"], year
+
+        # 跨年：明年 1 月 1 日 09:00，落库后日期与钟点不变
+        now = datetime.now()
+        target = datetime(now.year + 1, 1, 1, 9, 0)
+        cross = reminder.schedule(
+            "qq-g1", 8, 1, (target - now).total_seconds(), "新年")
+        assert cross["ok"], cross
+        due = datetime.fromtimestamp(cross["due"])
+        assert due.date() == target.date() and due.hour == 9, due
+        # 跨年的展示必须带年份，避免「01-01」歧义
+        assert str(now.year + 1) in reminder.fmt_when(cross["due"]), \
+            reminder.fmt_when(cross["due"])
+
+    finally:
+        reminder.close()
+    print("R98 提醒一年/跨年: OK 366 天 / 367 天拒绝 / 1年解析 / 跨年日期")
 
 
 def test_owner_gate_binding():
@@ -3809,6 +3847,267 @@ def test_desktop_remote_smoke():
                 os.environ[key] = value
 
 
+def _music_wav() -> Path:
+    """合成 10 秒 / 120 BPM 的 C 大三和弦脉冲 WAV，供音乐测试复用。"""
+    import math
+    import tempfile
+    import wave
+    path = Path(tempfile.gettempdir()) / "jinyu_music_test.wav"
+    if path.is_file():
+        return path
+    sr, dur = 22050, 10.0
+    n = int(sr * dur)
+    x = [0.0] * n
+    notes = (261.63, 329.63, 392.0)          # C4 E4 G4
+    beat, burst = int(sr * 60 / 120), int(0.06 * sr)
+    for start in range(0, n, beat):
+        for i in range(burst):
+            k = start + i
+            if k >= n:
+                break
+            env = math.sin(math.pi * i / burst) ** 2
+            t = k / sr
+            x[k] += 0.28 * env * sum(math.sin(2 * math.pi * f * t) for f in notes)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(b"".join(
+            max(-32768, min(32767, int(v * 32767))).to_bytes(2, "little", signed=True)
+            for v in x))
+    return path
+
+
+def test_music_synthetic_wav():
+    """R94：120 BPM / C 大三和弦的合成 WAV 能测出接近的 BPM 与 C 大调候选。"""
+    if music.np is None:
+        print("R94 音乐合成 WAV: SKIP（本机没装 numpy）")
+        return
+    path = _music_wav()
+    report = music.analyze_file(path)
+    assert len(report) <= music.MAX_RESULT, len(report)
+    assert "[测量]" in report and "[局限]" in report, report
+    hit = re.search(r"约 (\d+) BPM", report)
+    assert hit, report
+    assert 108 <= int(hit.group(1)) <= 130, report
+    assert "C 大调" in report and "[调性]" in report, report
+    print(f"R94 音乐合成 WAV: OK BPM={hit.group(1)} 报告={len(report)}字")
+
+
+def test_music_brief_detail_and_time():
+    """R95：brief 更短、detail 不超硬上限；时间解析与片段校验。"""
+    if music.np is None:
+        print("R95 音乐简报/时间: SKIP（本机没装 numpy）")
+    else:
+        path = _music_wav()
+        full = music.analyze_file(path)
+        brief = music.analyze_file(path, brief=True)
+        detail = music.analyze_file(path, start="0:01", end="0:06", detail=True)
+        assert len(brief) < len(full), (len(brief), len(full))
+        for text in (full, brief, detail):
+            assert len(text) <= music.MAX_RESULT, len(text)
+        assert "分析 0:01–0:06" in detail, detail
+        print(f"R95 音乐简报/时间: OK brief={len(brief)} full={len(full)} "
+              f"detail={len(detail)}")
+    assert music._parse_time("90") == 90
+    assert music._parse_time("1:30") == 90
+    assert music._parse_time("0:01:30") == 90
+    assert music._fmt_time(90) == "1:30"
+    for bad in ("abc", "1:2:3:4"):
+        try:
+            music._parse_time(bad)
+        except music.MusicError:
+            pass
+        else:
+            raise AssertionError(f"{bad} 应该报时间格式错误")
+    assert music.MAX_RESULT <= TOOL_RESULT_CHARS
+
+
+def test_music_source_guards():
+    """R96：网易云/QQ音乐直链、内网地址、空来源与坏文件都给出可读的失败原因。"""
+    for url in ("https://music.163.com/song?id=1", "https://y.qq.com/n/ryqq/songDetail/x"):
+        try:
+            music.resolve(url)
+        except music.MusicError as exc:
+            assert "网易云" in str(exc) or "QQ音乐" in str(exc), exc
+        else:
+            raise AssertionError(f"{url} 不应被直接下载")
+    for source in ("", "/definitely/missing/jinyu.mp3"):
+        try:
+            music.resolve(source)
+        except music.MusicError as exc:
+            assert "音频" in str(exc) or "本地文件" in str(exc), exc
+        else:
+            raise AssertionError(f"{source!r} 应该失败")
+    try:
+        music._check_public("http://127.0.0.1/x")
+    except music.MusicError:
+        pass
+    else:
+        raise AssertionError("回环地址应该被拒绝")
+    try:
+        music.save_bytes(b"")
+    except music.MusicError:
+        pass
+    else:
+        raise AssertionError("空音频应该被拒绝")
+    print("R96 音乐来源护栏: OK 网易云/QQ音乐/内网/空来源/空字节")
+
+
+def test_music_report_limits():
+    """R97：片段窗口按 start/end 截取，且 end<=start 报错。"""
+    if music.np is None:
+        print("R97 音乐片段窗口: SKIP（本机没装 numpy）")
+        return
+    path = _music_wav()
+    report = music.analyze_file(path, start="0:01", end="0:09")
+    assert "分析 0:01–0:09" in report, report
+    assert "最多 120 秒" not in report
+    try:
+        music.analyze_file(path, start="0:05", end="0:03")
+    except music.MusicError as exc:
+        assert "end" in str(exc), exc
+    else:
+        raise AssertionError("end<=start 应该报错")
+    print("R97 音乐片段窗口: OK start/end 与 end<=start")
+
+
+class _FakeAutonomyChat:
+    """按 prompt 关键词返回预设 JSON；不联网、不依赖模型。"""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def __call__(self, messages, max_tokens=400):
+        self.calls.append(messages)
+        system = str((messages or [{}])[0].get("content") or "")
+        for key, reply in self.replies:
+            if key in system:
+                return json.dumps(reply, ensure_ascii=False) if isinstance(
+                    reply, dict) else str(reply)
+        return "{}"
+
+
+def _fresh_autonomy(name):
+    import autonomy
+    path = Path(tempfile.gettempdir()) / f"rp_autonomy_{name}.db"
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+    (Path(tempfile.gettempdir()) / "autonomy_diary.md").unlink(missing_ok=True)
+    autonomy.init(path, "qq-u1", 1)
+    return autonomy, path
+
+
+def test_autonomy_plan_and_tick():
+    """R99：日计划校验/兜底 + 报点静默与开口配额，不写 turns。"""
+    import asyncio
+    from datetime import timedelta as _td
+    autonomy, _path = _fresh_autonomy("plan")
+    try:
+        tomorrow = (datetime.now() + _td(days=1)).strftime("%Y-%m-%d")
+        # 非法计划（只有 2 窗）→ fallback 4 窗
+        fake = _FakeAutonomyChat([("排一份自己的作息", {"wakes": [
+            {"at": "09:00"}, {"at": "21:00"}]})])
+        autonomy.bind(chat=fake, send=lambda text: True, action=lambda n, a: "",
+                      recent=lambda: {}, persona="瑾瑜")
+        asyncio.run(autonomy._run_plan({"id": "J-plan",
+                                        "payload": {"date": tomorrow}}))
+        plan = autonomy._plan(tomorrow)
+        assert plan and len(plan["wakes"]) == 4, plan
+        assert sum(1 for s in plan["wakes"] if 8 <= int(s["at"][:2]) < 20) >= 2
+        assert any(int(s["at"][:2]) < 8 or int(s["at"][:2]) >= 20
+                   for s in plan["wakes"])
+
+        # 报点：主人刚说过话 → 静默，不调发送
+        sent = []
+        autonomy.bind(chat=_FakeAutonomyChat([("整点报点", {
+            "speak": True, "text": "主人，理理我。", "reason": "想说话"})]),
+            send=lambda text: sent.append(text) or True,
+            action=lambda n, a: "", recent=lambda: {}, persona="瑾瑜")
+        autonomy._last_active = time.time()
+        asyncio.run(autonomy._run_tick({"id": "J-tick-1"}))
+        assert sent == [], sent
+        # 主人不在线 → 允许开口，且计入当天配额
+        autonomy._last_active = 0
+        autonomy.QUIET_HOURS = (0, 0)
+        asyncio.run(autonomy._run_tick({"id": "J-tick-2"}))
+        assert sent == ["主人，理理我。"], sent
+        assert autonomy._usage()["speak"] == 1
+    finally:
+        autonomy.QUIET_HOURS = (0, 8)
+        autonomy._last_active = 0
+        autonomy.close()
+    print("R99 自主计划/报点: OK fallback 4 窗 / 主人在场静默 / 开口计配额")
+
+
+def test_autonomy_wake_and_limits():
+    """R100：醒来动作 → 报告/意图/日记都有硬上限，run 与 action 落库。"""
+    import asyncio
+    autonomy, path = _fresh_autonomy("wake")
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        fake = _FakeAutonomyChat([
+            ("按自己的计划醒来", {"silent": False, "steps": [
+                {"action": "recall", "args": {"query": "旧伞"}}]}),
+            ("这次醒来做的事已经结束", {
+                "outcome": "acted", "report": "做" * 500,
+                "open_loops": ["没整理完", "还想看一个视频", "第三件"],
+                "next_intent": "下" * 200, "next_wake_at": "23:59",
+                "message": "", "diary": "睡" * 500}),
+        ])
+        sent = []
+        autonomy.bind(chat=fake, action=lambda name, args: "记忆：旧伞、修伞的约定",
+                      send=lambda text: sent.append(text) or True,
+                      recent=lambda: {"recent": "主人在说伞"}, persona="瑾瑜")
+        autonomy._last_active = 0
+        asyncio.run(autonomy._run_wake({
+            "id": "J-wake",
+            "payload": {"date": today, "at": "09:00", "intent": "整理昨天的记忆"}}))
+        state = autonomy.state()
+        assert len(state["last_report"]) <= autonomy.REPORT_MAX, state
+        assert len(state["next_intent"]) <= autonomy.NEXT_INTENT_MAX, state
+        assert 1 <= len(state["open_loops"]) <= 3, state
+        with sqlite3.connect(str(path)) as con:
+            run = con.execute("SELECT * FROM runs").fetchall()
+            act = con.execute("SELECT * FROM actions").fetchall()
+            diary = con.execute("SELECT kind, text FROM diary ORDER BY id").fetchall()
+        assert len(run) == 1 and run[0][4] == "acted", run
+        assert len(act) == 1 and "旧伞" in act[0][6], act
+        kinds = [r[0] for r in diary]
+        assert kinds.count("wake") >= 1 and kinds.count("sleep") >= 1, kinds
+        assert all(len(r[1]) <= autonomy.DIARY_MAX for r in diary), diary
+        # 额度用完：同一天不再醒来
+        for _ in range(autonomy.WAKE_MAX):
+            autonomy._bump(today, "wakes")
+        before = len(fake.calls)
+        asyncio.run(autonomy._run_wake({
+            "id": "J-wake-2",
+            "payload": {"date": today, "at": "10:00", "intent": "再来一次"}}))
+        assert len(fake.calls) == before, "配额满仍调用模型"
+    finally:
+        autonomy.close()
+    print("R100 自主醒来: OK 动作落库 / 报告与日记截断 / 配额满不跑模型")
+
+
+def test_autonomy_jobs_idempotent():
+    """R101：同一个 idem 只登记一次；claim 只能成功一次。"""
+    autonomy, _path = _fresh_autonomy("jobs")
+    try:
+        due = time.time() + 60
+        a = autonomy.add_job("tick", due, {}, "same-key")
+        b = autonomy.add_job("tick", due, {}, "same-key")
+        assert a == b, (a, b)
+        rows = [j for j in autonomy._pending() if j["idem"] == "same-key"]
+        assert len(rows) == 1, rows
+        job = rows[0]
+        assert autonomy._claim(job) is True
+        assert autonomy._claim(job) is False
+    finally:
+        autonomy.close()
+    print("R101 自主 job: OK 幂等登记 / CAS 只认领一次")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -3838,7 +4137,10 @@ if __name__ == "__main__":
                test_retry_backoff_bounds, test_time_awareness, test_migrate_stage1_db,
                test_multi_bot_lanes, test_principal_memory_merge,
                test_bili_live_adapter,
-               test_reminder_claim_cas, test_owner_gate_binding,
+               test_reminder_claim_cas, test_reminder_one_year,
+               test_autonomy_plan_and_tick, test_autonomy_wake_and_limits,
+               test_autonomy_jobs_idempotent,
+               test_owner_gate_binding,
                test_task_supervisor_preempt, test_recall_trace_audit,
                test_merge_log_and_card_crud, test_fact_merge_log_and_edit,
                test_fact_merge_verify_and_guards, test_fuse_and_embedding_math,
@@ -3868,6 +4170,8 @@ if __name__ == "__main__":
                test_chapter_lane_grouping, test_chapter_scan_cap_advances,
                test_fact_inherit_no_cap, test_card_pool_no_starvation,
                test_chapter_recall_across_epoch,
+               test_music_synthetic_wav, test_music_brief_detail_and_time,
+               test_music_source_guards, test_music_report_limits,
                test_desktop_remote_smoke,
                test_chat_stores_reply_when_context_build_fails):
         fn()

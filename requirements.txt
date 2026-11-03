@@ -10,6 +10,9 @@ pillow>=10.0
 # 语音合成（可选：不装则 [[voice:...]] 标记会被跳过）
 edge-tts>=6.1
 
+# 听音乐（可选：不装则 music_analyze 工具返回缺依赖提示，聊天不受影响）
+numpy>=1.24
+
 # MCP 只读工具（可选：不装或没有 mcp.json 时自动跳过，不影响聊天）
 mcp>=1.0
 mcp-server-fetch

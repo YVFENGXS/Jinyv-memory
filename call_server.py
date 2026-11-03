@@ -34,6 +34,7 @@ import re
 import secrets
 import sys
 import time
+from html import escape as html_escape
 from pathlib import Path
 
 import call_voice as cv
@@ -54,7 +55,7 @@ sys.path.insert(0, str(CORE_DIR))
 
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from persona import PERSONA  # noqa: E402
@@ -101,6 +102,20 @@ WIN_TOKEN = str(os.environ.get("RP_WIN_TOKEN") or "").strip()
 # 跨站页面发来的「简单请求」不会带这个 Cookie，读不到也放不进去。
 CALL_TOKEN = (os.environ.get("RP_CALL_TOKEN") or secrets.token_urlsafe(32)).strip()
 MAX_BODY_BYTES = max(1, int(float(os.environ.get("RP_CALL_BODY_MAX_MB") or 24))) * 1024 * 1024
+# 手机接入：除了本机那路明文 HTTP，再开一路 HTTPS。
+# 手机浏览器只在安全上下文里给摄像头/麦克风，纯 http 的 IP 地址拿不到授权。
+TLS_CERT = (os.environ.get("RP_CALL_TLS_CERT") or "").strip()
+TLS_KEY = (os.environ.get("RP_CALL_TLS_KEY") or "").strip()
+TLS_HOST = (os.environ.get("RP_CALL_TLS_HOST") or "0.0.0.0").strip()
+TLS_PORT = int(_cli("--tls-port", os.environ.get("RP_CALL_TLS_PORT") or "8443"))
+CA_FILE = (os.environ.get("RP_CALL_CA_FILE") or "").strip()
+PUBLIC_URL = (os.environ.get("RP_CALL_PUBLIC_URL") or "").strip().rstrip("/")
+# 手机第一次打开要先装根证书，这路只放引导页和证书本身，不跑任何业务接口。
+SETUP_PORT = int(_cli("--setup-port", os.environ.get("RP_CALL_SETUP_PORT") or "8444"))
+# 公网访问口令：设了之后，首页必须先对上口令才会发通话页的 Cookie。
+# 没设的时候行为不变（只给本机 / SSH 隧道用）。
+ACCESS_CODE = (os.environ.get("RP_CALL_ACCESS_CODE") or "").strip()
+COOKIE_AGE = 30 * 86400 if ACCESS_CODE else 86400
 # 正在用的通话页会话（10 分钟内有过请求）；跨窗口 say 只发给这些会话
 LIVE = {}
 # sid -> [{text, stage, ts}]，前端轮询 /call/inbox 取走并播放
@@ -114,6 +129,9 @@ READY_TTL = max(30, int(float(os.environ.get("RP_CALL_READY_TTL") or 90)))
 # 队列里超过这个秒数的话不再播：避免刷新页面后突然把几分钟前的旧话讲出来。
 INBOX_TTL = max(30, int(float(os.environ.get("RP_CALL_INBOX_TTL") or 120)))
 PASS_RE = re.compile(r"\[\[\s*pass\s*\]\]", re.I)
+# 主人明确点名另一台设备时，这句话也投到那台设备的队列里出声
+CROSS_RE = re.compile(r"(电脑|手机|另一台|另一边|那边的通话|通话窗口)")
+CROSS_HOLD = 60                    # 自己发的那条留一分钟等对端来取
 MAP_MAX = max(32, int(float(os.environ.get("RP_CALL_MAX_SESSIONS") or 512)))
 
 
@@ -197,6 +215,11 @@ MAX_IMAGE_BYTES = max(1, int(float(os.environ.get("RP_SCREEN_MAX_MB") or 8))) * 
 MAX_QUESTION = 300
 READING_TTL = 600
 READINGS = {}                      # session -> [{"ts", "reading"}]
+
+# 多端同步：手机和电脑是同一场通话，这里只留最近几轮，两端各自拉增量
+TURN_FEED = []
+TURN_SEQ = 0
+FEED_MAX = 40
 VISION_LOCK = asyncio.Semaphore(1) # M3 单并发：读屏与回答都串行
 
 MAX_AUDIO_BYTES = max(1, int(float(os.environ.get("RP_CALL_AUDIO_MAX_MB") or 12))) * 1024 * 1024
@@ -226,7 +249,10 @@ PROACTIVE_LOCK = asyncio.Semaphore(1)
 
 # 语音通话里让回答适合念出来：短句、无表情符号、无括号动作
 VOICE_STYLE = ("（现在是浏览器语音通话：用口语化的短句回答，最多三句，"
-               "不要表情符号，不要写括号里的动作。）\n")
+               "不要表情符号，不要写括号里的动作。"
+               "这是通话窗口：直接出声回答，不要输出 [[pass]]。"
+               "主人让你「去电脑那边」「去手机上」说话时，你就在这儿正常回答，"
+               "系统会把这句话同步到另一台设备的通话页；不要假装已经说过。）\n")
 
 # ---- M2 舞台控制：服务器 AI 用指令驱动 Live2D ----
 MODEL_JSON = WEB_DIR / "models" / "jinyu" / "大肥鱼.model3.json"
@@ -489,6 +515,19 @@ def session_id(body):
     return raw[:64] or "local"
 
 
+def feed_push(who, text, sid, client):
+    """把一轮对话登记到共享时间线；client 用来区分是哪台设备说的。"""
+    global TURN_SEQ
+    clean = " ".join(str(text or "").split())[:300]
+    if not clean:
+        return
+    TURN_SEQ += 1
+    TURN_FEED.append({"id": TURN_SEQ, "who": who, "text": clean,
+                      "sid": sid, "client": str(client or "")[:40],
+                      "ts": int(time.time())})
+    del TURN_FEED[:-FEED_MAX]
+
+
 def decode_b64(raw, label, max_bytes):
     text = str(raw or "").strip()
     if text.startswith("data:"):
@@ -652,10 +691,10 @@ def view_note(sid, view=""):
     view 由前端上报（screen / camera），只用这一路的帧；前端没上报时退回最新一帧。
     摄像头刚打开还没读到帧时不能拿旧屏幕帧顶上，否则模型会编造「我看得见你」。
     """
-    view = str(view or "").strip().lower()
-    if view == "none":
-        return ""
-    view = "camera" if view == "camera" else ("screen" if view == "screen" else "")
+    raw = str(view or "").strip().lower()
+    # 「我这端没开画面」不等于「整场通话都没有画面」：手机开着摄像头时，
+    # 电脑这边问就该用手机刚传来的那一帧，所以 none 走最新帧兜底
+    view = "camera" if raw == "camera" else ("screen" if raw == "screen" else "")
     now = time.time()
     if view:
         readings = [x for x in READINGS.get(sid, [])
@@ -673,6 +712,8 @@ def view_note(sid, view=""):
         reading = latest["reading"] if latest else None
         mode = str((reading or {}).get("mode") or "screen")
     if not reading:
+        if raw == "none":
+            return ""
         if mode == "camera":
             return ("（主人现在开着摄像头，但这一帧还没读到；别编造看到了什么，"
                     "可以说画面还没过来，让他稍等一下。）\n")
@@ -875,11 +916,75 @@ def supplied_token(request):
     return (request.headers.get("x-rp-token") or request.cookies.get("rp_call") or "").strip()
 
 
+UNLOCK_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>瑾瑜 · 访问口令</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #1b1d24; color: #eef0f6;
+         font: 15px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  main { width: min(86vw, 360px); padding: 28px 24px 24px; border-radius: 22px;
+         background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); }
+  h1 { margin: 0 0 6px; font-size: 22px; font-weight: 600; letter-spacing: .04em; }
+  p { margin: 0 0 18px; color: #a8adbd; font-size: 13px; }
+  input { width: 100%; box-sizing: border-box; padding: 13px 14px; border-radius: 14px;
+          border: 1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.28); color: inherit;
+          font-size: 16px; letter-spacing: .06em; outline: none; }
+  input:focus { border-color: #8ab4ff; }
+  button { width: 100%; margin-top: 12px; padding: 13px; border: 0; border-radius: 14px;
+           background: #5b8cff; color: #fff; font-size: 15px; font-weight: 600; }
+  button:active { background: #4a78e0; }
+  .tip { min-height: 18px; margin: 12px 0 0; color: #ff9c9c; font-size: 12px; }
+</style></head>
+<body><main>
+  <h1>瑾瑜</h1>
+  <p>这个地址只给主人自己用，先输入访问口令。</p>
+  <input id="k" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="访问口令">
+  <button id="go" type="button">进去</button>
+  <p class="tip" id="tip"></p>
+</main>
+<script>
+(function () {
+  var input = document.getElementById("k");
+  var tip = document.getElementById("tip");
+  function go() {
+    var value = (input.value || "").trim();
+    if (!value) { tip.textContent = "口令不能为空"; return; }
+    location.href = "/?k=" + encodeURIComponent(value);
+  }
+  document.getElementById("go").addEventListener("click", go);
+  input.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { go(); }
+  });
+  input.focus();
+})();
+</script></body></html>"""
+
+
+def page_allowed(request):
+    """首页放行判断：没设口令就照旧；设了口令只认 Cookie 或这次带的 ?k=。"""
+    if not ACCESS_CODE:
+        return True
+    cookie = (request.cookies.get("rp_call") or "").strip()
+    if cookie and hmac.compare_digest(cookie, CALL_TOKEN):
+        return True
+    given = (request.query_params.get("k") or "").strip()
+    return bool(given) and hmac.compare_digest(given, ACCESS_CODE)
+
+
+
 @APP.middleware("http")
 async def call_guard(request: Request, call_next):
     path = request.url.path
     if request.method == "OPTIONS":
         return await call_next(request)
+    # 公网那路 HTTPS 先过口令门：对不上口令连首页都不给，也就拿不到通话页的 Cookie。
+    # 本机 SSH 隧道走的是明文 HTTP（127.0.0.1:8790），照旧直接进，不用输口令。
+    if (request.url.scheme == "https" and path in ("/", "/index.html")
+            and not page_allowed(request)):
+        return HTMLResponse(UNLOCK_PAGE, headers={"cache-control": "no-store"})
     if guarded_path(path):
         site = (request.headers.get("sec-fetch-site") or "").strip().lower()
         if site and site not in ("same-origin", "none"):
@@ -895,12 +1000,25 @@ async def call_guard(request: Request, call_next):
             if raw_len.isdigit() and int(raw_len) > MAX_BODY_BYTES:
                 return err(413, "请求体太大")
     response = await call_next(request)
+    # 模型文件和第三方库动辄几十兆，手机第二次打开不该重下一遍
+    if path.startswith(("/models/", "/vendor/", "/backgrounds/")):
+        response.headers.setdefault("cache-control", "public, max-age=604800")
     if request.method == "GET" and path in ("/", "/index.html"):
         # 重启后令牌会变：旧 Cookie 也要换掉，否则页面会一直 401 到 Cookie 过期。
         if request.cookies.get("rp_call") != CALL_TOKEN:
-            response.set_cookie("rp_call", CALL_TOKEN, max_age=86400,
-                                httponly=True, samesite="strict", path="/")
+            response.set_cookie("rp_call", CALL_TOKEN, max_age=COOKIE_AGE,
+                                httponly=True, samesite="strict", path="/",
+                                secure=request.url.scheme == "https")
     return response
+
+
+@APP.get("/ca.crt")
+async def ca_cert():
+    """根证书本身就是给手机看的，内容不保密，不用口令门。"""
+    if not CA_FILE or not os.path.isfile(CA_FILE):
+        return err(404, "没有配置根证书")
+    return FileResponse(CA_FILE, media_type="application/x-x509-ca-cert",
+                        filename="jinyu-ca.crt")
 
 
 @APP.get("/health")
@@ -1042,6 +1160,14 @@ async def call_proactive(request: Request):
             "stage": stage, "view": view, "reason": reason}
 
 
+@APP.get("/call/feed")
+async def call_feed(after: int = 0):
+    """多端同步：返回 after 之后的对话增量，手机和电脑各拉各的。"""
+    after = max(0, min(int(after or 0), TURN_SEQ))
+    return {"ok": True, "items": [x for x in TURN_FEED if x["id"] > after],
+            "next": TURN_SEQ}
+
+
 @APP.post("/call/turn")
 async def call_turn(request: Request):
     """一句录音（或打字）→ ASR → LLM → 首句 TTS；剩余句子由 /call/tts 补。"""
@@ -1071,6 +1197,8 @@ async def call_turn(request: Request):
 
     print(f"[call] 主人：{_fingerprint(text)}", flush=True)
     LAST_USER[sid] = time.time()
+    client = str(body.get("client") or "").strip()
+    feed_push("user", text, sid, client)
     remember_talk(sid, text, "")
     view = str(body.get("view") or "").strip().lower()[:8]
     llm_started = time.perf_counter()
@@ -1080,8 +1208,8 @@ async def call_turn(request: Request):
 
     reply, stage = parse_stage(reply)
     if PASS_RE.search(reply) or not reply.strip():
-        # [[pass]]：这一轮瑾瑜把话说到 QQ/桌宠了，通话这边不出声，也不算失败
-        print("[call] 瑾瑜：这一轮在别的窗口说话", flush=True)
+        # 模型这一轮没出声：不当成跨窗口投递，老实告诉前端
+        print("[call] 瑾瑜：这一轮没出声", flush=True)
         return {
             "ok": True, "session": sid, "asr": text, "reply": "", "pass": True,
             "stage": stage,
@@ -1091,8 +1219,15 @@ async def call_turn(request: Request):
             "note": "",
         }
     print(f"[call] 瑾瑜：{_fingerprint(reply)}", flush=True)
+    feed_push("assistant", reply, sid, client)
     remember_talk(sid, "", reply)
     note_stage(sid, stage)
+    if client and CROSS_RE.search(text):
+        # 主人点名了另一台设备：这句也排进那边的队列，由那台出声
+        items = INBOX.setdefault(sid, [])
+        items.append({"text": reply, "stage": stage, "ts": time.time(), "client": client})
+        if len(items) > INBOX_MAX:
+            del items[:len(items) - INBOX_MAX]
     first, rest = cv.split_sentences(cv.speakable(reply))
     if not first:
         return err(502, "回答为空")
@@ -1182,20 +1317,107 @@ async def call_say(request: Request):
 
 
 @APP.get("/call/inbox")
-async def call_inbox(session: str = "local"):
+async def call_inbox(session: str = "local", client: str = ""):
     """前端轮询取走跨窗口发来的话；取一次就清空，避免重复播报。"""
     sid = (session or "local").strip()[:64] or "local"
     touch(sid)
     INBOX_READY[sid] = time.time()         # 这个页面确实在收队列
     now = time.time()
     raw = INBOX.pop(sid, [])
-    # 太旧的不要：刷新页面后不该突然播几分钟前的话
-    items = [it for it in raw if now - float(it.get("ts") or 0) <= INBOX_TTL]
+    items, keep = [], []
+    for it in raw:
+        age = now - float(it.get("ts") or 0)
+        if age > INBOX_TTL:
+            continue                       # 太旧的不要：刷新后不该突然播旧话
+        if client and str(it.get("client") or "") == client:
+            # 这条是本机自己发起的：留给另一台来取，别自己给自己播
+            if age < CROSS_HOLD:
+                keep.append(it)
+            continue
+        items.append(it)
+    if keep:
+        INBOX[sid] = keep
     return {"ok": True, "items": items, "ts": now}
 
 
 APP.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 
+
+# ---------------------------------------------------------------------------
+# 手机引导页：只跑在一路明文 HTTP 上，用来下发根证书和安装步骤。
+# 这里不放任何业务接口，也不写访问口令——口令只在电脑上。
+# ---------------------------------------------------------------------------
+SETUP_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>瑾瑜 · 手机接入</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; background: #14161d; color: #eef0f6;
+         font: 15px/1.68 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  main { width: min(90vw, 460px); margin: 0 auto; padding: 28px 0 48px; }
+  h1 { margin: 0 0 8px; font-size: 22px; font-weight: 600; }
+  .lead { margin: 0 0 22px; color: #a8adbd; font-size: 13px; }
+  section { margin: 0 0 22px; padding: 18px 18px 6px; border-radius: 20px;
+            background: rgba(255,255,255,.055); border: 1px solid rgba(255,255,255,.1); }
+  h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; color: #cfd6ea; }
+  .btn { display: block; box-sizing: border-box; width: 100%; padding: 13px 14px; margin: 0 0 14px;
+         border-radius: 14px; background: #5b8cff; color: #fff; font-size: 15px;
+         font-weight: 600; text-align: center; text-decoration: none; word-break: break-all; }
+  .btn.ghost { background: rgba(91,140,255,.16); color: #9dbcff; }
+  .note { margin: 0 0 14px; color: #a8adbd; font-size: 12.5px; }
+  .note b { color: #dfe5f3; font-weight: 600; }
+  .warn { color: #ffcf9a; }
+</style></head>
+<body><main>
+  <h1>把瑾瑜接到手机上</h1>
+  <p class="lead">手机浏览器只在 HTTPS 下才允许用摄像头和麦克风。这台服务器用的是自己签的证书，
+  所以先在手机上装一次根证书，之后就不会再提示「不安全」。</p>
+
+  <section>
+    <h2>第 1 步 · 装根证书</h2>
+    <a class="btn" href="/ca.crt" download>下载 jinyu-ca.crt</a>
+    <p class="note">下载完按这个路径装：<b>设置 → 安全（或「密码与安全」）→ 加密与凭据 →
+    安装证书 → CA 证书</b>，选中刚下载的文件。系统会提示「你的数据可能不安全」，点继续 / 仍然安装。</p>
+    <p class="note">各家名字略有差别：<b>小米 / Redmi</b> 在「密码与安全 → 系统安全 → 加密与凭据」；
+    <b>华为 / 荣耀</b> 在「安全 → 更多安全设置 → 加密和凭据」；<b>OPPO / vivo</b> 在「安全 → 更多 /
+    系统安全 → 加密与凭据」。装完能在「受信任的凭据 → 用户」里看到 <b>Jinyu Local CA</b> 就对了。</p>
+  </section>
+
+  <section>
+    <h2>第 2 步 · 打开通话页</h2>
+    <a class="btn ghost" href="{{URL}}">{{URL}}</a>
+    <p class="note">第一次打开会要访问口令，口令在电脑上「手机接入.txt」里。输入一次，这台手机会记一个月。</p>
+    <p class="note">进去以后点底部的<b>「摄像头」</b>授权，就能用手机前置摄像头跟瑾瑜面对面；
+    <b>「免提」</b>是不用按住、直接说话的开关。</p>
+  </section>
+
+  <section>
+    <h2>还打不开的话</h2>
+    <p class="note warn">如果第 2 步仍然提示证书不受信任，说明第 1 步没装成：回到系统设置里找
+    「用户证书 / 受信任的凭据」，确认 jinyu-ca 出现在列表里，再重新打开第 2 步的链接。</p>
+    <p class="note">手机上不支持「共享屏幕」，那个按钮会自动隐藏。画面只在内存里判读，不落盘。</p>
+  </section>
+</main></body></html>"""
+
+
+SETUP = FastAPI()
+_CONNECT_URL = PUBLIC_URL or (f"https://<公网地址>:{TLS_PORT}/" if TLS_PORT else "")
+
+
+@SETUP.get("/")
+async def setup_page():
+    url = _CONNECT_URL or "（还没配 RP_CALL_PUBLIC_URL）"
+    html = SETUP_PAGE.replace("{{URL}}", html_escape(url))
+    return HTMLResponse(html, headers={"cache-control": "no-store"})
+
+
+@SETUP.get("/ca.crt")
+async def setup_ca():
+    if not CA_FILE or not os.path.isfile(CA_FILE):
+        return err(404, "没有配置根证书")
+    return FileResponse(CA_FILE, media_type="application/x-x509-ca-cert",
+                        filename="jinyu-ca.crt")
 
 
 @APP.on_event("shutdown")
@@ -1208,9 +1430,40 @@ def shutdown():
 
 
 if __name__ == "__main__":
+    import asyncio
     import uvicorn
+
+    class GroupServer(uvicorn.Server):
+        """几路监听共用一个进程：任意一路收到退出信号，所有路一起停。"""
+
+        group = []
+
+        def handle_exit(self, sig, frame):
+            for item in type(self).group:
+                item.should_exit = True
+            super().handle_exit(sig, frame)
+
     print(f"[call] stage  page=http://{HOST}:{PORT}/  "
           f"vision={'mock' if sv.mock_enabled() else ('ready' if sv.configured() else 'no-key')} "
           f"llm={LLM_MODE} asr={'ready' if cv.asr_ready() else 'no-key'} "
           f"tts={'ready' if cv.tts_ready() else 'off'} db={DB_PATH}")
-    uvicorn.run(APP, host=HOST, port=PORT, log_level="info")
+
+    servers = []
+    GroupServer.group = servers
+    servers.append(GroupServer(uvicorn.Config(APP, host=HOST, port=PORT, log_level="info")))
+    if TLS_CERT and TLS_KEY:
+        print(f"[call] phone  page={PUBLIC_URL or f'https://<公网地址>:{TLS_PORT}/'}  "
+              f"listen={TLS_HOST}:{TLS_PORT}")
+        servers.append(GroupServer(uvicorn.Config(
+            APP, host=TLS_HOST, port=TLS_PORT, log_level="info", log_config=None,
+            ssl_certfile=TLS_CERT, ssl_keyfile=TLS_KEY)))
+    if SETUP_PORT > 0:
+        print(f"[call] setup  page=http://<公网地址>:{SETUP_PORT}/  "
+              f"listen={TLS_HOST}:{SETUP_PORT}")
+        servers.append(GroupServer(uvicorn.Config(
+            SETUP, host=TLS_HOST, port=SETUP_PORT, log_level="warning", log_config=None)))
+
+    async def serve_all():
+        await asyncio.gather(*(item.serve() for item in servers))
+
+    asyncio.run(serve_all())

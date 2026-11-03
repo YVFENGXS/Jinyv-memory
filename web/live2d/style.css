@@ -749,6 +749,39 @@ body {
   }
 }
 
+/* 另一端的对话提示：只显示对方刚说的那一轮 */
+.peer-line {
+  position: fixed;
+  z-index: 26;
+  left: 50%;
+  bottom: 104px;
+  transform: translateX(-50%);
+  max-width: min(560px, 86vw);
+  padding: 10px 16px;
+  border-radius: 16px;
+  background: rgba(18, 21, 28, .78);
+  border: 1px solid rgba(255, 255, 255, .12);
+  color: #eef0f6;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+@media (max-width: 860px) {
+  .peer-line {
+    bottom: calc(150px + env(safe-area-inset-bottom, 0px));
+    padding: 9px 14px;
+    font-size: 12px;
+  }
+}
+
+/* 手机底部独立输入条：桌面宽度下不显示，聊天框仍在控制台里 */
+.phone-chat {
+  display: none;
+}
+
 @media (max-width: 860px) {
   .callbar {
     padding: calc(10px + env(safe-area-inset-top, 0px)) calc(14px + env(safe-area-inset-right, 0px)) 10px calc(14px + env(safe-area-inset-left, 0px));
@@ -785,9 +818,61 @@ body {
   }
 
   .status {
-    bottom: 96px;
+    bottom: 152px;
     font-size: 11px;
     max-width: 72vw;
+  }
+
+  .phone-chat {
+    position: fixed;
+    z-index: 25;
+    left: 12px;
+    right: 12px;
+    bottom: calc(84px + env(safe-area-inset-bottom, 0px));
+    display: flex;
+    gap: 8px;
+    padding: 8px;
+    border-radius: 18px;
+    background: rgba(18, 21, 28, .74);
+    border: 1px solid rgba(255, 255, 255, .12);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  .phone-chat input {
+    flex: 1;
+    min-width: 0;
+    padding: 11px 13px;
+    border: 1px solid rgba(255, 255, 255, .14);
+    border-radius: 13px;
+    background: rgba(0, 0, 0, .3);
+    color: inherit;
+    font-size: 16px;
+    outline: none;
+  }
+
+  .phone-chat input:focus {
+    border-color: #8ab4ff;
+  }
+
+  .phone-chat button {
+    flex: 0 0 auto;
+    padding: 0 16px;
+    border: 0;
+    border-radius: 13px;
+    background: #5b8cff;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .phone-chat button:active {
+    background: #4a78e0;
+  }
+
+  /* 控制台展开时它自己带着输入框，底部这条先让位 */
+  #stage[data-panel="true"] .phone-chat {
+    display: none;
   }
 
   .panel {

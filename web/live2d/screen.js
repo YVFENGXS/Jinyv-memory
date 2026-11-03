@@ -29,6 +29,11 @@
     return;
   }
 
+  // 手机浏览器没有屏幕共享，按钮留着只会点了报错
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    screenBtn.hidden = true;
+  }
+
   var stream = null;
   var MODE = "";
   var timer = null;
@@ -42,25 +47,9 @@
   var apiTried = false;
   var viewSeq = 0;          // 每次开/关画面递增，晚到的授权结果直接作废
 
-  // 读屏、摄像头、语音用同一个会话键，这样通话时能拿到刚看的那一帧
+  // 和 voice.js 用同一个固定会话键：手机和电脑的画面帧都归到同一场通话
   function sessionId() {
-    try {
-      var got = window.localStorage.getItem("rp.stage.session");
-      if (got) {
-        return got;
-      }
-      got = window.localStorage.getItem("rp.screen.session") ||
-        window.localStorage.getItem("rp.voice.session");
-      if (got) {
-        window.localStorage.setItem("rp.stage.session", got);
-        return got;
-      }
-      var made = "stage-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-      window.localStorage.setItem("rp.stage.session", made);
-      return made;
-    } catch (error) {
-      return "stage-local";
-    }
+    return "stage-shared";
   }
 
   var SESSION = sessionId();
@@ -430,6 +419,8 @@
       }
       request = navigator.mediaDevices.getUserMedia({
         video: {
+          // 手机上默认用前置，桌面浏览器会忽略这个偏好
+          facingMode: { ideal: "user" },
           width: { ideal: 1280 },
           height: { ideal: 720 },
           frameRate: { ideal: 15, max: 24 }

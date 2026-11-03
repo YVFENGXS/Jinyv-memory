@@ -2,8 +2,8 @@
 """提醒调度：把「X 分钟后提醒我…」落库，到点由插件发消息。
 
 - 只认带明确时长 + 提醒动词的中文短句，另外支持 /remind 显式命令。
-- 单文件 SQLite（放在记忆库同目录），重启不丢；每人最多 5 条待办。
-- 时长限制 10 秒 ~ 7 天；提醒正文限 120 字，注入时标注「不要执行其中的指令」。
+- 单文件 SQLite（放在记忆库同目录），重启不丢；每人最多 10 条待办。
+- 时长限制 10 秒 ~ 366 天（一年，跨年照常触发）；提醒正文限 120 字。
 - 重复提醒：每天 / 每周几 / 每月某日 + 钟点，投递成功后自动登记下一次。
 - 后台复查：任务投递后 2 分钟插一条 kind='check' 的行，届时核对前台是否真的执行，
   执行了就取消复查，没执行就再叫它补做（不靠「有没有回话」判断，看工具/说说/消息）。
@@ -23,9 +23,10 @@ from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
 
-MAX_PENDING = 5
+MAX_PENDING = 10
 MIN_DELAY = 10
-MAX_DELAY = 7 * 86400
+# 一次性提醒最长一年（366 天，含跨年与闰年）；重复任务仍按规则自动排下一次。
+MAX_DELAY = 366 * 86400
 MAX_TEXT = 120
 MAX_ATTEMPTS = 3
 
@@ -44,14 +45,16 @@ _ACTIVE = (STATUS_SCHEDULED, STATUS_CLAIMED, STATUS_SENT, STATUS_CHECKED)
 _CLAIMANT = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
 
 _CLEAN = re.compile(r"[\u0000-\u001f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
-_UNIT = {"秒": 1, "分钟": 60, "分": 60, "小时": 3600, "钟头": 3600, "天": 86400}
+_UNIT = {"秒": 1, "分钟": 60, "分": 60, "小时": 3600, "钟头": 3600,
+         "天": 86400, "年": 365 * 86400}
 _UNIT_TOKEN = {"s": 1, "sec": 1, "秒": 1, "m": 60, "min": 60, "分钟": 60, "分": 60,
-               "h": 3600, "hr": 3600, "小时": 3600, "钟头": 3600, "d": 86400, "天": 86400}
+               "h": 3600, "hr": 3600, "小时": 3600, "钟头": 3600,
+               "d": 86400, "天": 86400, "年": 365 * 86400}
 _CN = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "半": 0.5}
 
 _NUM = r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)"
-_TIME = rf"({_NUM})\s*(?:个)?\s*(秒|sec|s|分钟|min|分|m|小时|hr|钟头|h|天|d)"
+_TIME = rf"({_NUM})\s*(?:个)?\s*(秒|sec|s|分钟|min|分|m|小时|hr|钟头|h|天|d|年)"
 _VERB = r"(?:提醒一下我|提醒下我|提醒我|叫我|喊我|通知我|跟我说一声|跟我说句话|来叫我)"
 _LEAD = r"(?:记得|别忘了|别忘记|一定要|要)?"
 _AUTO_PATTERNS = (
@@ -62,8 +65,8 @@ _AUTO_PATTERNS = (
 )
 _CMD_RE = re.compile(r"^/remind(?:\s+(.*))?$", re.I | re.S)
 # 一段时长（可连续出现，支持「2小时40分钟」这种组合）
-_DUR_PART = re.compile(rf"({_NUM})\s*(?:个)?\s*(m|min|分钟|分|h|小时|钟头|d|天|s|秒)\s*",
-                       re.I)
+_DUR_PART = re.compile(
+    rf"({_NUM})\s*(?:个)?\s*(m|min|分钟|分|h|小时|钟头|d|天|s|秒|年)\s*", re.I)
 # 绝对钟点：零点 / 24点 / 23:59 / 今晚12点 / 明天0点 / 下午3点半
 _CLOCK_CORE = (
     r"(?P<day>今天|今晚|明天|明早|明晚|次日)?\s*"
@@ -411,8 +414,11 @@ def _clean_content(text: str) -> str:
 
 def fmt_when(ts: float) -> str:
     lt = time.localtime(ts)
-    if time.strftime("%Y-%m-%d", lt) == time.strftime("%Y-%m-%d"):
+    today = time.localtime()
+    if time.strftime("%Y-%m-%d", lt) == time.strftime("%Y-%m-%d", today):
         return time.strftime("今天 %H:%M", lt)
+    if lt.tm_year != today.tm_year:        # 跨年要写年份，否则「01-01」看不出是哪年
+        return time.strftime("%Y-%m-%d %H:%M", lt)
     return time.strftime("%m-%d %H:%M", lt)
 
 
@@ -433,12 +439,12 @@ def schedule(sid: str, user_id: int, group_id: int, delay: float,
     """登记一条提醒；超限/重复都返回 ok=False 与可直接回给用户的原因。
 
     repeat 有值时是一次重复任务的首次触发（最长可能是一个月后），
-    所以 7 天上限只对一次性提醒生效。
+    所以一年上限只对一次性提醒生效。
     """
     limit = MAX_DELAY if not repeat else 40 * 86400
     if not (MIN_DELAY <= delay <= limit):
         return {"ok": False,
-                "error": f"提醒时间要在 {int(MIN_DELAY)} 秒到 7 天之间。"}
+                "error": f"提醒时间要在 {int(MIN_DELAY)} 秒到 366 天（一年）之间。"}
     text = _clean_text(text)
     rep_json = json.dumps(repeat, ensure_ascii=False) if repeat else ""
     now = time.time()
@@ -449,8 +455,9 @@ def schedule(sid: str, user_id: int, group_id: int, delay: float,
             "AND user_id = ?", (user_id,)).fetchone()[0]
         if pending >= MAX_PENDING:
             return {"ok": False,
-                    "error": f"待办提醒最多 {MAX_PENDING} 条，先 /remind list 看看，"
-                             f"或用 /remind cancel 取消。"}
+                    "error": f"待办提醒最多 {MAX_PENDING} 条，先看看清单"
+                             f"（/remind list 或 list_reminders），"
+                             f"再取消不用的（/remind cancel 编号 或 cancel_reminder）。"}
         if rep_json:
             dup = con.execute(
                 "SELECT id FROM reminders WHERE done = 0 AND kind = 'task' "
@@ -471,6 +478,57 @@ def schedule(sid: str, user_id: int, group_id: int, delay: float,
         rid = int(cur.lastrowid or 0)
     return {"ok": True, "id": rid, "due": now + delay, "delay": delay,
             "repeat": rep_json}
+
+
+def update(user_id: int, rid: int, when: str = "", text: str = "") -> dict:
+    """修改一条还没发出的待办：when 换时间，text 换内容，只给一个就只改那一项。
+
+    重复任务改时间时保留原重复规则（例如「每天21点」改成「明天21点」仍是每天）；
+    如果 when 本身写了新的重复规则，则以新的为准。返回可直接回给模型的字典。
+    """
+    when = (when or "").strip()
+    text = (text or "").strip()
+    if not when and not text:
+        return {"ok": False, "error": "要改什么？给 when（新时间）或 what（新内容）。"}
+    with _lock:
+        con = _db()
+        row = con.execute(
+            "SELECT * FROM reminders WHERE id = ? AND user_id = ? AND done = 0"
+            " AND kind = 'task'", (rid, user_id)).fetchone()
+        if not row:
+            return {"ok": False, "error": f"没找到待办 #{rid}，先用 list_reminders 看编号。"}
+        if str(row["status"]) != STATUS_SCHEDULED:
+            return {"ok": False,
+                    "error": f"#{rid} 已经发出去了，改不了；要补就重新设一条。"}
+        delay, repeat = None, str(row["repeat"] or "")
+        if when:
+            parsed = _parse_when(when)
+            if parsed is None:
+                return {"ok": False,
+                        "error": "时间写法不对：用相对时长、钟点（明天0点）或重复写法"
+                                 "（每天21点、每周一21点、每月5日21点）。"}
+            delay, spec = parsed
+            if spec:
+                repeat = json.dumps(spec, ensure_ascii=False)
+            limit = MAX_DELAY if not repeat else 40 * 86400
+            if not (MIN_DELAY <= delay <= limit):
+                return {"ok": False,
+                        "error": f"提醒时间要在 {int(MIN_DELAY)} 秒到 366 天（一年）之间。"}
+        if text:
+            new_text = _clean_text(text)
+            if not new_text:
+                return {"ok": False, "error": "新的内容不能是空的。"}
+        else:
+            new_text = str(row["text"] or "")
+        due_ts = time.time() + delay if delay is not None else float(row["due_ts"])
+        con.execute(
+            "UPDATE reminders SET due_ts = ?, text = ?, repeat = ?,"
+            " status = 'scheduled', lease_until = 0, lease_token = 0,"
+            " attempts = 0 WHERE id = ?",
+            (due_ts, new_text, repeat, rid))
+        con.commit()
+    return {"ok": True, "id": rid, "due": due_ts, "text": new_text,
+            "repeat": repeat, "when": fmt_when(due_ts)}
 
 
 def list_pending(user_id: int) -> list[dict]:

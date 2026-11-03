@@ -16,6 +16,9 @@
   var sendBtn = document.getElementById("voice-send");
   var stateEl = document.getElementById("voice-state");
   var inputEl = document.getElementById("voice-text");
+  // 手机上输入框单独贴在底部，不进控制台；PC 上这块是隐藏的
+  var phoneForm = document.getElementById("phone-chat");
+  var phoneInput = document.getElementById("phone-chat-text");
   var asrEl = document.getElementById("voice-asr");
   var replyEl = document.getElementById("voice-reply");
 
@@ -59,26 +62,24 @@
   var HF_COOLDOWN_MS = 700;      // 瑾瑜说完后的静默，避免自己的尾音被当成新一句
   var HF_TICK_MS = 80;
 
-  // 和读屏/摄像头共用同一个会话键，服务端才能把最近一帧画面带进通话回答
+  // 手机和电脑是同一场通话：会话键固定，表情/动作/待播话两端都走同一个
   function sessionId() {
-    try {
-      var got = window.localStorage.getItem("rp.stage.session");
-      if (got) {
-        return got;
-      }
-      got = window.localStorage.getItem("rp.voice.session") ||
-        window.localStorage.getItem("rp.screen.session");
-      if (got) {
-        window.localStorage.setItem("rp.stage.session", got);
-        return got;
-      }
-      var made = "stage-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-      window.localStorage.setItem("rp.stage.session", made);
-      return made;
-    } catch (error) {
-      return "stage-local";
-    }
+    return "stage-shared";
   }
+
+  // 每台设备一个实例号，只用来区分「这句是谁说的」，不参与记忆
+  var CLIENT = (function () {
+    try {
+      var got = window.sessionStorage.getItem("rp.client");
+      if (!got) {
+        got = "c-" + Math.random().toString(36).slice(2, 10);
+        window.sessionStorage.setItem("rp.client", got);
+      }
+      return got;
+    } catch (error) {
+      return "c-local";
+    }
+  })();
 
   var SESSION = sessionId();
 
@@ -492,7 +493,8 @@
     if (!apiBase) {
       return;
     }
-    timedFetch(apiBase + "/call/inbox?session=" + encodeURIComponent(SESSION),
+    timedFetch(apiBase + "/call/inbox?session=" + encodeURIComponent(SESSION)
+          + "&client=" + encodeURIComponent(CLIENT),
           { cache: "no-store" }, 10000)
       .then(function (resp) { return resp.ok ? resp.json() : null; })
       .then(function (data) {
@@ -578,6 +580,7 @@
         throw new Error("通话服务未启动：请运行 python call_server.py");
       }
       body.session = SESSION;
+      body.client = CLIENT;
       // 告诉服务端当前打开的是屏幕还是摄像头，避免拿另一路的旧画面充数
       body.view = (window.JinyuScreen && window.JinyuScreen.mode)
         ? (window.JinyuScreen.mode() || "none") : "";
@@ -585,11 +588,11 @@
     }).then(function (data) {
       busy = false;
       if (data.pass) {
-        // 这一轮瑾瑜把话说到 QQ/桌宠了，通话这边不出声，也不报错
+        // 这一轮模型没给正文，通话这边不出声，也不报错
         renderAsr(data);
         replyEl.hidden = false;
-        replyEl.textContent = "（瑾瑜这一轮在别的窗口说话）";
-        setState("瑾瑜在别的窗口说话", "idle");
+        replyEl.textContent = "（这一轮没出声，主人再说一次？）";
+        setState("瑾瑜没出声", "idle");
         flushPending();
         return;
       }
@@ -727,12 +730,19 @@
     });
   }
 
-  function sendText() {
-    var text = inputEl.value.trim().slice(0, MAX_TEXT);
+  function sendText(from) {
+    var box = from || (phoneInput && phoneInput.value.trim() ? phoneInput : inputEl);
+    var text = (box.value || "").trim().slice(0, MAX_TEXT);
     if (!text || busy) {
       return;
     }
-    inputEl.value = "";
+    box.value = "";
+    if (inputEl !== box) {
+      inputEl.value = "";
+    }
+    if (phoneInput && phoneInput !== box) {
+      phoneInput.value = "";
+    }
     if (window.JinyuScreen && window.JinyuScreen.scanNow) {
       window.JinyuScreen.scanNow();
     }
@@ -815,14 +825,79 @@
     }
   });
 
-  sendBtn.addEventListener("click", sendText);
+  sendBtn.addEventListener("click", function () {
+    sendText(inputEl);
+  });
+
+  if (phoneForm && phoneInput) {
+    // 手机键盘的回车就是「发送」，走 form 提交最稳
+    phoneForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      sendText(phoneInput);
+    });
+  }
 
   inputEl.addEventListener("keydown", function (event) {
     if (event.key === "Enter") {
       event.preventDefault();
-      sendText();
+      sendText(inputEl);
     }
   });
+
+  // 多端同步：每几秒拉一次另一端说了什么，显示在页面底部
+  var peerEl = document.getElementById("peer-line");
+  var feedAfter = 0;
+  var feedPrimed = false;
+  var peerTimer = 0;
+
+  function showPeer(items) {
+    if (!peerEl) {
+      return;
+    }
+    var others = items.filter(function (item) {
+      return item.client !== CLIENT;
+    });
+    if (!others.length) {
+      return;
+    }
+    var last = others[others.length - 1];
+    peerEl.textContent = last.who === "user"
+      ? "另一边的主人说「" + last.text + "」"
+      : "瑾瑜在另一边：" + last.text;
+    peerEl.hidden = false;
+    window.clearTimeout(peerTimer);
+    peerTimer = window.setTimeout(function () {
+      peerEl.hidden = true;
+    }, 9000);
+  }
+
+  function pollFeed() {
+    if (document.hidden) {
+      return;
+    }
+    resolveApi().then(function (base) {
+      if (!base) {
+        return null;
+      }
+      return fetch(base + "/call/feed?after=" + feedAfter, {
+        credentials: "same-origin",
+        cache: "no-store"
+      }).then(function (resp) {
+        return resp.ok ? resp.json() : null;
+      });
+    }).then(function (data) {
+      if (!data) {
+        return;
+      }
+      feedAfter = data.next || feedAfter;
+      if (feedPrimed) {
+        showPeer(data.items || []);
+      }
+      feedPrimed = true;
+    }).catch(function () {});
+  }
+
+  window.setInterval(pollFeed, 2500);
 
   window.addEventListener("beforeunload", function () {
     if (vadTimer) {

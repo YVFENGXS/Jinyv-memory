@@ -603,18 +603,9 @@
   }
 
   // ---- 让模型知道自己现在的样子：把实际表情/动作上报给通话服务 ----
+  // 和 voice.js / screen.js 同一个固定会话键，表情上报才能落到同一场通话里
   function stageSessionId() {
-    try {
-      var got = window.localStorage.getItem("rp.stage.session");
-      if (got) {
-        return got;
-      }
-      var made = "stage-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-      window.localStorage.setItem("rp.stage.session", made);
-      return made;
-    } catch (error) {
-      return "stage-local";
-    }
+    return "stage-shared";
   }
 
   function motionLabelOf(key) {
