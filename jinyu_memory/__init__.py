@@ -24,7 +24,7 @@
   RP_COOLDOWN                       选填，同一会话最小间隔秒数，默认 2
   RP_RICH                           选填，1/0 开关富消息，默认 1
   RP_BUBBLES                        选填，1/0 回复按句子拆成多条气泡依次发，默认 1
-  RP_BUBBLE_MAX                     选填，单条回复最多拆几个气泡，默认 6
+  RP_BUBBLE_MAX                     选填，单条回复最多拆几个气泡，默认 10
   RP_BUBBLE_DELAY                   选填，相邻气泡的平均间隔秒数，默认 0.9
   RP_STICKER_DIR                    选填，贴纸库目录，默认 /opt/qqbot/stickers
   RP_TTS_DIR / RP_TTS_VOICE         选填，语音缓存目录 / edge-tts 音色
