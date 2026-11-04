@@ -206,7 +206,7 @@ COOLDOWN = float(os.environ.get("RP_COOLDOWN") or 2)
 REPLY_CHUNK = 1000
 BUBBLES_ON = (os.environ.get("RP_BUBBLES") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
-BUBBLE_MAX = max(1, int(float(os.environ.get("RP_BUBBLE_MAX") or 6)))
+BUBBLE_MAX = max(1, int(float(os.environ.get("RP_BUBBLE_MAX") or 10)))
 _BUBBLE_GAP = max(0.0, float(os.environ.get("RP_BUBBLE_DELAY") or 0.9))
 BUBBLE_DELAY = (_BUBBLE_GAP * 0.6, _BUBBLE_GAP * 1.4)   # 相邻气泡的随机间隔（秒）
 ADMIN = {x.strip() for x in (os.environ.get("RP_ADMIN_QQ") or "").split(",") if x.strip()}
@@ -967,7 +967,7 @@ def _tool_web_search(args, sid, cid, ctx=None) -> str:
     if not _search_ok():
         return "今天查得有点多，晚点再查；这次先按你知道的说，不知道就如实讲。"
     try:
-        return web_search_note(query, 5)
+        return web_search_note(query, 6)
     except Exception as exc:                  # noqa: BLE001 网络失败如实降级
         logger.warning(f"[search] 查询失败 query={query!r}: {exc}")
         return f"联网搜索没成功（{exc}），别硬编，如实告诉主人这次没查到。"
@@ -3013,8 +3013,8 @@ _STAGE_TAG = re.compile(r"\[\[\s*(表情|动作|收起|重置|待机|转头|歪�
 def _bubbles(reply: str, limit: Optional[int] = None) -> list:
     """把一条回复按句子拆成多条气泡，富消息标记和链接整体保留。
 
-    先按换行切，再按句末标点切；太短的碎片并到前一条，超过上限的并到最后
-    一条——一次刷十几条会被 QQ 风控，也不像真人。
+    先按换行切，再按句末标点切；一句一个气泡，不再把短句并回上一条。
+    超过上限的才并到最后一条——一次刷十几条会被 QQ 风控，也不像真人。
     """
     limit = limit or BUBBLE_MAX
     marks = []
@@ -3024,14 +3024,8 @@ def _bubbles(reply: str, limit: Optional[int] = None) -> list:
         return f"\x00{len(marks) - 1}\x00"
 
     text = _RICH_TOKEN.sub(_keep, reply)
-    parts = [p.strip(" \t") for p in re.split(r"\n+|(?<=[。！？!?…])", text)]
-    parts = [p for p in parts if p]
-    merged = []
-    for p in parts:
-        if merged and (len(p) < 2 or len(merged[-1]) < 2):
-            merged[-1] += p
-        else:
-            merged.append(p)
+    parts = [p.strip(" \t") for p in re.split(r"\n+|(?<=[。！？!?])", text)]
+    merged = [p for p in parts if p]
     if len(merged) > limit:
         merged = merged[:limit - 1] + ["\n".join(merged[limit - 1:])]
     return [re.sub(r"\x00(\d+)\x00", lambda m: marks[int(m.group(1))], p)
