@@ -15,8 +15,8 @@
 - 可逆摘要：事件卡除摘要外存 1–3 句逐字原话（`quotes`），需要时按 `event_id` 用 `query_memory(detail="raw")` 回捞原文
 - 章节卡：Dream 把 30 天前的明细卡按车道（跨 epoch）/受众/bot/知识边界并成 T2 章节卡；明细卡保留，仍可展开
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
-- 自主作息（`RP_AUTONOMY=1`）：每小时报点可静默 pass；23:30 规划次日、00:05 兜底；每天 3–5 次自己醒来（白天 ≥2、夜间 ≥1），醒来可查记忆 / 整理 / 上网 / 看 B 站，也能按天限量自己搜一张图看（T2 奢侈品），报告、意图、日记全部有字数硬上限
-- 114 项回归测试，不依赖任何 API key
+- 自主作息（`RP_AUTONOMY=1`）：每小时报点可静默 pass；23:30 规划次日、00:05 兜底；每天 3–5 次自己醒来（白天 ≥2、夜间 ≥1），醒来可查记忆、给词条打分、改删补词条与事件卡、判重合并，也能上网 / 看 B 站、按天限量自己搜一张图看（T2 奢侈品），报告、意图、日记全部有字数硬上限
+- 115 项回归测试，不依赖任何 API key
 
 ---
 
@@ -42,7 +42,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ（走 JinyuHost）
-├── tests/test_regression.py # 114 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽、音乐测量、自主作息）
+├── tests/test_regression.py # 115 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽、音乐测量、自主作息）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── serve.py             # 宿主 HTTP 服务：/chat /remember /recall（零依赖）
@@ -92,7 +92,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限、跨 epoch 召回池、本地音乐测量、一年期提醒、自主报点/计划/醒来等 114 项场景（服务器实测 18 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限、跨 epoch 召回池、本地音乐测量、一年期提醒、自主报点/计划/醒来、醒来记忆整理动作等 115 项场景（服务器实测 18 秒）。
 
 ## 评测结果（可复现）
 
@@ -172,7 +172,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 114 项回归
+python tests/test_regression.py                        # 115 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -483,11 +483,11 @@ NapCat 与 NoneBot 的启动顺序不敏感：反了也会在约 30 秒后自动
 
 - **整点报点**：每小时一次。规则先挡：00:00–08:00 静默、主人 10 分钟内说过话、今日主动开口达到 `RP_TICK_SPEAK_MAX`（默认 4）。模型只回 `{"speak": true/false, "text": ...}`；`speak=false` 时**不发消息、不写对话轮次**，只记审计
 - **日计划**：23:30 为次日生成计划；00:05 发现当天没有计划就用兜底模板补一份。计划 3–5 个窗口，白天 ≥2、夜间 ≥1，间隔 ≥30 分钟。AI 不清醒时 fallback 是 `09:30 / 14:00 / 20:30 / 02:30`
-- **自己醒来**：每次醒来先读计划、自我状态、最近 2 条日记和最近对话，再决定做什么。可用动作：`recall` 查记忆、`recent` 看最近对话、`tidy_memory` 走一次 Dream 整理、`web_search` 上网、`bili_search` / `bili_popular` / `bili_watch` 看 B 站、`search_image` 自己搜一张图看（T2）。默认单次最多 3 步
+- **自己醒来**：每次醒来先读计划、自我状态、最近 2 条日记和最近对话，再决定做什么。可用动作：`recall` 查记忆、`recent` 看最近对话、`memory_overview` 看各会话词条/事件卡数量、`memory_list` / `memory_cards` 按会话翻编号、`memory_get` 按编号看单条词条、`memory_edit` / `memory_card_edit` 改正文、`memory_score` 给词条打分（0–1）、`memory_delete` / `memory_card_delete` 删重复或错的、`memory_add` / `memory_card_add` 补新的、`merge_facts` 让后台判重合并、`tidy_memory` 走一次 Dream 批量整理（每天只跑一次，已跑过会提示改用针对性整理）、`web_search` 上网、`bili_search` / `bili_popular` / `bili_watch` 看 B 站、`search_image` 自己搜一张图看（T2）。默认单次最多 3 步，一轮只做一个动作：查到内容后再决定改哪条，不会因为看不到结果而只能盲改。计划 prompt 明确要求白天至少安排一次翻旧事或整理，避免整页都是「发呆」
 - **醒来会留下**：报告（≤200 字）、还没做完的事（≤3 条）、下次意图（≤100 字）、睡前日记（≤200 字），并更新固定的自我状态。这些会以「你最近自己做的事，不是对主人说的话」注入正常聊天，默认 ≤300 字
 - **自己定下次**：醒来可以给 `next_wake_at`（30 分钟～12 小时后）；后台夹取到合法窗口，且当天醒来次数不超过 `RP_WAKE_MAX`。没给就按日计划里的下一个窗口
-- **主人插话**：醒来过程中主人一发消息就 `yielded`，不再跑外部动作，优先回去陪主人
-- **额度**：T0（记忆 / 整理 / 日记）不计外部额度；T1（网页 / B站）受 `RP_EXTERNAL_UNITS_DAY` 与 `RP_EXTERNAL_UNITS_WAKE` 限制；T2（自己搜图看）受 `RP_VISION_UNITS_DAY` 限制（默认每天 1 次）；额度不够的动作会跳过并在报告里说明
+- **主人插话**：醒来过程中主人本人一发消息就 `yielded`，不再跑外部动作，优先回去陪主人；群友闲聊不打断（只看主人账号）
+- **额度**：T0（记忆查询、词条/事件卡改删补、打分、日记）不计外部额度；T1（`merge_facts` 判重合并、网页、B站）受 `RP_EXTERNAL_UNITS_DAY` 与 `RP_EXTERNAL_UNITS_WAKE` 限制；T2（自己搜图看）受 `RP_VISION_UNITS_DAY` 限制（默认每天 1 次）；额度不够的动作会跳过并在报告里说明
 - **防膨胀**：自我状态、报告、意图、日记全部按字数硬截断；日记全文写进 `autonomy.db` 和同目录的 `autonomy_diary.md`，文档只保留最近 40 条，不会越醒越长
 - **失败恢复**：job 存在独立的 `autonomy.db`，带租约与幂等键；模型返回非法 JSON 就回退到安全默认；进程重启后过期报点只补最新一条，过期醒来超过 15 分钟直接标错过
 

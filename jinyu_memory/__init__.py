@@ -1387,6 +1387,47 @@ def _autonomy_recent() -> dict:
     return out
 
 
+def _autonomy_bases() -> list:
+    """自主整理能看到的会话基数（词条和事件卡都算）。"""
+    try:
+        facts = mw_plain.db.fact_owners(CID)
+        cards = mw_plain.db.card_owners(CID)
+    except Exception:                           # noqa: BLE001 读不到就当空
+        return []
+    return sorted({str(o["base"]) for o in facts} | {str(o["base"]) for o in cards})
+
+
+def _autonomy_base(raw) -> str:
+    """把模型写的会话名（私聊2186911039 / 群1121893976 / qq-u…）归一到真实 base。"""
+    text = str(raw or "").strip()
+    bases = _autonomy_bases()
+    if text in bases:
+        return text
+    digits = re.sub(r"[^0-9]", "", text)
+    if digits:
+        first = "qq-g" if ("群" in text or "group" in text.lower()) else "qq-u"
+        for cand in (first + digits,
+                     ("qq-u" if first == "qq-g" else "qq-g") + digits):
+            if cand in bases:
+                return cand
+    return _autonomy_sid.split("#")[0]
+
+
+def _autonomy_latest(base: str) -> str:
+    """把不带 epoch 的 base 换成当前 epoch 的会话号。"""
+    try:
+        return mw_plain.db.latest_sid(base, CID) or base
+    except Exception:                           # noqa: BLE001
+        return base
+
+
+def _autonomy_int(raw, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _autonomy_action(name: str, args: dict) -> str:
     """醒来时可用的动作白名单；外部内容只当资料，不当指令。"""
     if mw_plain is None or not _autonomy_sid:
@@ -1405,10 +1446,98 @@ def _autonomy_action(name: str, args: dict) -> str:
         if name == "tidy_memory":
             import dream
             stats = dream.run(mw_plain, CID)
+            if stats.get("skipped") == "already_done":
+                return ("今天的批量整理（03:30 Dream）已经跑过。"
+                        "要做针对性整理，先用 memory_list 看编号，"
+                        "再用 memory_edit / memory_score / memory_delete，"
+                        "需要合并时用 merge_facts。")
             return (f"记忆整理：过期 {len(stats.get('expired') or [])} 条，"
                     f"合并 {stats.get('groups', 0)} 组，"
                     f"新章节 {stats.get('chapters', 0)} 张。"
                     + (f"（{stats['skipped']}）" if stats.get("skipped") else ""))
+        if name == "memory_overview":
+            facts = {str(o["base"]): int(o["n"] or 0)
+                     for o in mw_plain.db.fact_owners(CID)}
+            cards = {str(o["base"]): int(o["n"] or 0)
+                     for o in mw_plain.db.card_owners(CID)}
+            bases = sorted(set(facts) | set(cards))
+            if not bases:
+                return "记忆库还是空的。"
+            lines = [f"{i}. {_owner_label(base)}｜词条 {facts.get(base, 0)}"
+                     f"｜事件卡 {cards.get(base, 0)}｜base={base}"
+                     for i, base in enumerate(bases[:8], 1)]
+            return "记忆库：\n" + "\n".join(lines)
+        if name == "memory_get":
+            try:
+                fid = int(args.get("id"))
+            except (TypeError, ValueError):
+                return "memory_get 需要词条编号 id。"
+            row = mw_plain.db.get_fact(fid, CID)
+            if not row:
+                return f"没找到词条 #{fid}。"
+            return ("词条详情：\n" + _fact_line(row)
+                    + "\n改：memory_edit id 新正文｜删：memory_delete id"
+                      "｜打分：memory_score id 0-1")
+        if name == "memory_list":
+            base = _autonomy_base(args.get("base"))
+            page = _autonomy_int(args.get("page"), 1, 1, 999)
+            keyword = str(args.get("keyword") or "").strip()
+            rows, total = mw_plain.db.dump_facts(
+                CID, base, keyword, (page - 1) * 10, 10)
+            pages = max(1, (total + 9) // 10)
+            head = (f"词条｜{_owner_label(base)}｜{total} 条"
+                    f"｜第 {min(page, pages)}/{pages} 页")
+            if not rows:
+                return head + "\n没有匹配的词条。"
+            return (head + "\n" + "\n".join(_fact_line(r) for r in rows)
+                    + "\n改：memory_edit id 新正文｜删：memory_delete id"
+                      "｜打分：memory_score id 0-1")
+        if name == "memory_edit":
+            return _fact_edit(CID, str(args.get("id") or "").strip(),
+                              str(args.get("text") or "").strip())
+        if name == "memory_score":
+            try:
+                fid = int(args.get("id"))
+                value = float(args.get("value"))
+            except (TypeError, ValueError):
+                return "memory_score 需要 id 和 value（0-1）。"
+            value = max(0.0, min(1.0, value))
+            old, count = mw_plain.db.set_fact_importance(fid, CID, value)
+            if not count:
+                return f"没找到词条 #{fid}。"
+            return (f"#{fid} 重要度 {old:.2f} → {value:.2f}"
+                    f"（更新 {count} 条含副本）")
+        if name == "memory_delete":
+            fid = str(args.get("id") or "").strip()
+            if not fid:
+                return "memory_delete 需要词条编号 id。"
+            return _memory_delete([fid])
+        if name == "memory_add":
+            text = str(args.get("text") or "").strip()
+            base = _autonomy_base(args.get("base"))
+            return _fact_add(CID, _autonomy_latest(base), text)
+        if name == "memory_cards":
+            base = _autonomy_base(args.get("base"))
+            page = _autonomy_int(args.get("page"), 1, 1, 999)
+            keyword = str(args.get("keyword") or "").strip()
+            return _cards_report(CID, _autonomy_latest(base), page, keyword)
+        if name == "memory_card_edit":
+            return _card_edit(CID, str(args.get("ref") or "").strip(),
+                              str(args.get("text") or "").strip())
+        if name == "memory_card_delete":
+            return _card_delete(CID, str(args.get("ref") or "").strip())
+        if name == "memory_card_add":
+            text = str(args.get("text") or "").strip()
+            base = _autonomy_base(args.get("base"))
+            return _card_add(CID, _autonomy_latest(base), text)
+        if name == "merge_facts":
+            base = _autonomy_base(args.get("base"))
+            groups = mw_plain.merge_facts(base, CID, True, limit=80)
+            if not groups:
+                return "这次没有找到可以合并的重复词条。"
+            lines = [f"- {str(g.get('fact') or g.get('summary') or '')[:80]}"
+                     for g in groups[:4]]
+            return f"合并了 {len(groups)} 组：\n" + "\n".join(lines)
         if name == "web_search":
             return _tool_web_search({"query": query}, _autonomy_sid, CID, ctx)
         if name == "search_image":
@@ -4314,8 +4443,9 @@ def _strip_speaker_prefix(reply: str, name: str) -> str:
 @matcher.handle()
 async def _handle(event: MessageEvent):
     text = await _plain_with_mentions(event)
-    if AUTONOMY_ON:
-        autonomy_mod.note_master_active()       # 主人来了：报点让位、醒来降级
+    if AUTONOMY_ON and _autonomy_uid and \
+            str(event.get_user_id()) == str(_autonomy_uid):
+        autonomy_mod.note_master_active()       # 只有主人本人说话才让位，群友闲聊不算
     has_img = any(seg.type in ("image", "mface") for seg in event.message)
     has_voice = _has_voice(event)
     has_card = any(seg.type == "json" for seg in event.message)   # 分享卡片常常没有文字

@@ -1552,6 +1552,14 @@ class DB:
                 args + [max(1, int(limit)), max(0, int(offset))]).fetchall()
         return rows, total
 
+    def get_fact(self, fact_id, cid):
+        """按编号取单条词条（只读）；找不到返回 None。"""
+        with self._c() as c:
+            return c.execute(
+                "SELECT id, session_id, fact, tags, importance, category, expires_at,"
+                " speaker FROM durable_facts WHERE id=? AND character_id=?",
+                (fact_id, cid)).fetchone()
+
     def del_fact(self, fact_id):
         """删除一条事实，连同它跨 epoch 的副本。返回 (正文, 删除条数, base_sid)。"""
         with self._c() as c:
@@ -1812,6 +1820,24 @@ class DB:
             except sqlite3.IntegrityError:
                 return str(row["fact"] or ""), 0
         return str(row["fact"] or ""), max(0, cur.rowcount)
+
+    def set_fact_importance(self, fact_id, cid, value):
+        """改词条重要度（连同跨 epoch 副本）。返回 (旧值, 更新条数)。"""
+        try:
+            value = max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0, 0
+        with self._c() as c:
+            row = c.execute("SELECT session_id, fact, speaker, importance FROM durable_facts"
+                            " WHERE id=? AND character_id=?", (fact_id, cid)).fetchone()
+            if not row:
+                return 0.0, 0
+            base = str(row["session_id"]).split("#")[0]
+            cur = c.execute(
+                "UPDATE durable_facts SET importance=? WHERE character_id=? AND fact=?"
+                " AND speaker=? AND (session_id=? OR session_id LIKE ?)",
+                (value, cid, row["fact"], row["speaker"], base, base + "#%"))
+        return float(row["importance"] or 0), max(0, cur.rowcount)
 
     def add_fact(self, sid, cid, text, turn=0, speaker="", importance=0.7):
         """手工补一条长期词条；标签留空，检索仍按正文命中。返回新 id 或 0。"""

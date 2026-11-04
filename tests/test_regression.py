@@ -4108,6 +4108,33 @@ def test_autonomy_jobs_idempotent():
     print("R101 自主 job: OK 幂等登记 / CAS 只认领一次")
 
 
+def test_autonomy_memory_actions():
+    """R102：醒来的记忆整理动作可放行；打分能写回词条。"""
+    autonomy, _path = _fresh_autonomy("memory")
+    try:
+        steps = autonomy._allowed_steps({"steps": [
+            {"action": "memory_overview", "args": {}},
+            {"action": "memory_list", "args": {"base": "qq-u1"}},
+            {"action": "memory_edit", "args": {"id": 1, "text": "改正文"}},
+            {"action": "not_an_action", "args": {}}]})
+        names = [s["action"] for s in steps]
+        assert names == ["memory_overview", "memory_list", "memory_edit"], names
+        assert autonomy._tier_cost("memory_edit") == ("T0", 0)
+        assert autonomy._tier_cost("merge_facts") == ("T1", 1)
+    finally:
+        autonomy.close()
+    db_path = Path(tempfile.gettempdir()) / "rp_autonomy_importance.db"
+    db_path.unlink(missing_ok=True)
+    db = DB(str(db_path))
+    fid = db.add_fact("qq-u1", "jinyu", "主人的伞是蓝色的", turn=1)
+    old, count = db.set_fact_importance(fid, "jinyu", 0.95)
+    assert count >= 1 and old >= 0, (old, count)
+    rows, _total = db.dump_facts("jinyu", "qq-u1")
+    hit = [r for r in rows if int(r["id"]) == fid]
+    assert hit and abs(float(hit[0]["importance"]) - 0.95) < 1e-6, hit
+    print("R102 自主记忆整理: OK 动作放行 / 打分写回词条")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -4140,6 +4167,7 @@ if __name__ == "__main__":
                test_reminder_claim_cas, test_reminder_one_year,
                test_autonomy_plan_and_tick, test_autonomy_wake_and_limits,
                test_autonomy_jobs_idempotent,
+               test_autonomy_memory_actions,
                test_owner_gate_binding,
                test_task_supervisor_preempt, test_recall_trace_audit,
                test_merge_log_and_card_crud, test_fact_merge_log_and_edit,
