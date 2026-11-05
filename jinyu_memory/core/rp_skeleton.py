@@ -2652,19 +2652,26 @@ class RPContextMiddleware:
             try:
                 topic = questions.topic_of(user_input)
                 evidence = questions.evidence_for(self.db, cid, user_input, topic)
+                if self.compression_shadow:
+                    # shadow：只记录「本会拦下」，绝不改写真实回复
+                    _v = questions.gate(self.db, cid, reply, user_input,
+                                        evidence_id=evidence, topic=topic)
+                    if not _v["allowed"]:
+                        logger.info("重问门禁 shadow sid=%s cid=%s 本会拦下：%s",
+                                    sid, cid, "；".join(_v["blocked"])[:80])
+                else:
+                    def _rewrite(old, blocked, _msgs=msgs):
+                        note = ("【防重复】下面这些问法已经问过，且没有新证据："
+                                + "；".join(blocked)
+                                + "。请重写回复：保留陈述与关心，不要再问同样的问题；"
+                                "可以换成更小的动作或直接陈述你知道的。")
+                        return self.front.chat(list(_msgs) + [
+                            {"role": "assistant", "content": old},
+                            {"role": "system", "content": note}])
 
-                def _rewrite(old, blocked, _msgs=msgs):
-                    note = ("【防重复】下面这些问法已经问过，且没有新证据："
-                            + "；".join(blocked)
-                            + "。请重写回复：保留陈述与关心，不要再问同样的问题；"
-                            "可以换成更小的动作或直接陈述你知道的。")
-                    return self.front.chat(list(_msgs) + [
-                        {"role": "assistant", "content": old},
-                        {"role": "system", "content": note}])
-
-                reply, _verdict = questions.gate_reply(
-                    reply, self.db, cid, user_input, rewriter=_rewrite,
-                    evidence_id=evidence, topic=topic)
+                    reply, _verdict = questions.gate_reply(
+                        reply, self.db, cid, user_input, rewriter=_rewrite,
+                        evidence_id=evidence, topic=topic)
             except Exception as exc:              # noqa: BLE001 门禁失败不能吞掉回复
                 logger.warning("重问门禁异常 sid=%s cid=%s：%s", sid, cid, exc)
         # 上下文构建失败（如召回代码报错）不等于库写失败：用户轮已落库就要接着存回复，
