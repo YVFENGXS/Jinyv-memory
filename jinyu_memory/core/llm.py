@@ -178,6 +178,7 @@ class LLM:
         self.thinking = (thinking or "").strip().lower()
         self.role = role
         self.calls = 0
+        self.last_usage = {}                 # 最近一次 API usage（水位实测用）
 
     def chat(self, messages, temperature=0.7, max_tokens=1200, json_mode=False):
         payload = {"model": self.model, "messages": messages,
@@ -232,6 +233,7 @@ class LLM:
                 with urllib.request.urlopen(self._req(payload, want),
                                             timeout=self.timeout) as r:
                     body = json.loads(r.read().decode())
+                self.last_usage = body.get("usage") or {}
                 cs = cache_stats(body.get("usage"))
                 hit, miss = cs.get("prompt_cache_hit_tokens"), cs.get("prompt_cache_miss_tokens")
                 if hit is not None or miss is not None:

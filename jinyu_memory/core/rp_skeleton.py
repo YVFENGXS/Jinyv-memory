@@ -2669,6 +2669,15 @@ class RPContextMiddleware:
                 logger.warning("重问门禁异常 sid=%s cid=%s：%s", sid, cid, exc)
         # 上下文构建失败（如召回代码报错）不等于库写失败：用户轮已落库就要接着存回复，
         # 否则这一轮会从记忆里凭空消失（2026-10-30 视频报告丢失事故）。
+        if self.compression_on:
+            try:
+                usage = context_budget.usage_tokens(
+                    getattr(self.front, "last_usage", None))
+                if usage["prompt_tokens"]:
+                    # C1-01：优先用 API 实测 prompt_tokens，而不是字符估算
+                    self._last_used[(sid, cid)] = usage["prompt_tokens"]
+            except Exception:                  # noqa: BLE001 usage 缺失不影响回复
+                pass
         if user_stored:
             try:
                 stored_reply = reply

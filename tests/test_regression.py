@@ -4244,6 +4244,11 @@ def test_scoring_floor_and_inflation():
     assert scoring.inflation_guard([90, 85, 20, 30]) is True
     assert scoring.detect_type("我最近总头疼，吃了布洛芬") == "medical"
     assert scoring.detect_type("我答应明天给你带伞") == "commitment"
+    u = context_budget.usage_tokens({"prompt_tokens": 120,
+                                     "completion_tokens": 30,
+                                     "prompt_tokens_details": {"cached_tokens": 40}})
+    assert u["prompt_tokens"] == 120 and u["total_tokens"] == 150
+    assert u["cache_hit_tokens"] == 40
     print("C8-01 评分: OK 加权 / 单边归一 / 硬地板 / 膨胀 / 类别")
 
 
