@@ -178,13 +178,14 @@ def gate(db, cid, reply, user_input, evidence_id="", topic=None,
         if reason == "direct_question" and DIRECT_BYPASS:
             allowed.append(q)
             continue
+        row = control.get_question(db, cid, fp, reason)
+        if row is None:
+            # 第一次问这个主题：允许，不要求 evidence；只有「重问」才要新证据
+            allowed.append(q)
+            continue
         if not evidence_id:
             owed.append(q)
             blocked.append(q)
-            continue
-        row = control.get_question(db, cid, fp, reason)
-        if row is None:
-            allowed.append(q)
             continue
         nxt = control.parse_iso(row.get("next_eligible_at"))
         if nxt and stamp < nxt:
@@ -228,7 +229,7 @@ def remember(db, cid, questions, user_input, evidence_id="", topic=None,
         qid = control.record_question(
             db, cid, topic, fp, reason, evidence_id=evidence_id,
             action_level=level, min_gap_hours=gap,
-            status="owed" if not evidence_id else "active")
+            status="active")
         control.mark_asked(db, qid, min_gap_hours=gap, status="active",
                            evidence_id=evidence_id or None)
         ids.append(qid)

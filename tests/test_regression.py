@@ -4335,7 +4335,7 @@ def test_question_ledger_and_gate():
     v = questions.gate(db, "c1", "你头疼好点了吗？", "外面下雨了",
                        evidence_id="atom-1", topic="医疗")
     assert not v["allowed"] and v["blocked"], v
-    v2 = questions.gate(db, "c1", "你还好吗？", "外面下雨了", evidence_id="")
+    v2 = questions.gate(db, "c1", q, "外面下雨了", evidence_id="")
     assert not v2["allowed"] and v2["owed"], v2
     v3 = questions.gate(db, "c1", "你现在安全吗？", "我不想活了", evidence_id="")
     assert v3["allowed"], v3                       # 安全旁路
