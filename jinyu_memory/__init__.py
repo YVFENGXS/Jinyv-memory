@@ -26,6 +26,11 @@
   RP_BUBBLES                        选填，1/0 回复按句子拆成多条气泡依次发，默认 1
   RP_BUBBLE_MAX                     选填，单条回复最多拆几个气泡，默认 10
   RP_BUBBLE_DELAY                   选填，相邻气泡的平均间隔秒数，默认 0.9
+  RP_COMPRESSION_ENABLED            选填，1/0 梯度记忆与压缩总开关，默认 0
+  RP_COMPRESSION_SHADOW             选填，1 只记录不实压，默认 1
+  RP_CONTEXT_WORK_BUDGET            选填，工作预算（不是模型上限），默认 65536
+  RP_ASK_GATE                       选填，1/0 服务端重问门禁，默认 1
+  RP_TURN_RETENTION_DAYS            选填，原文按单条 turn 保留天数，默认 7
   RP_STICKER_DIR                    选填，贴纸库目录，默认 /opt/qqbot/stickers
   RP_TTS_DIR / RP_TTS_VOICE         选填，语音缓存目录 / edge-tts 音色
   RP_AUTOSTICKER                    选填，1/0 自动收藏贴纸，默认 1
@@ -168,6 +173,8 @@ import autonomy as autonomy_mod                              # noqa: E402
 import music as music_mod                                    # noqa: E402
 import persona as persona_mod                               # noqa: E402
 import reminder                                             # noqa: E402
+import retention as retention_mod                            # noqa: E402
+import status as status_mod                                  # noqa: E402
 from persona import PERSONA                                 # noqa: E402
 from richmsg import (                                       # noqa: E402
     DOWNLOAD_LIMIT,
@@ -4051,6 +4058,17 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         if not (AUTONOMY_ON and autonomy_mod.ready()):
             await matcher.finish("自主作息没开（RP_AUTONOMY=0）。")
         report = await asyncio.to_thread(autonomy_mod.status)
+        await matcher.finish(report)
+        return True
+    if cmd in ("compress", "压缩"):
+        if arg in ("on", "开"):
+            await matcher.finish("压缩开关由 .env 的 RP_COMPRESSION_ENABLED 控制，改完重启生效。")
+        if arg in ("prune", "清理"):
+            result = await asyncio.to_thread(
+                retention_mod.prune, mw.db, CID)
+            await matcher.finish(f"原文保留清理：软归档 {result['archived']} 轮，"
+                                 f"无洞 pin {result['pinned']} 条。")
+        report = await asyncio.to_thread(status_mod.report_text, mw.db, CID)
         await matcher.finish(report)
         return True
     if cmd == "voice" and arg:

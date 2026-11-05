@@ -20,7 +20,8 @@ import copy, difflib, hashlib, json, logging, math, os, queue, re, sqlite3, thre
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-import conflict, disclosure, embedding, gate, promise, retriever
+import conflict, context_budget, control, disclosure, embedding, gate, gradient
+import compression, promise, questions, retention, retriever, scoring, sealing
 from persona_guard import PersonaGuard
 from summarizer import parse as parse_json, summarize
 
@@ -732,6 +733,7 @@ CREATE TABLE IF NOT EXISTS turns(
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, character_id TEXT NOT NULL,
   turn_idx INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT '',
+  archived_at TEXT DEFAULT NULL,
   created_at TEXT DEFAULT (datetime('now')), UNIQUE(session_id, character_id, turn_idx, role));
 CREATE INDEX IF NOT EXISTS idx_turns ON turns(session_id, character_id, turn_idx);
 CREATE TABLE IF NOT EXISTS event_cards(
@@ -1023,6 +1025,8 @@ CARD_EXTRA_COLS = {
     # covers 记下章节覆盖了哪些明细卡，便于幂等与审计。
     "layer": "TEXT NOT NULL DEFAULT 'event'",
     "covers": "TEXT NOT NULL DEFAULT '[]'",
+    # 梯度记忆的控制字段：只放指针与状态，不复制摘要正文（C12）
+    "meta_json": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 # 长期事实的标签/热力/时效列：tags 供检索先筛，importance 做热力排序，
@@ -1057,6 +1061,7 @@ def _card(row) -> dict:
     d["state_changes"] = json.loads(d.get("state_changes") or "{}")
     for k in ("entity_hooks", "rel_hooks", "conflict_flags", "quotes", "covers"):
         d[k] = json.loads(d.get(k) or "[]")
+    d["meta_json"] = json.loads(d.get("meta_json") or "{}")
     d["importance"] = float(d.get("importance") or 0.5)
     d["knowledge_boundary"] = d.get("knowledge_boundary") or "both"
     d["precision"] = d.get("precision") or "normal"
@@ -1123,6 +1128,10 @@ class DB:
         ucols = {r["name"] for r in conn.execute("PRAGMA table_info(turns)")}
         if "source" not in ucols:
             conn.execute("ALTER TABLE turns ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        if "archived_at" not in ucols:                 # C6-02：软归档列，不硬删
+            conn.execute("ALTER TABLE turns ADD COLUMN archived_at TEXT DEFAULT NULL")
+        # 控制层与梯度记忆表（C0-01）：幂等建表，旧库升级不丢 turns/event_cards
+        control.ensure_schema(conn)
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(event_cards)")}
         for name, decl in CARD_EXTRA_COLS.items():
             if name not in cols:
@@ -1203,14 +1212,18 @@ class DB:
             return c.execute(f"SELECT COUNT(*) FROM turns WHERE character_id=? AND {cond}",
                              [cid] + args).fetchone()[0]
 
-    def get_turns(self, sid, cid, lo=1, hi=None):  # 闭区间 [lo, hi]；hi=None 到最新
+    def get_turns(self, sid, cid, lo=1, hi=None, include_archived=False):
+        """闭区间 [lo, hi]；hi=None 到最新。默认跳过软归档原文，审计回捞时显式打开。"""
         cond, id_args = _sid_filter(sid)
-        sql = ("SELECT turn_idx, role, content, source, created_at FROM turns"
+        sql = ("SELECT turn_idx, role, content, source, created_at, archived_at"
+               " FROM turns"
                f" WHERE character_id=? AND {cond} AND turn_idx>=?")
         args = [cid] + id_args + [lo]
         if hi is not None:
             sql += " AND turn_idx<=?"
             args.append(hi)
+        if not include_archived:
+            sql += " AND archived_at IS NULL"
         with self._c() as c:
             return [dict(r) for r in c.execute(sql + " ORDER BY turn_idx, id", args)]
 
@@ -1791,6 +1804,22 @@ class DB:
             c.execute(INSERT_CARD, _card_params(card))
         return eid
 
+    def update_card_meta(self, event_id, meta) -> bool:
+        """只更新控制字段（meta_json），不动正文；单源规则 C12。"""
+        with self._c() as c:
+            cur = c.execute("UPDATE event_cards SET meta_json=? WHERE event_id=?",
+                            (json.dumps(meta or {}, ensure_ascii=False), event_id))
+            return cur.rowcount > 0
+
+    def get_card_meta(self, event_id) -> dict:
+        with self._c() as c:
+            row = c.execute("SELECT meta_json FROM event_cards WHERE event_id=?",
+                            (event_id,)).fetchone()
+        try:
+            return json.loads(row["meta_json"] or "{}") if row else {}
+        except (TypeError, ValueError):
+            return {}
+
     def next_turn(self, sid, cid):
         """手工卡/手工词条的轮次：排在已归档内容之后，不动归档游标。"""
         with self._c() as c:
@@ -2299,6 +2328,17 @@ class RPContextMiddleware:
         if self.output_reserve >= self.max_tokens:
             self.output_reserve = self.max_tokens // 2
         self.budget = self.max_tokens - self.output_reserve  # 水位作用在扣掉输出预留后的预算上
+        # 梯度记忆与压缩（方案 C1/C8）：默认关闭；shadow 只记录不改变 prompt。
+        self.compression_on = (os.environ.get("RP_COMPRESSION_ENABLED") or "0"
+                               ).strip().lower() not in {"0", "false", "no", "off"}
+        self.compression_shadow = (os.environ.get("RP_COMPRESSION_SHADOW") or "1"
+                                   ).strip().lower() not in {"0", "false", "no", "off"}
+        self.gradient_on = gradient.enabled() and self.compression_on
+        self.gradient_real = self.gradient_on and not self.compression_shadow
+        self.budget_cfg = context_budget.load_budget()
+        self._last_used = {}                           # (sid,cid) -> 本轮 prompt token 实测/估算
+        self._ask_gate = (os.environ.get("RP_ASK_GATE") or "1").strip().lower() not in {
+            "0", "false", "no", "off"}
         self.profile = profile
         self.recent_limit, self.recall_limit = recent_limit, recall_limit
         self.guard_retry = guard_retry                 # 人设硬违规重生成次数（决策 3）
@@ -2449,7 +2489,8 @@ class RPContextMiddleware:
         try:
             turns = self.db.get_turns(target["session_id"], target["character_id"],
                                       int(target["turn_start"]),
-                                      int(target["turn_end"]))
+                                      int(target["turn_end"]),
+                                      include_archived=True)
         except Exception as e:                    # noqa: BLE001
             logger.warning("工具 query_memory 展开原文失败 sid=%s：%s", sid, e)
             return "读原文失败，这次没展开。"
@@ -2578,6 +2619,13 @@ class RPContextMiddleware:
             turn = max(self.db.max_turn(sid, cid), self._fallback_turn.get((sid, cid), 0)) + 1
             self.db.add_turn(sid, cid, turn, "user", stored_input, source)  # P0-4：回复前先落库
             user_stored = True
+            if self.compression_on:                # C5：主人这句话更新封口状态
+                try:
+                    sealing.observe_safety(self.db, cid, user_input)
+                    sealing.observe(self.db, cid, user_input,
+                                    default_topic=questions.topic_of(user_input))
+                except Exception as exc:           # noqa: BLE001 封口失败不拖垮对话
+                    logger.warning("封口状态更新失败 sid=%s cid=%s：%s", sid, cid, exc)
             if retriever.pin_intent(user_input):                   # 显式「记住这件事」
                 self._maybe_pin(sid, cid, user_input)
             msgs = self._build_messages(persona, sid, cid, upto=turn - 1,
@@ -2600,6 +2648,25 @@ class RPContextMiddleware:
                 reply = reply_filter(reply) or reply
             except Exception:                  # noqa: BLE001  清洗失败不能影响回复
                 logger.exception("回复清洗失败 sid=%s cid=%s", sid, cid)
+        if self.compression_on and self._ask_gate:   # C4-02：服务端重问门禁
+            try:
+                topic = questions.topic_of(user_input)
+                evidence = questions.evidence_for(self.db, cid, user_input, topic)
+
+                def _rewrite(old, blocked, _msgs=msgs):
+                    note = ("【防重复】下面这些问法已经问过，且没有新证据："
+                            + "；".join(blocked)
+                            + "。请重写回复：保留陈述与关心，不要再问同样的问题；"
+                            "可以换成更小的动作或直接陈述你知道的。")
+                    return self.front.chat(list(_msgs) + [
+                        {"role": "assistant", "content": old},
+                        {"role": "system", "content": note}])
+
+                reply, _verdict = questions.gate_reply(
+                    reply, self.db, cid, user_input, rewriter=_rewrite,
+                    evidence_id=evidence, topic=topic)
+            except Exception as exc:              # noqa: BLE001 门禁失败不能吞掉回复
+                logger.warning("重问门禁异常 sid=%s cid=%s：%s", sid, cid, exc)
         # 上下文构建失败（如召回代码报错）不等于库写失败：用户轮已落库就要接着存回复，
         # 否则这一轮会从记忆里凭空消失（2026-10-30 视频报告丢失事故）。
         if user_stored:
@@ -2611,6 +2678,11 @@ class RPContextMiddleware:
                     except Exception:            # noqa: BLE001  清洗失败就按原样存
                         stored_reply = reply
                 self.db.add_turn(sid, cid, turn, "assistant", stored_reply, source)
+                if self.compression_on:            # C6：按轮登记 7 天保留期
+                    try:
+                        retention.register_round(self.db, sid, cid, turn)
+                    except Exception as exc:       # noqa: BLE001 保留登记失败不阻断
+                        logger.warning("保留期登记失败 sid=%s cid=%s：%s", sid, cid, exc)
                 hi = turn - self.keep_recent
                 if hi >= 1:                                # R2：只投递 hi，批次由 worker 决定
                     self._last_hi[(sid, cid)] = max(self._last_hi.get((sid, cid), 0), hi)
@@ -2917,7 +2989,20 @@ class RPContextMiddleware:
         lg, cursor = self._ledger(sid, cid), self.db.get_cursor(sid, cid)
         floor = max(cursor, self._floor.get((sid, cid), 0))   # 手术挤出过的轮次不再回到 prompt
         # 热对话 = 游标 / 手术 floor 之后、且不含当前轮（当前轮由调用方追加）
-        turns = self.db.get_turns(sid, cid, lo=floor + 1, hi=upto)
+        lo_turn = floor + 1
+        if self.gradient_real:
+            # C8-03：open episode 锚定，原文不因水位移出；超限先 checkpoint split
+            try:
+                lo_turn = max(lo_turn, gradient.hot_lo(self.db, sid, cid, floor + 1))
+                open_start = gradient.open_episode_start(self.db, sid, cid, lo_turn)
+                cut = gradient.checkpoint_split(self.db, sid, cid, open_start, upto or 0)
+                if cut > open_start:
+                    lo_turn = max(lo_turn, cut)
+                    logger.info("open episode checkpoint split sid=%s cid=%s 后半段从 t%d 起",
+                                sid, cid, cut)
+            except Exception as exc:                  # noqa: BLE001 锚定失败退回旧热窗
+                logger.warning("open episode 锚定失败 sid=%s cid=%s：%s", sid, cid, exc)
+        turns = self.db.get_turns(sid, cid, lo=lo_turn, hi=upto)
         raw_cards = self.db.recent_cards(sid, cid, self.recent_limit)   # 事件卡按 session 过滤（P0-2）
         shown = {c["event_id"] for c in raw_cards}                      # 排除集按「全部已注入」算，含被隔离的
         cards, quarantined = self._injectable(raw_cards)
@@ -3175,6 +3260,48 @@ class RPContextMiddleware:
                            for t, w, c in assoc_notes)
                 + "。这是根据标签推断的线索，不是确证；对不上当前话题就只当模糊印象，"
                 "不要编造细节。")
+        if self.gradient_real:
+            # C8-03：L1 open 原子必进；closed 高分原子与 L3 时间桶按预算补
+            try:
+                open_ep = raw_cards[0]["event_id"] if raw_cards else None
+                picked = gradient.select_for_prompt(self.db, cid, open_episode=open_ep)
+
+                def _line(u):
+                    c = u.get("content_json") or {}
+                    if str(c.get("kind") or "") == "bucket":
+                        return (f"- {u.get('bucket_key') or ''} · {c.get('topic') or ''}"
+                                f" · {c.get('conclusion') or ''}")
+                    when = f"（{c.get('when')}）" if c.get("when") else ""
+                    nxt = f"；下一步：{c.get('next')}" if c.get("next") else ""
+                    return (f"- [{c.get('atom_type') or '事实'}] {c.get('what') or ''}"
+                            f"{when}{nxt}")
+
+                if picked["open"]:
+                    sections.append((4, 0.0, {
+                        "role": "system",
+                        "content": ("【当前事件原子】" + MEMORY_LABEL + "\n"
+                                    + "\n".join(_line(u) for u in picked["open"][:12]))}))
+                if picked["strong"]:
+                    sections.append((3, 0.0, {
+                        "role": "system",
+                        "content": ("【高分长期原子】" + MEMORY_LABEL + "\n"
+                                    + "\n".join(_line(u) for u in picked["strong"][:8]))}))
+                if picked["buckets"]:
+                    sections.append((1, 0.0, {
+                        "role": "system",
+                        "content": ("【时间线·较远记忆】" + MEMORY_LABEL + "\n"
+                                    + "\n".join(_line(u) for u in picked["buckets"]))}))
+            except Exception as exc:                  # noqa: BLE001 选层失败退回原注入
+                logger.warning("梯度注入失败 sid=%s cid=%s：%s", sid, cid, exc)
+            try:
+                note = questions.prompt_note(self.db, cid)
+                if note:
+                    anchors[1]["content"] += note
+                seal_note = sealing.prompt_note(self.db, cid)
+                if seal_note:
+                    anchors[1]["content"] += seal_note
+            except Exception as exc:                  # noqa: BLE001
+                logger.warning("账本/封口注入失败 sid=%s cid=%s：%s", sid, cid, exc)
         recent, prev_dt = [], None                          # 热窗时间标注：见 _stamp / RECENT_GAP_SECONDS
         now = datetime.now().astimezone()
         has_source = bool(source_label(source)) or any(
@@ -3201,7 +3328,7 @@ class RPContextMiddleware:
             if dt is not None:
                 prev_dt = dt
         out, dropped, level = self._fit(anchors, sections, recent, sid, cid)
-        self._annotate_budget(out)
+        self._annotate_budget(out, sid, cid)
         if dropped and turns:                          # 手术确实丢了轮次才投；level 仅用于可读
             f = max(self._floor.get((sid, cid), 0), turns[dropped - 1]["turn_idx"])
             self._floor[(sid, cid)] = f
@@ -3273,7 +3400,7 @@ class RPContextMiddleware:
         self._q.put((sid, cid, floor))
         return True
 
-    def _annotate_budget(self, out) -> None:
+    def _annotate_budget(self, out, sid="", cid="") -> None:
         """在状态账本尾补一行「上下文用掉多少 / 模型账户还剩多少」。
 
         余额查询带 TTL 缓存；查不到（自定义接口/网络失败）就只写水位，
@@ -3282,6 +3409,13 @@ class RPContextMiddleware:
         if self.budget <= 0:
             return
         used = sum(est_tokens(str(m.get("content") or ""), self.profile) for m in out)
+        if sid and cid:
+            try:
+                if not hasattr(self, "_last_used"):
+                    self._last_used = {}
+                self._last_used[(sid, cid)] = used
+            except Exception:                  # noqa: BLE001 测试桩没有可写属性
+                pass
         try:
             import llm as llm_mod
             bal = llm_mod.balance_cached()
@@ -3858,7 +3992,7 @@ class RPContextMiddleware:
         """归档一个闭区间。LLM 调用/校验失败 → 记 attempts + last_error，返回 False。"""
         lg = None
         try:
-            turns = self.db.get_turns(sid, cid, lo, hi)
+            turns = self.db.get_turns(sid, cid, lo, hi, include_archived=True)
             fields, err = (None, None)
             if turns:                                  # 区间为空则跳过后台调用，直接推进游标
                 lg = copy.deepcopy(self._ledger(sid, cid))   # 在副本上算，事务成功才换入
@@ -3905,8 +4039,11 @@ class RPContextMiddleware:
             if float(fields.get("confidence", 0.8)) < 0.7:   # 模型自评低置信：留痕便于人工复核
                 logger.warning("低置信事件卡 sid=%s cid=%s 区间=%d-%d confidence=%.2f",
                                sid, cid, lo, hi, float(fields["confidence"]))
-            fulfilled, unmatched, restated = self._apply_state(
-                lg, card["state_changes"], turn=hi, evidence=card["summary"])
+            stance_text = "\n".join(str(t.get("content") or "") for t in turns
+                                    if t.get("role") == "user")
+            fulfilled, unmatched, restated, added = self._apply_state(
+                lg, card["state_changes"], turn=hi, evidence=card["summary"],
+                stance_text=stance_text)
             # 这张卡被承诺状态机接受为兑现证据 → 它是一张「被确认过」的卡。
             # 显著性只用于同分排序，不改正文，也不代表模型觉得它更重要。
             card["verified"] = 1 if fulfilled else 0
@@ -3933,13 +4070,15 @@ class RPContextMiddleware:
                             len(card["state_changes"].get("pending_promises") or []),
                             len(card["state_changes"].get("resolved_promises") or []),
                             len(facts), card["summary"][:60])
+                if self.gradient_on:                   # C3/C8：落 L1 原子 + 闭环 + 归档审核
+                    self._learn_episode(sid, cid, card, turns, added)
         else:
             self.db.advance_cursor(sid, cid, lo, hi)   # 空区间：无卡无账本，游标+清失败同一事务
         return True
 
-    def _apply_state(self, lg, sc, turn, evidence=""):
+    def _apply_state(self, lg, sc, turn, evidence="", stance_text=""):
         """账本应用（delta 语义，见 P0-3 裁定）。只改传入副本，返回
-        (lg, 未匹配的兑现文本, 同批仅重申的承诺 ID)。
+        (lg, 未匹配的兑现文本, 同批仅重申的承诺 ID, 本轮新建承诺 ID)。
 
         承诺以账本为唯一权威：后台模型的 pending/resolved 只是提议，这里确定性提交。
         """
@@ -3953,13 +4092,84 @@ class RPContextMiddleware:
             lg["mood"] = promise.sanitize(sc["mood"], 20)
         if sc.get("location"):
             lg["location"] = promise.sanitize(sc["location"], 80)
-        promise.add_pending(lg, sc.get("pending_promises") or [], turn)  # 先建后兑，覆盖同批
+        added = promise.add_pending(lg, sc.get("pending_promises") or [], turn)  # 先建后兑，覆盖同批
+        if stance_text:                             # C2-03：主人态度 → PAUSED/DORMANT
+            promise.apply_stance(lg, stance_text, turn)
         _, unmatched, restated = promise.resolve(lg, sc.get("resolved_promises") or [], turn,
                                                  evidence=evidence)
         moved = promise.evict(lg, turn)             # 兑现出账 + TTL 40 / 活跃 ≤8 / strict ≤12
         if moved:                                   # Gemini C：dormant/expired 必须可观测
             logger.info("承诺移出活跃池 turn=%d：%s", turn, "；".join(moved))
-        return lg, unmatched, restated
+        return lg, unmatched, restated, added
+
+    @staticmethod
+    def _episode_closure(card, turns) -> str:
+        """C2-02：闭环判定；拿不准一律 OPEN。承诺未兑现不阻止闭环。"""
+        text = "\n".join(str(t.get("content") or "") for t in turns or ())
+        if re.search(r"(先别|等我|等下|先搁着|回头再说|我一会|等我回来|先不聊|"
+                     r"别结束|暂停)", text):
+            return "OPEN"
+        return "CLOSED"
+
+    def _learn_episode(self, sid, cid, card, turns, added_promises=()) -> None:
+        """归档后：落 L1 原子、判闭环、写卡 meta、跑四道关、按水位降级。
+
+        控制层与内容层都在同一进程写；任何一步失败只告警，不推翻已归档的卡。
+        """
+        try:
+            closure = self._episode_closure(card, turns)
+            retention_until = (datetime.now(timezone.utc) + timedelta(days=7)
+                               ).isoformat(timespec="seconds")
+            thread_id = "thr_" + hashlib.sha1(str(cid).encode("utf-8")).hexdigest()[:10]
+            control.upsert_thread(self.db, cid, "会话主线", state="OPEN",
+                                  thread_id=thread_id)
+            result = compression.write_atoms(self.db, sid, cid, card, turns,
+                                             retention_until=retention_until)
+            atoms = result.get("atoms") or []
+            cover = result.get("coverage") or {}
+            top = max([int(u.get("salience") or 0)
+                       for u in control.list_units(self.db, cid,
+                                                   episode_id=card["event_id"], limit=50)]
+                      or [int(round(float(card.get("importance") or 0.5) * 100))])
+            meta = {
+                "thread_id": thread_id,
+                "episode_id": card["event_id"],
+                "commitment_ids": list(added_promises or ()),
+                "must_keep_atoms": result.get("atom_ids") or [],
+                "coverage": {"must_keep_present": cover.get("must_keep_present", 0),
+                             "must_keep_total": cover.get("must_keep_total", 0)},
+                "source_turns": [[int(card.get("turn_start") or 0),
+                                  int(card.get("turn_end") or 0)]],
+                "retention_until": retention_until,
+                "miscompressed": result.get("flags") or [],
+                "closure_state": closure if not self.compression_shadow else "OPEN",
+                "shadow_closure": closure,
+                "level": 2,
+                "salience": top,
+                "floor_level": 1,
+                "rewrite_count": 0,
+                "frozen": 0,
+            }
+            self.db.update_card_meta(card["event_id"], meta)
+            if self.compression_shadow:
+                logger.info("压缩 shadow sid=%s cid=%s 卡=%s 本会闭环=%s 原子=%d 覆盖=%s",
+                            sid, cid, card["event_id"], closure, len(atoms),
+                            f"{cover.get('must_keep_present', 0)}/"
+                            f"{cover.get('must_keep_total', 0)}")
+                return
+            used = self._last_used.get((sid, cid), 0)
+            if context_budget.should_compress(used, self.budget_cfg):
+                reports = compression.maybe_compress(
+                    self.db, sid, cid, used, self.budget_cfg,
+                    shadow=self.compression_shadow)
+                if reports:
+                    logger.info("压缩降级 sid=%s cid=%s 单元=%d（used=%d high=%d）",
+                                sid, cid, len(reports), used, self.budget_cfg.high)
+            # 7 天到期且未 pin 的原文软归档；无 L1 的会被 pin 住，不制造空洞
+            retention.prune(self.db, cid)
+        except Exception as exc:                  # noqa: BLE001 梯度落格失败不推翻归档
+            logger.warning("梯度记忆落格失败 sid=%s cid=%s 卡=%s：%s: %s",
+                           sid, cid, card.get("event_id"), type(exc).__name__, exc)
 
     def _wait_cursor(self, sid, cid, lo, end, deadline, poll=0.25) -> bool:
         """等本批落库。若该区间已记失败则立刻返回，避免在坏批次上空转到超时。"""

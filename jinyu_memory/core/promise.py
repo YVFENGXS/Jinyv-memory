@@ -114,8 +114,79 @@ def ensure_shape(lg):
             lg["pseq"] += 1
             ps[i] = {"id": f"P-{lg['pseq']:03d}", "text": p,
                      "created_turn": 0, "strict": is_strict(p)}
+        # 长期承诺生命周期字段（C2-03）：老条目就地补默认值，不迁移数据
+        p.setdefault("status", "ACTIVE")
+        p.setdefault("blocker", "")
+        p.setdefault("master_stance", "")
+        p.setdefault("next_action", "")
+        p.setdefault("next_check_at", "")
+        p.setdefault("last_discussed_at", "")
+        p.setdefault("last_asked_at", "")
+        p.setdefault("ask_count", 0)
+        p.setdefault("source_turns", [])
+        p.setdefault("review_policy", "trigger")
     lg["promises"] = ps
     return lg
+
+
+PAUSE_WORDS = re.compile(r"(先搁着|先放放|先放着|先别管|先不提|以后再说|过阵子再说|"
+                         r"再等等|等以后)")
+NOPUSH_WORDS = re.compile(r"(别催|不用催|不要催|别推|不用推|别提醒|不用提醒|"
+                          r"别老提|不要老提)")
+LONG_TERM = re.compile(r"(以后|长期|将来|将来有一天|未来|计划|打算|等有空|"
+                       r"有朝一日|慢慢来)")
+
+
+def apply_stance(lg, text, turn):
+    """从主人这句话更新承诺的主人态度（PAUSED / DORMANT / ACTIVE）。
+
+    只认明确措辞；拿不准不动。长期承诺第二次「再等等」后转 DORMANT，
+    避免每两天催一次（方案 6.5 / 10.4）。
+    """
+    ensure_shape(lg)
+    t = str(text or "")
+    pause = PAUSE_WORDS.search(t)
+    nopush = NOPUSH_WORDS.search(t)
+    longterm = LONG_TERM.search(t)
+    for p in lg["promises"]:
+        if not pause and not nopush:
+            continue
+        p["last_discussed_at"] = str(turn)
+        p["master_stance"] = "先搁着" if pause else "不想被催"
+        # 长期计划（承诺正文里就写着「以后/长期/计划」）按 30 天节奏
+        long_plan = bool(longterm or LONG_TERM.search(p.get("text") or ""))
+        if pause:
+            if p.get("status") == "PAUSED" and (long_plan or p.get("review_policy") == "30d"):
+                p["status"] = "DORMANT"
+                p["review_policy"] = "30d"
+            else:
+                p["status"] = "PAUSED"
+                p["review_policy"] = "30d" if (long_plan or p.get("strict")) else "trigger"
+        elif nopush:
+            p["status"] = "DORMANT"
+            p["review_policy"] = "trigger"
+    return lg
+
+
+def set_lifecycle(lg, promise_id, status=None, blocker=None, next_action=None,
+                  next_check_at=None, stance=None):
+    """显式更新承诺生命周期字段（管理员/醒来动作可用）；返回是否命中。"""
+    ensure_shape(lg)
+    for p in lg["promises"]:
+        if p.get("id") != promise_id:
+            continue
+        if status:
+            p["status"] = status
+        if blocker is not None:
+            p["blocker"] = str(blocker)[:60]
+        if next_action is not None:
+            p["next_action"] = str(next_action)[:60]
+        if next_check_at is not None:
+            p["next_check_at"] = str(next_check_at)[:40]
+        if stance is not None:
+            p["master_stance"] = str(stance)[:20]
+        return True
+    return False
 
 
 def add_pending(lg, texts, turn):

@@ -16,7 +16,7 @@
 - 章节卡：Dream 把 30 天前的明细卡按车道（跨 epoch）/受众/bot/知识边界并成 T2 章节卡；明细卡保留，仍可展开
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
 - 自主作息（`RP_AUTONOMY=1`）：每小时报点可静默 pass；23:30 规划次日、00:05 兜底；每天 3–5 次自己醒来（白天 ≥2、夜间 ≥1），醒来可查记忆、给词条打分、改删补词条与事件卡、判重合并，也能上网 / 看 B 站、按天限量自己搜一张图看（T2 奢侈品），报告、意图、日记全部有字数硬上限
-- 115 项回归测试，不依赖任何 API key
+- 125 项回归测试，不依赖任何 API key
 
 ---
 
@@ -35,6 +35,15 @@ jinyu-memory/
 │       ├── summarizer.py    #     后台归纳与校验
 │       ├── promise.py       #     承诺生命周期
 │       ├── conflict.py      #     跨会话矛盾消解
+│       ├── control.py       #     控制层：线程/审核/问题账本/保留/梯度单元
+│       ├── context_budget.py #    工作预算：USABLE / HIGH / LOW / HARD
+│       ├── scoring.py       #     前台/后台评分 + 硬地板
+│       ├── gradient.py      #     L1–L4 梯度阶梯、时间桶、冻结、无洞审计
+│       ├── compression.py   #     must-keep 原子、覆盖率、四道关
+│       ├── questions.py     #     问题指纹与服务端重问门禁
+│       ├── sealing.py       #     封口状态机与 topic×mode 矩阵
+│       ├── retention.py     #     原文 7 天保留、pin、软归档
+│       ├── status.py        #     压缩观测快照
 │       ├── persona.py       #     人设单源（换成你自己的角色）
 │       ├── persona_guard.py #     人设硬规则校验/重生成
 │       ├── host.py          #     框架中立宿主：chat / remember / recall
@@ -42,7 +51,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ（走 JinyuHost）
-├── tests/test_regression.py # 115 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽、音乐测量、自主作息）
+├── tests/test_regression.py # 125 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽、音乐测量、自主作息、梯度记忆与压缩）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── serve.py             # 宿主 HTTP 服务：/chat /remember /recall（零依赖）
@@ -92,7 +101,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限、跨 epoch 召回池、本地音乐测量、一年期提醒、自主报点/计划/醒来、醒来记忆整理动作等 115 项场景（服务器实测 18 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限、跨 epoch 召回池、本地音乐测量、一年期提醒、自主报点/计划/醒来、醒来记忆整理动作，以及控制层 schema、工作预算、评分地板、梯度冻结、must-keep 覆盖、问题账本、封口矩阵、原文 pin/软归档等 125 项场景（服务器实测 18 秒）。
 
 ## 评测结果（可复现）
 
@@ -172,7 +181,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 115 项回归
+python tests/test_regression.py                        # 125 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -426,6 +435,12 @@ NapCat 与 NoneBot 的启动顺序不敏感：反了也会在约 30 秒后自动
 | `RP_POKE_COOLDOWN` | `30` | 同一人两次戳的最小间隔（秒），防连戳与机器人对戳 |
 | `RP_BUBBLES` | `1` | 回复是否按句拆成多条气泡发送；`0` 整条一次发出 |
 | `RP_BUBBLE_MAX` | `10` | 一条回复最多拆成几条气泡，超出部分并到最后一条 |
+| `RP_COMPRESSION_ENABLED` | `0` | 梯度记忆/压缩总开关；`0` 完全走原有热窗 |
+| `RP_COMPRESSION_SHADOW` | `1` | `1` 只记录「本会闭环/本会压缩」；`0` 才真正降级与改 prompt |
+| `RP_CONTEXT_MODEL_MAX` | `1000000` | 模型宣称上限，只当天花板，不当水位分母 |
+| `RP_CONTEXT_WORK_BUDGET` | `65536` | 实际工作预算；`USABLE = WORK - 输出预留 - 固定预留` |
+| `RP_ASK_GATE` | `1` | 服务端重问门禁；无证据/同指纹同理由在最小间隔内拦下 |
+| `RP_TURN_RETENTION_DAYS` | `7` | 原文按单条 turn 保留天数；引用/复核/must-keep 会 pin 住 |
 | `RP_ASR` | `1` | 语音转文字开关；没配 `RP_ASR_KEY` 时自动不生效 |
 | `RP_ASR_KEY` | 空 | SiliconFlow 密钥，用于语音转写（SenseVoice） |
 | `RP_ASR_MODEL` | `FunAudioLLM/SenseVoiceSmall` | 转写模型 |
@@ -483,6 +498,20 @@ NapCat 与 NoneBot 的启动顺序不敏感：反了也会在约 30 秒后自动
 
 - **一句一气泡**：回复先按换行拆，再按句末标点（`。！？!?`）拆，**每个句号结尾就是一条气泡**，不再把「嗯。」「好。」这类短句并回上一条，也不把整段话塞进一条。`RP_BUBBLE_MAX`（默认 10）是单条回复的气泡上限，超过的并到最后一条——一次刷十几条容易触发 QQ 风控。
 - **联网搜索先压关键词**：`web_search` 会先剥掉「请问 / 帮我查一下 / 是什么 / 为什么」这类问句外壳和标点，拿压缩后的关键词去查；只有关键词搜空时才退回原句再试一次。整句原样丢给必应容易被「主人」「是什么」这类噪声词带偏，压缩后命中率明显更高。搜索结果的说明里会写实际使用的关键词，搜空时提示换成更短的关键词。
+
+### 梯度记忆与热上下文压缩（默认关闭 / 先 shadow）
+
+解决「聊着聊着就忘了、又问一遍」不是靠加大窗口，而是把分辨率分档、把问题账本独立出来。默认 `RP_COMPRESSION_ENABLED=0`，行为与旧版一致；打开后先 `RP_COMPRESSION_SHADOW=1` 只记录，确认日志再设 `0` 真压。
+
+- **L0–L4 五档**：L0 原文（`turns`）、L1 单条事实原子、L2 事件卡（既有 `event_cards`）、L3 时间桶、L4 索引。越近越细，越远越粗；高评分原子停在 L1，低分闲聊最终只剩「时间 + 主题 + 结论」。
+- **评分**：前台快评 0.4 + 后台细评 0.6，只有一边时权重归一；医疗/安全 95、承诺/外部节点 90、偏好/边界 88、冲突/关系 85 的硬地板由规则钉死，模型打低分也不降。
+- **只降不升、到地板冻结**：每个单元最多 3 次改写，到 `floor_level` 后写 `frozen_hash`，自动任务不再改内容；纠错只能新建版本。
+- **must-keep 100%**：医疗、承诺、外部节点、偏好/边界、冲突、安全、关系原子必须全部落在 L1；覆盖率不足即拒绝压缩稿并 pin 原文。四道关：来源可追溯、硬信息+覆盖、压歪+压漏、冲突进清单。
+- **问题账本**：同指纹同理由在按 topic 的弹性间隔内（短期医疗约 2 天、一般约 3 天、长期规划 30 天）不再问；没有 `evidence_id` 的一律记 `owed`，不发。安全/急症与主人直接提问旁路。
+- **封口权**：`PAUSE_2D`（先搁着，48h 不催不推不建议，物流可问）/ `NO_PUSH`（不催不推，建议最多一次）/ `TOTAL_SILENCE`（只有明确「一个字不提」才全禁）；安全事件可越过封口。
+- **原文保留**：按单条 turn 7 天；引用、复核、must-keep 期间 pin 住。到期只软归档（`archived_at`），不硬删，仍可用 `query_memory` 回捞。
+- **open episode 锚定**：正在聊的事不因 token 水位移出 prompt；超过 `RP_OPEN_EPISODE_MAX_TOKENS` 先在自然断点 checkpoint split，不静默截断。
+- **观测**：`/compress status` 看单元档位、审核通过/拒绝、无洞过期、问题账本、评分膨胀与预算；`/compress prune` 手动跑一次原文清理。离线实验：`python tools/exp_hot_window.py`、`python tools/exp_gradient.py`。
 
 ### 自主作息（`RP_AUTONOMY=1`）
 
@@ -556,6 +585,8 @@ RP_SESSION=qq-u你的QQ号        # 自主消息默认发到这里
 | `/memory card del <编号>` | 删事件卡 |
 | `/memory card add <正文>` | 手工补一张事件卡 |
 | `/memory log [编号]` | 合并记录列表 / 单条详情 |
+| `/compress`（`/压缩`） | 梯度记忆状态：单元档位、审核通过/拒绝、无洞过期、问题账本、评分膨胀与预算 |
+| `/compress prune` | 手动跑一次原文保留清理（7 天到期且未 pin 的软归档） |
 
 ### 去重合并（管理员）
 
@@ -664,6 +695,7 @@ sqlite3 /opt/qqbot/data/rp_memory.db ".backup '/opt/qqbot/backup/rp-$(date +%F).
 - 每条消息一次前台调用 + 每 2 轮一次后台调用，注意成本
 - 第三方协议端有封号风险，请使用小号并自行评估
 - 贴纸库不做自动删除（它是资产，不是临时文件）
+- 梯度记忆默认关闭（`RP_COMPRESSION_ENABLED=0`）；评分、闭环判定、问题指纹与封口识别目前是规则近似，不是模型语义判定。先用 shadow 跑几天，确认审核通过率与「本会闭环」记录后再开真实降级
 
 ## 十、常见问题
 

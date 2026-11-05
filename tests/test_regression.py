@@ -23,8 +23,18 @@ import dream
 import embedding
 import llm
 import music
+import promise
 import retriever
 import summarizer
+import compression
+import context_budget
+import control
+import gradient
+import questions
+import retention
+import scoring
+import sealing
+import status
 from rp_skeleton import (DB, RPContextMiddleware, est_tokens, _human_gap,
                          _now_line, _stamp, _to_midnight,
                          MAX_TOOL_STEPS, TOOL_RESULT_CHARS, TOOL_LABEL)
@@ -4155,6 +4165,275 @@ def test_autonomy_memory_actions():
     print("R102 自主记忆整理: OK 动作放行 / 打分写回词条")
 
 
+def test_long_term_commitment_lifecycle():
+    """C2-03：长期承诺 ACTIVE→PAUSED→DORMANT，不套 2 天催办节奏。"""
+    lg = {"promises": [{"id": "P-001", "text": "以后一起整理旅行计划",
+                        "created_turn": 1, "strict": False}]}
+    promise.ensure_shape(lg)
+    p = lg["promises"][0]
+    assert p["status"] == "ACTIVE" and p["review_policy"] == "trigger"
+    promise.apply_stance(lg, "旅行的事先搁着", 2)
+    assert p["status"] == "PAUSED" and p["review_policy"] == "30d", p
+    promise.apply_stance(lg, "再等等", 3)
+    assert p["status"] == "DORMANT", p            # 第二次搁置转 DORMANT，不每两天催
+    assert promise.set_lifecycle(lg, "P-001", status="BLOCKED",
+                                 blocker="等预算", next_action="列预算",
+                                 next_check_at="主人提到旅行", stance="先搁着")
+    assert p["blocker"] == "等预算" and p["next_action"] == "列预算"
+    assert p["next_check_at"] == "主人提到旅行"
+    print("C2-03 长期承诺: OK ACTIVE/PAUSED/DORMANT / blocker / next_check")
+
+
+def test_compression_schema_and_single_source():
+    """C0-01 / C0-02：控制层建表幂等、event_cards 有 meta_json、无正文字段。"""
+    db = fresh("/tmp/rp_comp_schema.db")
+    required = {"threads", "compression_reviews", "question_ledger",
+                "turn_retention", "memory_units", "memory_rewrites", "seal_state"}
+    with db._c() as c:
+        names = {r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(event_cards)")}
+        turncols = {r["name"] for r in c.execute("PRAGMA table_info(turns)")}
+    assert required <= names, (required - names)
+    assert "meta_json" in cols and "archived_at" in turncols, (cols, turncols)
+    assert control.single_source_audit(db) == []
+    DB(db.path)
+    DB(db.path)                              # 重复升级不报错、不丢表
+    print("C0 控制层: OK 建表 / meta_json / 软归档列 / 单源审计")
+
+
+def test_context_budget():
+    """C1-01：1M 不当水位分母；HIGH/LOW/HARD 与分区预算。"""
+    b = context_budget.Budget(work_budget=65536, reserve_output=4096,
+                              reserve_fixed=6000)
+    assert b.usable == 55440, b.usable
+    assert b.high == 41580 and b.low == 30492 and b.hard == 65536
+    assert b.level(30000) == "low" and b.level(45000) == "compress"
+    assert b.level(70000) == "over"
+    assert b.section_budgets()["closed_cards"] == int(55440 * 0.20)
+    keys = ("RP_CONTEXT_MODEL_MAX", "RP_CONTEXT_WORK_BUDGET",
+            "RP_CONTEXT_RESERVE_OUTPUT", "RP_CONTEXT_RESERVE_FIXED")
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ.update({"RP_CONTEXT_MODEL_MAX": "1000000",
+                           "RP_CONTEXT_WORK_BUDGET": "65536",
+                           "RP_CONTEXT_RESERVE_OUTPUT": "4096",
+                           "RP_CONTEXT_RESERVE_FIXED": "6000"})
+        loaded = context_budget.load_budget()
+        assert loaded.model_max == 1000000 and loaded.work_budget == 65536
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("C1 预算: OK USABLE/HIGH/LOW/HARD / 1M 只当天花板")
+
+
+def test_scoring_floor_and_inflation():
+    """C8-01：加权、单边归一、硬地板覆盖模型分、膨胀阈值。"""
+    assert scoring.hard_floor("medical") == 95
+    assert scoring.hard_floor("commitment") == 90
+    assert scoring.combine(None, 80) == (80, "back")
+    assert scoring.combine(40, None) == (40, "front")
+    score, source = scoring.effective_score("medical", 10, 20)
+    assert score == 95 and source == "rule", (score, source)
+    assert scoring.floor_level(90) == 1 and scoring.floor_level(70) == 2
+    assert scoring.floor_level(50) == 3 and scoring.floor_level(20) == 4
+    assert scoring.inflation_ratio([90, 85, 20, 30]) == 0.5
+    assert scoring.inflation_guard([90, 85, 20, 30]) is True
+    assert scoring.detect_type("我最近总头疼，吃了布洛芬") == "medical"
+    assert scoring.detect_type("我答应明天给你带伞") == "commitment"
+    print("C8-01 评分: OK 加权 / 单边归一 / 硬地板 / 膨胀 / 类别")
+
+
+def test_gradient_ladder_and_freeze():
+    """C8-02：只降不升、地板不越界、到地板冻结、改写上界。"""
+    db = fresh("/tmp/rp_comp_gradient.db")
+    eid = db.add_card("s1", "c1", "一段闲聊", turn=2)
+    db.update_card_meta(eid, {"closure_state": "CLOSED"})
+    uid = control.add_unit(db, "c1", "s1", level=1, floor_level=4,
+                           content={"what": "主人随口聊了几句"},
+                           source_turns=[[2, 2]], episode_id=eid, salience=30)
+    r = gradient.demote(db, uid, 4)
+    assert r["changed"] and r["to"] == 4, r
+    unit = control.get_unit(db, uid)
+    assert unit["level"] == 4 and unit["frozen"] == 1 and unit["frozen_hash"]
+    assert gradient.demote(db, uid, 4)["blocked"] == "frozen"
+    # 医疗原子地板 1：不允许降到任何更粗档
+    uid2 = control.add_unit(db, "c1", "s1", level=1, floor_level=1,
+                            content={"what": "头疼，吃了布洛芬"},
+                            source_turns=[[2, 2]], episode_id=eid, salience=95)
+    r2 = gradient.demote(db, uid2, 4)
+    assert not r2["changed"] and r2["blocked"] == "no_downgrade", r2
+    # 改写次数上界：已用满 3 次 → 直接冻结
+    uid3 = control.add_unit(db, "c1", "s1", level=1, floor_level=4,
+                            content={"what": "第三次以后"}, source_turns=[[2, 2]],
+                            episode_id=eid, salience=20)
+    control.update_unit(db, uid3, rewrite_count=3)
+    r3 = gradient.demote(db, uid3, 2)
+    assert r3["blocked"] == "max_rewrites" and r3["frozen"], r3
+    # 未闭环 episode 不参与降级扫描
+    uid4 = control.add_unit(db, "c1", "s1", level=1, floor_level=4,
+                            content={"what": "还在聊"}, source_turns=[[2, 2]],
+                            episode_id="", salience=10)
+    os.environ["RP_GRADIENT_SHADOW"] = "0"
+    try:
+        reports = gradient.ladder(db, "c1", 54000)
+    finally:
+        os.environ.pop("RP_GRADIENT_SHADOW", None)
+    assert not any(x["unit_id"] == uid4 for x in reports), reports
+    print("C8-02 梯度: OK 只降不升 / 地板 / 冻结 / 改写上界 / open 不压")
+
+
+def test_must_keep_atoms_and_coverage():
+    """C3-02 / C3-03：原子落格、覆盖率 100%、审核通过、原文 pin。"""
+    db = fresh("/tmp/rp_comp_atoms.db")
+    turns = [
+        {"turn_idx": 1, "role": "user", "created_at": "2026-11-05 09:00:00",
+         "content": "我最近总头疼，吃了布洛芬，明天要去复诊"},
+        {"turn_idx": 2, "role": "assistant", "created_at": "2026-11-05 09:01:00",
+         "content": "记住了，明天复诊，别忘带医保卡"},
+    ]
+    card = {"event_id": "E-comp01", "turn_start": 1, "turn_end": 2,
+            "summary": "主人头疼吃药，明天复诊",
+            "state_changes": {"pending_promises": ["答应明天陪主人去复诊"]},
+            "entity_hooks": ["复诊", "布洛芬"]}
+    result = compression.write_atoms(db, "s1", "c1", card, turns)
+    assert result["atoms"], result
+    assert result["coverage"]["must_keep_total"] >= 2
+    assert result["coverage"]["ratio"] == 1.0, result["coverage"]
+    units = control.list_units(db, "c1", level=1)
+    assert len(units) >= 2, units
+    assert all(u["floor_level"] == 1 and u["frozen"] == 1
+               for u in units if u["atom_type"] in compression.MUST_KEEP_TYPES)
+    reviews = control.list_reviews(db, "c1")
+    assert reviews and reviews[0]["status"] == "passed", reviews
+    assert control.list_retention(db, "c1"), "must-keep 原文应被 pin"
+    atoms = [
+        {"atom_type": "medical", "what": "头疼，吃了布洛芬", "atom_id": "a1"},
+        {"atom_type": "commitment", "what": "答应明天复诊", "atom_id": "a2"},
+    ]
+    cov = compression.coverage(atoms, "只写了头疼", atom_ids=["a1"])
+    assert cov["must_keep_present"] == 1 and cov["ratio"] == 0.5, cov
+    print("C3 must-keep: OK 原子落格 / 覆盖率 100% / 审核通过 / pin")
+
+
+def test_question_ledger_and_gate():
+    """C4-01 / C4-02：同义指纹、最小间隔拦截、无证据 owed、安全与直答旁路。"""
+    db = fresh("/tmp/rp_comp_question.db")
+    assert questions.fingerprint("你头疼好点了吗") == \
+        questions.fingerprint("你头疼好些了吗")
+    q = "你头疼好些了吗？"
+    questions.remember(db, "c1", [q], "外面下雨了", evidence_id="atom-1",
+                       topic="医疗")
+    v = questions.gate(db, "c1", "你头疼好点了吗？", "外面下雨了",
+                       evidence_id="atom-1", topic="医疗")
+    assert not v["allowed"] and v["blocked"], v
+    v2 = questions.gate(db, "c1", "你还好吗？", "外面下雨了", evidence_id="")
+    assert not v2["allowed"] and v2["owed"], v2
+    v3 = questions.gate(db, "c1", "你现在安全吗？", "我不想活了", evidence_id="")
+    assert v3["allowed"], v3                       # 安全旁路
+    v4 = questions.gate(db, "c1", "你头疼吗？", "今天头疼吗？", evidence_id="")
+    assert v4["allowed"], v4                       # 主人直接提问旁路
+    note = questions.prompt_note(db, "c1")
+    assert "勿重复" not in note or len(note) < 400
+    print("C4 问题账本: OK 同义指纹 / 拦截 / owed / 安全与直答旁路")
+
+
+def test_sealing_matrix():
+    """C5-01 / C5-02：封口状态机、矩阵、48h、模糊默认、安全旁路。"""
+    db = fresh("/tmp/rp_comp_seal.db")
+    assert sealing.detect("药的事先搁着")[1] == "PAUSE_2D"
+    assert sealing.detect("一个字不提")[1] == "TOTAL_SILENCE"
+    assert sealing.detect("不用一个字不提")[1] == "OPEN"
+    assert sealing.detect("别催了")[1] == "NO_PUSH"
+    assert not sealing.allowed("PAUSE_2D", "push")
+    assert sealing.allowed("PAUSE_2D", "logistics")
+    assert not sealing.allowed("TOTAL_SILENCE", "mention")
+    assert not sealing.allowed("TOTAL_SILENCE", "hint")
+    assert sealing.allowed("SAFETY", "hint")
+    assert sealing.allowed("NO_PUSH", "advice", 0)
+    assert not sealing.allowed("NO_PUSH", "advice", 1)
+    hit = sealing.observe(db, "c1", "这件事先搁着")
+    assert hit and hit["status"] == "PAUSE_2D", hit
+    assert sealing.observe(db, "c1", "一个字不提")["status"] == "TOTAL_SILENCE"
+    assert sealing.current(db, "c1", "general") == "TOTAL_SILENCE"
+    print("C5 封口: OK 状态机 / 矩阵 / 否定解除 / 安全旁路")
+
+
+def test_retention_pin_and_soft_archive():
+    """C6-01 / C6-02：按轮保留、无洞 pin、软归档、可恢复。"""
+    db = fresh("/tmp/rp_comp_retention.db")
+    for idx in (1, 2):
+        db.add_turn("s1", "c1", idx, "user", f"第{idx}轮")
+        db.add_turn("s1", "c1", idx, "assistant", f"回{idx}")
+        retention.register_round(db, "s1", "c1", idx)
+    with db._c() as c:
+        c.execute("UPDATE turn_retention SET retention_until='2000-01-01T00:00:00+00:00'"
+                  " WHERE character_id='c1'")
+    r1 = retention.prune(db, "c1")
+    assert r1["archived"] == 0 and r1["pinned"] >= 1, r1      # 无 L1 → 先 pin
+    assert gradient.no_hole_audit(db, "c1")
+    control.add_unit(db, "c1", "s1", level=1, floor_level=1,
+                     content={"what": "两轮原文已落原子"},
+                     source_turns=[[1, 2]], salience=90)
+    with db._c() as c:
+        c.execute("UPDATE turn_retention SET pinned_until=NULL"
+                  " WHERE character_id='c1'")
+    r2 = retention.prune(db, "c1")
+    assert r2["archived"] >= 2, r2
+    assert retention.get_source(db, "s1", "c1", 1, include_archived=False) == []
+    retention.restore(db, "s1", "c1", 1)
+    assert retention.get_source(db, "s1", "c1", 1, include_archived=False)
+    assert retention.audit(db, "c1")["no_hole"] == 0
+    print("C6 保留: OK 无洞 pin / 软归档 / 原文可恢复")
+
+
+def test_compression_pipeline_shadow():
+    """C2/C3/C8 集成：归档落原子、shadow 判闭环、审核通过。"""
+    class MedicalBack(MockBack):
+        def chat(self, messages):
+            return json.dumps({
+                "summary": "主人最近总头疼，吃了布洛芬，答应明天去复诊",
+                "state_changes": {"mood": "平静",
+                                  "pending_promises": ["答应明天陪主人去复诊"]},
+                "entity_hooks": ["复诊", "布洛芬"],
+                "knowledge_boundary": "both"}, ensure_ascii=False)
+
+    keys = ("RP_COMPRESSION_ENABLED", "RP_COMPRESSION_SHADOW", "RP_GRADIENT_SHADOW")
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ.update({"RP_COMPRESSION_ENABLED": "1",
+                           "RP_COMPRESSION_SHADOW": "1",
+                           "RP_GRADIENT_SHADOW": "1"})
+        db = fresh("/tmp/rp_comp_pipeline.db")
+        mw = RPContextMiddleware(MockFront("沈青梧"), MedicalBack(), db,
+                                 keep_recent=1, max_tokens=12000, output_reserve=2000)
+        mw.chat("我最近总头疼，吃了布洛芬，明天要去复诊", PERSONA, "s1", "c1")
+        mw.chat("别忘了明天的复诊", PERSONA, "s1", "c1")
+        mw.shutdown()
+        cards = db.all_cards("s1", "c1")
+        assert cards, "归档应产出事件卡"
+        meta = cards[0]["meta_json"]
+        assert meta.get("shadow_closure") == "CLOSED", meta
+        assert meta.get("closure_state") == "OPEN", meta      # shadow 不真闭环
+        assert meta.get("must_keep_atoms"), meta
+        units = control.list_units(db, "c1", level=1)
+        assert units and any(u["atom_type"] == "medical" for u in units), units
+        reviews = control.list_reviews(db, "c1")
+        assert reviews and reviews[0]["status"] == "passed", reviews
+        snap = status.snapshot(db, "c1")
+        assert snap["units"] >= 1 and snap["budget"]["high"] > 0
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("C2/C3/C8 集成: OK 归档原子 / shadow 闭环 / 审核 / 状态快照")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -4221,7 +4500,13 @@ if __name__ == "__main__":
                test_music_synthetic_wav, test_music_brief_detail_and_time,
                test_music_source_guards, test_music_report_limits,
                test_desktop_remote_smoke,
-               test_chat_stores_reply_when_context_build_fails):
+               test_chat_stores_reply_when_context_build_fails,
+               test_long_term_commitment_lifecycle,
+               test_compression_schema_and_single_source, test_context_budget,
+               test_scoring_floor_and_inflation, test_gradient_ladder_and_freeze,
+               test_must_keep_atoms_and_coverage, test_question_ledger_and_gate,
+               test_sealing_matrix, test_retention_pin_and_soft_archive,
+               test_compression_pipeline_shadow):
         fn()
     print("\nall regression tests passed")
 
