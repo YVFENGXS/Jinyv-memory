@@ -61,8 +61,11 @@
                                     默认自动：装了就用，没装走四帧
   RP_STORYBOARD_DIR                 选填，分镜工具目录，默认 /opt/qqbot/vendor/dsh-video-storyboard
   RP_STORYBOARD_CELLS               选填，分镜格数，默认 9（40 秒以下自动 6 格）
-  RP_TAG_MODEL                      选填，打标视觉模型，默认 deepseek-flash
-  RP_GLM_KEY                        选填，智谱 API key；配置后视觉判读优先用 GLM
+  RP_VISION_KEY / RP_VISION_BASE / RP_VISION_MODEL
+                                    选填，首选视觉模型（秒级出结果，如 DeepSeek
+                                    deepseek-flash）；三项要一起给，没配才走 GLM。
+                                    聊天模型（DeepSeek/火山）看不见图，不配就跳过
+  RP_GLM_KEY                        选填，智谱 API key；首选视觉失败后用它兜底判读
   RP_GLM_MODEL                      选填，GLM 判读模型，默认 glm-5.3-flash
   RP_GLM_BASE                       选填，GLM 接口地址，默认智谱开放平台 v4
   RP_IMG_TEXT_LIMIT                 选填，视觉判读抄录图中文字的上限（字符），默认 4000
@@ -73,6 +76,8 @@
   RP_FACT_MERGE_HOURS               选填，每隔多少小时让后台模型合并重复词条，默认 6，0=关闭
   RP_FACT_MERGE_MIN                 选填，会话事实达到多少条才自动合并，默认 20
   RP_CARD_MERGE_MIN                 选填，会话事件卡达到多少张才自动合并，默认 8
+  RP_MERGE_ANN                      选填，1/0 合并候选先走向量召回（只 shadow 记录），默认 0
+  RP_MERGE_ANN_COS                  选填，词条相似对余弦阈值，默认 0.72
   RP_DREAM                          选填，1/0 开关每日 Dream 整理，默认 1
   RP_DREAM_AT                       选填，Dream 运行时刻 HH:MM，默认 03:30
   RP_BALANCE_ALERT                  选填，模型账户余额降到多少元及以下时，
@@ -147,6 +152,8 @@ from asr import (                                            # noqa: E402
     transcribe as asr_transcribe,
 )
 import bili_live                                             # noqa: E402
+import bubbles as bubbles_mod                                # noqa: E402
+import merge_ann as merge_ann_mod                             # noqa: E402
 from llm import balance as llm_balance, balance_action, from_env, strip_dsml   # noqa: E402
 import dream as dream_mod                                    # noqa: E402
 import embedding                                             # noqa: E402
@@ -278,6 +285,11 @@ _HOST_ROUTES_READY = False
 FACT_MERGE_HOURS = max(0.0, float(os.environ.get("RP_FACT_MERGE_HOURS") or 6))
 FACT_MERGE_MIN = max(2, int(float(os.environ.get("RP_FACT_MERGE_MIN") or 20)))
 CARD_MERGE_MIN = max(2, int(float(os.environ.get("RP_CARD_MERGE_MIN") or 8)))
+# 合并候选先走向量召回（shadow）：只记录「模型没找到、向量找到」的对子，
+# 不改变合并结果和默认行为；阈值 RP_MERGE_ANN_COS 默认 0.72。
+MERGE_ANN = (os.environ.get("RP_MERGE_ANN") or "0").strip().lower() not in {
+    "0", "false", "no", "off"}
+MERGE_ANN_COS = float(os.environ.get("RP_MERGE_ANN_COS") or 0.72)
 # Dream 轻量整理：每天固定时刻收走过期临时事实 + 合并同义词条；0=关闭。
 DREAM_ON = (os.environ.get("RP_DREAM") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
@@ -1367,16 +1379,37 @@ async def _autonomy_send(text: str) -> bool:
 
 def _autonomy_recent() -> dict:
     """给自主作息读最近对话；只读，不触发会话轮换。"""
-    out = {"last_user": "", "last_user_ts": 0.0, "recent": ""}
+    out = {"last_user": "", "last_user_ts": 0.0, "recent": "", "facts": "", "said": ""}
     if mw_plain is None or not _autonomy_sid:
         return out
     try:
         sid = mw_plain.db.latest_sid(_autonomy_sid, CID)
         hi = mw_plain.db.max_turn(sid, CID)
-        rows = mw_plain.db.get_turns(sid, CID, max(1, hi - 6))
+        rows = mw_plain.db.get_turns(sid, CID, max(1, hi - 60))
     except Exception as exc:                    # noqa: BLE001 读不到就当没有
         logger.info(f"[jinyu] 自主读最近对话失败: {exc}")
         return out
+    # 主人近三小时说过的话：词条要等归档才有，热对话是即时凭据，午饭这种靠它兜住
+    now_ts, said = datetime.now(timezone.utc).timestamp(), []
+    for r in rows:
+        if str(r.get("role")) != "user":
+            continue
+        try:
+            ts = datetime.strptime(str(r.get("created_at") or "")[:19],
+                                   "%Y-%m-%d %H:%M:%S").replace(
+                                       tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            ts = 0.0
+        text = str(r.get("content") or "").strip()
+        if text and now_ts - ts <= 3 * 3600:
+            said.append(text[:60])
+    out["said"] = "；".join(said[-5:])
+    # 只给最近几轮会漏事：午饭这种十几轮前的交代，醒来要能看见，否则会重复问
+    try:
+        out["facts"] = "；".join(mw_plain.db.recent_facts(
+            CID, _autonomy_sid.split("#")[0], hours=3, limit=6))
+    except Exception as exc:                    # noqa: BLE001
+        logger.info(f"[jinyu] 自主读近期词条失败: {exc}")
     users = [r for r in rows if str(r.get("role")) == "user"]
     if users:
         out["last_user"] = str(users[-1].get("content") or "")[:120]
@@ -1390,7 +1423,7 @@ def _autonomy_recent() -> dict:
             pass
     out["recent"] = "；".join(
         f"{'你' if r.get('role') == 'assistant' else '主人'}:"
-        f"{str(r.get('content') or '')[:80]}" for r in rows[-4:])
+        f"{str(r.get('content') or '')[:100]}" for r in rows[-6:])
     return out
 
 
@@ -1539,7 +1572,14 @@ def _autonomy_action(name: str, args: dict) -> str:
             return _card_add(CID, _autonomy_latest(base), text)
         if name == "merge_facts":
             base = _autonomy_base(args.get("base"))
-            groups = mw_plain.merge_facts(base, CID, True, limit=80)
+            ann = None
+            if MERGE_ANN:
+                try:
+                    ann = mw_plain.merge_facts_ann(base, CID, MERGE_ANN_COS)
+                except Exception as exc:            # noqa: BLE001  向量不可用就只走模型
+                    logger.warning(f"[jinyu] 手动合并 ANN 候选失败: {exc}")
+            groups = mw_plain.merge_facts(base, CID, True, limit=80,
+                                          seed_pairs=(ann or {}).get("pairs"))
             if not groups:
                 return "这次没有找到可以合并的重复词条。"
             lines = [f"- {str(g.get('fact') or g.get('summary') or '')[:80]}"
@@ -1752,16 +1792,58 @@ async def _idle_nudge_loop():
             logger.warning(f"[jinyu] 闲置提醒循环异常: {exc}")
 
 
+def _merge_ts(text):
+    """SQLite UTC 文本 → 带时区的 datetime；坏值返回 None。"""
+    try:
+        return datetime.strptime(str(text)[:19], "%Y-%m-%d %H:%M:%S") \
+            .replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _merge_wait_seconds() -> float:
+    """距下一次合并扫描还要等多久。
+
+    等待按「上次扫描时间」算，并落库持久化：重启不该把整个窗口重新计时，
+    否则每改一次代码重启一次，词条合并和 ANN shadow 就永远到不了点。
+    没有记录时退回 merge_log 里最近一次真实合并；再没有就等满一个窗口。
+    """
+    span = max(600.0, FACT_MERGE_HOURS * 3600)
+    if mw is None:
+        return span
+    dt = None
+    try:
+        dt = _merge_ts(await asyncio.to_thread(mw.db.merge_last_run, CID))
+    except Exception as exc:                        # noqa: BLE001
+        logger.warning(f"[jinyu] 合并扫描计时读取失败: {exc}")
+    if dt is None:
+        try:
+            rows, _ = await asyncio.to_thread(mw.db.merge_logs, CID, "", 0, 1)
+            dt = _merge_ts(rows[0]["created_at"]) if rows else None
+        except Exception:                           # noqa: BLE001
+            dt = None
+    if dt is None:
+        return span
+    left = dt.timestamp() + span - time.time()
+    return max(60.0, left)
+
+
 async def _fact_merge_loop():
     """定期让后台模型合并重复词条与重复事件卡（同一件事被反复说时不再堆成多条）。
 
     先并事件卡（同一场景被记成多张），再并长期词条（同一设定被说成多条）；
     两者都在线程里跑，不阻塞对话。失败只记日志，下轮再试。
+    首轮等待从上次扫描时刻算起（见 _merge_wait_seconds），重启不重置窗口。
     """
     while True:
-        await asyncio.sleep(max(600.0, FACT_MERGE_HOURS * 3600))
+        await asyncio.sleep(await _merge_wait_seconds())
         if mw is None:
             continue
+        try:
+            await asyncio.to_thread(mw.db.mark_merge_run, CID)
+            logger.info(f"[jinyu] 合并扫描开始 间隔={FACT_MERGE_HOURS}h 下次在上次扫描后计时")
+        except Exception as exc:                    # noqa: BLE001
+            logger.warning(f"[jinyu] 合并扫描记时失败: {exc}")
         try:
             card_owners = mw.db.card_owners(CID)
         except Exception as exc:                    # noqa: BLE001
@@ -1787,14 +1869,33 @@ async def _fact_merge_loop():
         for o in owners:
             if int(o["n"] or 0) < FACT_MERGE_MIN:
                 continue
+            ann = None
+            if MERGE_ANN:
+                try:
+                    ann = await asyncio.to_thread(
+                        mw.merge_facts_ann, o["base"], CID, MERGE_ANN_COS)
+                except Exception as exc:            # noqa: BLE001  向量失败不影响合并
+                    logger.warning(f"[jinyu] 词条 ANN 候选失败 base={o['base']}: {exc}")
             try:
-                groups = await asyncio.to_thread(mw.merge_facts, o["base"], CID, True)
+                groups = await asyncio.to_thread(
+                    mw.merge_facts, o["base"], CID, True,
+                    seed_pairs=(ann or {}).get("pairs"))
             except Exception as exc:                # noqa: BLE001  模型/写库失败不致命
                 logger.warning(f"[jinyu] 词条合并失败 base={o['base']}: {exc}")
                 continue
             if groups:
                 logger.info(f"[jinyu] 词条合并 base={o['base']} 组={len(groups)}：" +
                             "；".join(f"{len(g['ids'])}→{g['fact'][:16]}" for g in groups[:6]))
+            if ann and ann["pairs"]:
+                cmp = merge_ann_mod.compare(ann["pairs"], groups)
+                sample = "；".join(f"{p['a']}↔{p['b']}({p['sim']})"
+                                  for p in cmp["ann_only"][:3])
+                logger.info(
+                    f"[jinyu] 词条 ANN shadow base={o['base']} 事实={ann['rows']} "
+                    f"向量={ann['vectors']} 相似对={cmp['pairs']} "
+                    f"模型已覆盖={cmp['covered']} 仅向量找到={len(cmp['ann_only'])} "
+                    f"模型组无向量对={cmp['missed_groups']}"
+                    + (f" 例={sample}" if sample else ""))
 
 
 async def _dream_loop():
@@ -3011,32 +3112,18 @@ def _is_silent(reply: str) -> bool:
     return not (reply or "").strip() or bool(_PASS_RE.search(reply))
 
 
-_RICH_TOKEN = re.compile(r"\[\[[^\[\]]*\]\]|https?://[^\s\[\]（）]+")
 # 通话页/桌宠的舞台指令（[[表情:..]]/[[动作:..]]/[[待机]] 等）到 QQ 没有渲染器，
 # 留在正文里会原样发出去；发送前统一剥掉，QQ 自己的 [[face:..]] 不受影响
 _STAGE_TAG = re.compile(r"\[\[\s*(表情|动作|收起|重置|待机|转头|歪头|抬头|低头|点头)\s*[:：]?\s*[^\]]*\]\]")
 
 
 def _bubbles(reply: str, limit: Optional[int] = None) -> list:
-    """把一条回复按句子拆成多条气泡，富消息标记和链接整体保留。
+    """把一条回复按句子拆成多条气泡（规则见 core/bubbles.split）。
 
-    先按换行切，再按句末标点切；一句一个气泡，不再把短句并回上一条。
-    超过上限的才并到最后一条——一次刷十几条会被 QQ 风控，也不像真人。
+    富消息标记和链接整体保留；句子首尾的（动作词）单独成泡；超过上限均分，
+    不再把剩余全塞进最后一条。
     """
-    limit = limit or BUBBLE_MAX
-    marks = []
-
-    def _keep(m):
-        marks.append(m.group(0))
-        return f"\x00{len(marks) - 1}\x00"
-
-    text = _RICH_TOKEN.sub(_keep, reply)
-    parts = [p.strip(" \t") for p in re.split(r"\n+|(?<=[。！？!?])", text)]
-    merged = [p for p in parts if p]
-    if len(merged) > limit:
-        merged = merged[:limit - 1] + ["\n".join(merged[limit - 1:])]
-    return [re.sub(r"\x00(\d+)\x00", lambda m: marks[int(m.group(1))], p)
-            for p in merged]
+    return bubbles_mod.split(reply, limit or BUBBLE_MAX)
 
 
 async def _send_rich(reply: str, sid: str = "") -> None:
@@ -4055,6 +4142,27 @@ async def _admin(event: MessageEvent, text: str) -> bool:
         await matcher.finish(report)
         return True
     if cmd in ("autonomy", "自主", "作息"):
+        off = arg.lower() in ("off", "关", "pause", "暂停")
+        on = arg.lower() in ("on", "开", "resume", "恢复")
+        if on:
+            if not AUTONOMY_ON:
+                await matcher.finish("自主作息总开关没开（RP_AUTONOMY=0），"
+                                     "先在 .env 设 1 再重启。")
+                return True
+            if not autonomy_mod.ready():
+                await matcher.finish("自主作息还没初始化，先看启动日志。")
+                return True
+            autonomy_mod.pause(False)
+            await matcher.finish("自主作息已恢复：报点、醒来、日计划按原计划继续。")
+            return True
+        if off:
+            if not autonomy_mod.ready():
+                await matcher.finish("自主作息没开（RP_AUTONOMY=0）。")
+                return True
+            autonomy_mod.pause(True)
+            await matcher.finish("自主作息已暂停：醒来、报点、日计划都停，"
+                                 "状态已写入 autonomy.db；/autonomy on 恢复。")
+            return True
         if not (AUTONOMY_ON and autonomy_mod.ready()):
             await matcher.finish("自主作息没开（RP_AUTONOMY=0）。")
         report = await asyncio.to_thread(autonomy_mod.status)
@@ -4506,6 +4614,10 @@ async def _handle(event: MessageEvent):
     _last_seen[cd_key] = now
     # 同 lane 新消息取消旧生成：旧答还没发出去就让位；已经发过的一条不动
     run = task_supervisor.begin(sid)
+    if run is not None:
+        # 带图/语音/卡片的一轮不能被后面那句文字取消：视觉判读还没回来就被
+        # 取消，这张图就彻底没有回复了。让它回完，新消息排在它后面。
+        run.media = bool(has_img or has_voice or has_card or has_audio_file)
     await task_supervisor.preempt(sid)
 
     # P1：提醒交给模型自己判断（调 set_reminder），正则只在没有工具能力时兜底。

@@ -360,7 +360,7 @@ def activate(scored, cards, text, limit=None):
     玩家私有卡与非具体钩子不参与连线。
     """
     if not graph_gate(text, scored):
-        return scored
+        return scored[:limit] if limit else scored
     have = {c["event_id"] for _, c in scored}
     df = _hook_df(cards)
     cut = max(8, int(len(cards) * GRAPH_DF_MAX))

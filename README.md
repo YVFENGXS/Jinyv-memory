@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿# Jinyu Memory
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿# Jinyu Memory
 
 一套给 QQ 角色扮演机器人用的**分层记忆中间件**：把「最近聊了什么」「半个月前发生过什么」「必须一直记住的设定」分开存，并在 token 预算内按优先级拼进上下文。
 
@@ -16,7 +16,7 @@
 - 章节卡：Dream 把 30 天前的明细卡按车道（跨 epoch）/受众/bot/知识边界并成 T2 章节卡；明细卡保留，仍可展开
 - 后台联想：字面/向量都单薄且像在问旧事时，后台按标签表返回候选标签，代码核对成卡后以【联想建议】注入（非确证，`RP_ASSOC=0` 可关）
 - 自主作息（`RP_AUTONOMY=1`）：每小时报点可静默 pass；23:30 规划次日、00:05 兜底；每天 3–5 次自己醒来（白天 ≥2、夜间 ≥1），醒来可查记忆、给词条打分、改删补词条与事件卡、判重合并，也能上网 / 看 B 站、按天限量自己搜一张图看（T2 奢侈品），报告、意图、日记全部有字数硬上限
-- 125 项回归测试，不依赖任何 API key
+- 130 项回归测试，不依赖任何 API key
 
 ---
 
@@ -44,6 +44,8 @@ jinyu-memory/
 │       ├── sealing.py       #     封口状态机与 topic×mode 矩阵
 │       ├── retention.py     #     原文 7 天保留、pin、软归档
 │       ├── status.py        #     压缩观测快照
+│       ├── bubbles.py       #     回复分气泡：一句一泡 + 括号动作独立
+│       ├── merge_ann.py     #     合并候选：向量近邻召回（模型只判对子）
 │       ├── persona.py       #     人设单源（换成你自己的角色）
 │       ├── persona_guard.py #     人设硬规则校验/重生成
 │       ├── host.py          #     框架中立宿主：chat / remember / recall
@@ -51,7 +53,7 @@ jinyu-memory/
 ├── examples/
 │   ├── demo.py              # 离线演示：10 轮对话，零依赖、零密钥
 │   └── chat_cli.py          # 命令行对话：接真实模型，不需要 QQ（走 JinyuHost）
-├── tests/test_regression.py # 125 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽、音乐测量、自主作息、梯度记忆与压缩）
+├── tests/test_regression.py # 130 项回归（含显著性、知识边界、防污染、概念改写、后台联想、查询变体、泛钩子屏蔽、音乐测量、自主作息、梯度记忆与压缩、气泡拆分、合并候选、主备兜底）
 ├── tools/
 │   ├── eval_memory.py       # 召回 / 注入 / 消融评测（README 指标来源）
 │   ├── serve.py             # 宿主 HTTP 服务：/chat /remember /recall（零依赖）
@@ -101,7 +103,7 @@ all asserts passed
 python tests/test_regression.py
 ```
 
-末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限、跨 epoch 召回池、本地音乐测量、一年期提醒、自主报点/计划/醒来、醒来记忆整理动作，以及控制层 schema、工作预算、评分地板、梯度冻结、must-keep 覆盖、问题账本、封口矩阵、原文 pin/软归档等 125 项场景（服务器实测 18 秒）。
+末尾出现 `all regression tests passed` 即通过。测试覆盖消息不重复、归档确定性、退出冲刷、token 上界、失败重试、会话隔离、重启恢复、幂等、召回、摘要自修复、冲突标注、人设重生成、承诺生命周期、单事务回滚、跨会话继承、空闲轮换、退避上界、防污染、概念改写、两路归一、后台联想、查询变体、泛钩子屏蔽、B站看视频、账号写操作护栏与带图笔记、上下文水位与余额提醒、充值后主动说「开饭」、宿主 API 与 HTTP 写入、原文展开与原话核验、章节卡与扫描上限、跨 epoch 召回池、本地音乐测量、一年期提醒、自主报点/计划/醒来、醒来记忆整理动作，以及控制层 schema、工作预算、评分地板、梯度冻结、must-keep 覆盖、问题账本、封口矩阵、原文 pin/软归档、气泡拆分、合并向量候选、自主作息暂停持久化、主备模型兜底等 130 项场景（服务器实测 18 秒）。
 
 ## 评测结果（可复现）
 
@@ -181,7 +183,7 @@ python tests/test_regression.py
 ### 复现
 
 ```bash
-python tests/test_regression.py                        # 125 项回归
+python tests/test_regression.py                        # 130 项回归
 python examples/demo.py                                 # 离线演示断言
 python tools/eval_memory.py --corpus small --ablate     # 小集 + 消融
 python tools/eval_memory.py --corpus scale --ablate     # 规模集 + 消融
@@ -213,6 +215,8 @@ $env:RP_FRONT_KEY="sk-..."; $env:RP_BACK_KEY="sk-..."; python examples\chat_cli.
 输入 `/new` 开新会话（同 continuity，跨会话记忆生效），`/quit` 退出并冲刷尾部归档。
 
 默认请求 `https://api.deepseek.com`，用 `RP_LLM_BASE` / `RP_FRONT_MODEL` / `RP_BACK_MODEL` 可换成任何 OpenAI 兼容服务。
+
+主模型会欠费（额度耗尽的 401/402/403/配额类 429）或连续调用失败时，配了 `RP_FALLBACK_KEY` 就自动切到备用接口（默认 DeepSeek 官方，模型用 `RP_FALLBACK_FRONT_MODEL` / `RP_FALLBACK_BACK_MODEL`），本进程后续都走备用并打一条 warning；重启后重新尝试主模型。普通 429 限流仍按原逻辑退避重试，不会误切。
 
 ### 桌面桌宠：desktop-v1 适配器
 
@@ -565,6 +569,7 @@ RP_SESSION=qq-u你的QQ号        # 自主消息默认发到这里
 | `/plan`（`/计划`） | 看今天的日计划：谁排的、几次醒来、每窗想做什么、限时几分钟；`/plan 2026-11-04` 看指定日期 |
 | `/diary`（`/日记`） | 看最近 6 条自主日记（醒来/睡前/报点）；`/diary 12` 看 12 条，最多 20 条 |
 | `/autonomy`（`/自主` `/作息`） | 总览：运行状态、今天醒来/开口/T1/T2 用量、下一个排程 |
+| `/autonomy on` / `/autonomy off` | 运行时恢复 / 暂停自主作息（醒来、报点、日计划全停）；状态写入 `autonomy.db`，重启仍保持 |
 
 ### 记忆管理（管理员）
 

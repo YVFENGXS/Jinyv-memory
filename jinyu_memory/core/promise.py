@@ -15,6 +15,7 @@
 普通角色内对话只是"证据"，永远不直接改状态。
 """
 import re
+from datetime import datetime, timedelta
 
 MIN_SCORE = 0.25        # GLM 实测：改写对 0.25~0.71，无关对 0.00
 MIN_MARGIN = 0.15       # ChatGPT：best 与 second 拉不开时弃权
@@ -22,6 +23,12 @@ TTL_TURNS = 40
 MAX_ACTIVE = 8
 MAX_STRICT = 12         # Grok Q2：strict 软上限，超出移入 dormant（不算违约）
 RESOLVED_KEEP = 100     # Gemini A1：resolved 只留最近 100 条，账本 JSON 不无界增长
+
+# 日期化：非 strict 承诺超过这么多天还没兑现就下沉，别让上星期的话继续挂在账本里
+RETIRE_DAYS = 3
+# 只对当天有效的指令：跨天即失效（「等下课」不该在第二天还装成待办）
+TEMP_SAME_DAY = re.compile(r"(今天|今晚|今早|等下课|下课后|下完课|待会|等会|一会儿|马上|这会儿)")
+TEMP_NEXT_DAY = re.compile(r"(明天|明早|明晚|明日)")
 
 # 豆包词表：强承诺标记（命中且剥离后仍有动作对象才判 strict）
 STRONG = (r"答应", r"保证", r"发誓", r"一定(要|会|给你|还你|回来|到)", r"说好了?", r"一言为定",
@@ -114,6 +121,7 @@ def ensure_shape(lg):
             lg["pseq"] += 1
             ps[i] = {"id": f"P-{lg['pseq']:03d}", "text": p,
                      "created_turn": 0, "strict": is_strict(p)}
+            p = ps[i]
         # 长期承诺生命周期字段（C2-03）：老条目就地补默认值，不迁移数据
         p.setdefault("status", "ACTIVE")
         p.setdefault("blocker", "")
@@ -125,6 +133,9 @@ def ensure_shape(lg):
         p.setdefault("ask_count", 0)
         p.setdefault("source_turns", [])
         p.setdefault("review_policy", "trigger")
+        # 日期化：老条目没有日期就留空，注入时显示「早期」，不做批量推断
+        p.setdefault("created_day", "")
+        p.setdefault("expire_day", "")
     lg["promises"] = ps
     return lg
 
@@ -189,7 +200,7 @@ def set_lifecycle(lg, promise_id, status=None, blocker=None, next_action=None,
     return False
 
 
-def add_pending(lg, texts, turn):
+def add_pending(lg, texts, turn, today=None):
     """新增承诺。近似重复（overlap>=0.7）不重复入账。返回新增 ID。
 
     已知特性（不修）：去重只看字面 bigram overlap，跨批次语义复述一旦措辞差异
@@ -197,7 +208,10 @@ def add_pending(lg, texts, turn):
     5 条文本、closed_total 4 > 意图 2）。这是「宁多勿丢」方向的设计内误差，
     上界由 MAX_ACTIVE / MAX_STRICT / TTL / RESOLVED_KEEP 兜住，指标按趋势读。
     真要收窄得做跨批次语义去重，优先级低。
+
+    today 是本地日期（datetime.date）；登记时落 created_day，当日指令再落 expire_day。
     """
+    today = today or datetime.now().date()
     added = []
     for t in texts or []:
         t = sanitize(t)
@@ -207,7 +221,13 @@ def add_pending(lg, texts, turn):
             continue
         lg["pseq"] += 1
         p = {"id": f"P-{lg['pseq']:03d}", "text": t,
-             "created_turn": turn, "strict": is_strict(t)}
+             "created_turn": turn, "strict": is_strict(t),
+             "created_day": today.strftime("%Y-%m-%d")}
+        # 时间措辞与 strict 无关：哪怕郑重答应过，说了「等下课」也只在当天有效
+        if TEMP_SAME_DAY.search(t):
+            p["expire_day"] = today.strftime("%Y-%m-%d")
+        elif TEMP_NEXT_DAY.search(t):
+            p["expire_day"] = (today + timedelta(days=1)).strftime("%Y-%m-%d")
         lg["promises"].append(p)
         added.append(p["id"])
     return added
@@ -264,15 +284,44 @@ def resolve(lg, items, turn, evidence=""):
     return fulfilled, unmatched, restated
 
 
-def evict(lg, turn, ttl=TTL_TURNS, cap=MAX_ACTIVE, strict_cap=MAX_STRICT):
+def _parse_day(s):
+    try:
+        return datetime.strptime(str(s or ""), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _retire(lg, p, reason):
+    """移出活跃池但保留内容：进 dormant，能被后续召回，不算违约。"""
+    lg["promises"].remove(p)
+    lg["dormant"].append({**p, "dormant_reason": reason})
+    return p["id"]
+
+
+def evict(lg, turn, ttl=TTL_TURNS, cap=MAX_ACTIVE, strict_cap=MAX_STRICT, today=None):
     """淘汰：非 strict 超龄 → expired；超量 → dormant（移出 prompt，不算违约）。
+
+    日期规则（解决「昨天的指令今天还在执行」）：
+      ① 当日/次日指令过了 expire_day 立刻下沉；
+      ② 非 strict 承诺超过 RETIRE_DAYS 天未兑现也下沉；
+    两条都进 dormant，不删内容，后续需要时仍可召回。
 
     strict 豁免 TTL，但按 Grok Q2 设软上限 12 条：超出的最旧项进 dormant，
     可被规则召回重新激活；resolved 只留最近 100 条，避免账本 JSON 无界增长。
     """
+    ensure_shape(lg)
+    today = today or datetime.now().date()
     moved = []
     for p in list(lg["promises"]):
+        exp = _parse_day(p.get("expire_day"))
+        if exp and today > exp:
+            moved.append(_retire(lg, p, "当日指令已过期"))
+            continue
         if p.get("strict"):
+            continue
+        made = _parse_day(p.get("created_day"))
+        if made and (today - made).days > RETIRE_DAYS:
+            moved.append(_retire(lg, p, "超过3天未兑现"))
             continue
         if turn - p.get("created_turn", 0) > ttl:
             lg["promises"].remove(p)
@@ -308,3 +357,66 @@ def prompt_lines(lg, limit=None):
 
 def texts(lg):
     return [p["text"] for p in lg["promises"]]
+
+
+def inject_lines(lg, days=RETIRE_DAYS, limit=6):
+    """给前台的承诺行：带登记日期与编号，别让旧指令冒充今天。
+
+    strict 不受天数限制（保密、长期约定本来就该一直记着）；非 strict 只给
+    最近 days 天、最多 limit 条，按日期从新到旧。没有日期的老条目显示
+    「早期」并排在最后——不猜日期，也不隐藏。
+    编号 P-xxx 是给 manage_promises 工具用的：模型要自己整理承诺时靠它定位。
+    """
+    ensure_shape(lg)
+    today = datetime.now().date()
+    rows = []
+    for p in lg["promises"]:
+        made = _parse_day(p.get("created_day"))
+        if not p.get("strict") and made and (today - made).days > days:
+            continue
+        rows.append((made or datetime.min.date(), p))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    for made, p in rows[:limit]:
+        tag = "早期" if made == datetime.min.date() else f"{made:%m-%d}"
+        out.append(f"[{tag} {p.get('id')}] {sanitize(p.get('text'), 40)}")
+    return out
+
+
+def manage(lg, action, ids, note="", turn=0):
+    """角色自己整理承诺（keep / drop / done / goal）。
+
+    只动本账本里存在的编号，最多 8 条；drop/done 都保留原文（进 dormant /
+    resolved），不物理删除。返回一句可读结果，交给工具回填。
+    """
+    ensure_shape(lg)
+    action = str(action or "").strip().lower()
+    want = {str(i).strip().upper() for i in (ids or []) if str(i).strip()}
+    if action not in ("keep", "drop", "done", "goal"):
+        return "action 只能是 keep / drop / done / goal。"
+    if not want:
+        return "缺少 ids：填账本里方括号中的承诺编号（如 P-003）。"
+    hit = [p for p in lg["promises"] if str(p.get("id") or "").upper() in want][:8]
+    if not hit:
+        return "没有找到对应编号的承诺，未改动。"
+    done = []
+    for p in hit:
+        if action == "keep":
+            p["expire_day"] = ""
+            p["master_stance"] = "长期，不用催"
+            p["review_policy"] = "30d"
+        elif action == "goal":
+            p["next_action"] = sanitize(note, 60)
+            p["master_stance"] = "有明确目标"
+            p["expire_day"] = ""
+        elif action == "drop":
+            lg["promises"].remove(p)
+            lg["dormant"].append({**p, "dormant_reason": "角色自行收起"})
+        else:                                   # done
+            lg["promises"].remove(p)
+            lg["resolved"].append({**p, "status": "fulfilled", "resolved_turn": turn,
+                                   "evidence": sanitize(note or "角色自述已完成", 40),
+                                   "matched_by": "self"})
+        done.append(p["id"])
+    left = len(lg["promises"])
+    return f"已处理 {action}：{'、'.join(done)}；账本剩余 {left} 条。"

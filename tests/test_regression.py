@@ -29,6 +29,8 @@ import summarizer
 import compression
 import context_budget
 import control
+import bubbles
+import merge_ann
 import gradient
 import questions
 import retention
@@ -229,6 +231,11 @@ def fresh(path: str) -> DB:
     for suffix in ("", "-wal", "-shm"):
         Path(path + suffix).unlink(missing_ok=True)
     return DB(path)
+
+
+def fact_texts(labels):
+    """词条注入带「[日期 类别]｜[说话人]」前缀，断言只看正文部分。"""
+    return [re.sub(r"^(\[[^\]]*\]\s*)+", "", str(x)) for x in labels]
 
 
 def run_session(db_path, sid, script, cid="c1", reuse=False):
@@ -1177,7 +1184,7 @@ def test_idle_epoch_rotation():
     sid1 = mw.session_identity("qq-g1", "c1", 3600, now=5200)
     assert sid1 == "qq-g1#1", sid1
     assert db.get_cursor("qq-g1", "c1") == hi, (db.get_cursor("qq-g1", "c1"), hi)
-    assert "主人最爱吃米饭" in db.list_facts("qq-g1#1", "c1"), db.list_facts("qq-g1#1", "c1")
+    assert "主人最爱吃米饭" in fact_texts(db.list_facts("qq-g1#1", "c1")), db.list_facts("qq-g1#1", "c1")
     with sqlite3.connect(db.path) as c:                # 旧会话必须标 closed 才能被跨界召回
         closed = c.execute("SELECT closed FROM session_meta"
                            " WHERE session_id=? AND character_id=?",
@@ -1192,8 +1199,9 @@ def test_idle_epoch_rotation():
     mw2.chat("客人推门进来", PERSONA, "qq-g1#1", "c1")
     blob = "\n".join(m["content"] for m in front.last_messages)
     assert "【跨会话记忆】" in blob and "保守伞铺的秘密" in blob, blob
-    # 承诺已搬进新账本（锚点里的「未兑现承诺」），不再重复出现在跨会话承诺段
-    assert "未兑现承诺：答应替客人保守伞铺的秘密" in blob, blob
+    # 承诺已搬进新账本（锚点里的「未兑现承诺」），不再重复出现在跨会话承诺段；
+    # 继承的老承诺没有登记日期，注入时标「早期」，并带 P-xxx 编号供工具整理
+    assert "未兑现承诺：" in blob and "答应替客人保守伞铺的秘密" in blob, blob
     assert "【跨会话承诺·仍未兑现】" not in blob, blob
     # 继承的 strict 承诺换了新 ID：能按候选 ID 兑现，不会变成永远挂着的幽灵
     lg = db.load_ledger("qq-g1#1", "c1")
@@ -1230,6 +1238,50 @@ def test_retry_backoff_bounds():
     print("R40 重试退避: OK 指数有界 / Retry-After 优先 / 非法值回落")
 
 
+def test_llm_fallback_switch():
+    """主模型欠费/鉴权失败 → 切备用；欠费确认后本进程不再打主模型。"""
+    inst = llm.LLM("k1", "primary", base="https://a.example", role="front",
+                   retries=1, fallback={"key": "k2", "model": "backup",
+                                        "base": "https://b.example"})
+    calls = []
+
+    def fake(prov, payload, want, started):
+        calls.append(prov["model"])
+        if prov["model"] == "primary":
+            err = RuntimeError("HTTP 402: 欠费")
+            err.switch_sticky = True
+            raise err
+        return {"content": "备用回复"}
+
+    inst._complete_one = fake
+    out = inst.chat([{"role": "user", "content": "hi"}], max_tokens=32)
+    assert out == "备用回复", out
+    assert calls == ["primary", "backup"], calls
+    calls.clear()
+    out = inst.chat([{"role": "user", "content": "hi"}], max_tokens=32)
+    assert out == "备用回复" and calls == ["backup"], calls
+
+    # 非欠费错误只切本次，下一轮仍先试主模型
+    inst2 = llm.LLM("k1", "primary", base="https://a.example", role="front",
+                    retries=1, fallback={"key": "k2", "model": "backup",
+                                         "base": "https://b.example"})
+    seen = []
+
+    def fake2(prov, payload, want, started):
+        seen.append(prov["model"])
+        if prov["model"] == "primary" and len(seen) == 1:
+            raise RuntimeError("HTTP 400: bad request")
+        return {"content": "主" if prov["model"] == "primary" else "备"}
+
+    inst2._complete_one = fake2
+    assert inst2.chat([{"role": "user", "content": "hi"}], max_tokens=32) == "备"
+    assert inst2.chat([{"role": "user", "content": "hi"}], max_tokens=32) == "主"
+    assert seen == ["primary", "backup", "primary"], seen
+    assert llm._quota_error(402, "") and llm._quota_error(429, "quota exhausted")
+    assert not llm._quota_error(429, "rate limit")
+    print("主备兜底: OK 欠费即切且粘住 / 非欠费仅本次 / 429 限流不算欠费")
+
+
 def test_time_awareness():
     """R41：时间感知——账本锚带「当前时间」与久别间隔；热窗用户消息在长间隔处带时间戳，
     assistant 消息不加戳（防模型模仿前缀）。"""
@@ -1255,7 +1307,7 @@ def test_time_awareness():
     ledger = next(m["content"] for m in msgs if "账本" in m["content"])
     assert "当前时间：" in ledger and "周" in ledger, ledger
     assert "距零点还有" in ledger, ledger                       # 不让模型自己心算
-    assert "距最近一条消息已约 45 分钟" in ledger, ledger
+    assert "距上一条消息 45 分钟" in ledger, ledger
     fixed = now.replace(hour=21, minute=48, second=0, microsecond=0)
     assert _to_midnight(fixed) == "2 小时 12 分", _to_midnight(fixed)
     assert "距零点还有" in mw._tool_now({}, sid, cid)
@@ -1266,7 +1318,7 @@ def test_time_awareness():
     assert by_content["早呀"] == "assistant"                 # assistant 不带戳
     # 间隔不足 30 分钟：不加重间隔说明，时间行保持纯净
     ledger2 = next(m["content"] for m in msgs if "账本" in m["content"])
-    assert ledger2.count("距最近一条消息") == 1
+    assert ledger2.count("距上一条消息") == 1
     # 时长不整档取整：90 分钟不能写成「2 小时」
     assert _human_gap(90 * 60) == "1 小时 30 分", _human_gap(90 * 60)
     assert _human_gap(45 * 60) == "45 分钟"
@@ -1351,7 +1403,7 @@ def test_multi_bot_lanes():
                       [("qq-g1#1", "c1", 4, "主人最爱吃米饭", "group:1"),
                        ("qq-g1#1@b222", "c1", 4, "主人最爱吃米饭", "group:1")])
     facts = db.list_facts("qq-g1#1@b222", "c1")
-    assert facts == ["主人最爱吃米饭"], facts
+    assert fact_texts(facts) == ["主人最爱吃米饭"], facts
     assert db.list_facts("qq-g1#2", "c1") == []                # epoch 不串
     print("R42 多号车道: OK 群合并 / 私聊与 epoch 隔离 / 事实去重")
 
@@ -1379,7 +1431,7 @@ def test_principal_memory_merge():
 
     # 未注入解析器：回到老行为，各车道只看自己
     assert memory_sids("qq-u7") == ["qq-u7"]
-    assert db.list_facts("qq-u7", "c1") == ["主人喜欢喝乌龙茶"]
+    assert fact_texts(db.list_facts("qq-u7", "c1")) == ["主人喜欢喝乌龙茶"]
     assert {c["event_id"] for c in db.all_cards("qq-u7", "c1")} == {"E-a"}
 
     def scope(sid):
@@ -1393,15 +1445,15 @@ def test_principal_memory_merge():
     try:
         # 同一个主人的两个号：长期事实与事件卡合并，陌生人/群内容照旧隔离
         assert memory_sids("qq-u7") == ["qq-u7", "qq-u8"]
-        assert set(db.list_facts("qq-u7", "c1")) == {"主人喜欢喝乌龙茶", "主人的猫叫团子"}
+        assert set(fact_texts(db.list_facts("qq-u7", "c1"))) == {"主人喜欢喝乌龙茶", "主人的猫叫团子"}
         assert db.count_facts("qq-u7", "c1") == 2
         assert {c["event_id"] for c in db.all_cards("qq-u7", "c1")} == {"E-a", "E-b"}
         # 热窗卡仍只看本车道：不同账号的轮号不可比
         assert {c["event_id"] for c in db.recent_cards("qq-u7", "c1")} == {"E-a"}
         # 陌生号不因「主人合并」看到主人内容，群记忆也不外流
-        assert db.list_facts("qq-u9", "c1") == ["陌生人住在杭州"]
+        assert fact_texts(db.list_facts("qq-u9", "c1")) == ["陌生人住在杭州"]
         assert {c["event_id"] for c in db.all_cards("qq-u9", "c1")} == {"E-x"}
-        assert db.list_facts("qq-g1", "c1") == ["群里约定周六聚餐"]
+        assert fact_texts(db.list_facts("qq-g1", "c1")) == ["群里约定周六聚餐"]
         assert {c["event_id"] for c in db.all_cards("qq-g1", "c1")} == {"E-g"}
 
         # audience 强制校验：本人/同主体可读，跨群、跨人、未知取值一律拒绝
@@ -1875,6 +1927,8 @@ class RejectVerifyBack:
         self.calls += 1
         if "待复核" in messages[0]["content"]:
             return '{"groups":[{"n":1,"same":false,"why":"谓语不同"}]}'
+        if "待判" in messages[0]["content"]:
+            return '{"pairs":[{"n":1,"same":false,"why":"谓语不同"}]}'
         return json.dumps({"groups": [{
             "ids": [1, 2], "keep": 1,
             "fact": "主人养了一只猫叫团子", "tags": ["猫"]}]},
@@ -1907,7 +1961,7 @@ def test_fact_merge_verify_and_guards():
     back = RejectVerifyBack()
     mw.back = back
     assert mw.merge_facts("s1", "c1", True) == []
-    assert back.calls == 1, back.calls           # 置信门挡掉，未进入复核
+    assert back.calls == 2, back.calls           # 置信门挡掉 → 只走改写判定，不进复核
     assert db.count_facts("s1", "c1") == 2
 
     # 近重复能过置信门，但复核判为不同事实：复核必须驳回
@@ -2357,10 +2411,10 @@ def test_fact_speaker_facet():
     db.add_fact("s1", "c1", "小明养了一只猫，叫团子", turn=4, speaker="小明")
 
     plain = [d["label"] for d in db.list_facts_detail("s1", "c1", query="团子")]
-    assert plain[0].startswith("[小明]"), plain       # 不分面：新 id 在前
+    assert "[小明]" in plain[0], plain       # 不分面：新 id 在前
     faceted = [d["label"] for d in
                db.list_facts_detail("s1", "c1", query="团子", speaker="主人")]
-    assert faceted[0].startswith("[主人]"), faceted    # 分面：眼前这个人优先
+    assert "[主人]" in faceted[0], faceted    # 分面：眼前这个人优先
     empty = [d["label"] for d in
              db.list_facts_detail("s1", "c1", query="团子", speaker="")]
     assert empty == [d["label"] for d in
@@ -2683,7 +2737,7 @@ def test_fact_four_factors():
                           " audience,authority,emotion,attention_hits)"
                           " VALUES('s1','c1',1,?,'[]',0.8,'设定',NULL,'','',?,?,?)",
                           (fact, auth, emo, att))
-    labels = lambda: [d["label"] for d in db.list_facts_detail("s1", "c1", query="团子")]
+    labels = lambda: fact_texts(d["label"] for d in db.list_facts_detail("s1", "c1", query="团子"))
     first = labels()
     assert first[0] == "团子爱吃小鱼干", first               # 情感 1.0 排第一
     assert first[-1] == "团子怕打雷", first                 # 300 天前：衰减到最后
@@ -2765,7 +2819,7 @@ def test_four_factor_roundtrip():
     assert row["last_used_at"] == "2026-10-30 12:00:00", dict(row)
     # 继承的词条在新 epoch 仍可召回（权威 1.0 不衰减）
     labels = [d["label"] for d in db.list_facts_detail("s1#1", "c1", query="团子")]
-    assert labels and labels[0] == "团子怕打雷", labels
+    assert labels and labels[0] == "[设定] 团子怕打雷", labels
     print("R64 四因子写入继承: OK E/A 校验落库 / 合并取高 / 跨 epoch 不重置")
 
 
@@ -4029,6 +4083,25 @@ def _fresh_autonomy(name):
     return autonomy, path
 
 
+def test_autonomy_pause_switch():
+    """R101：/autonomy off 的暂停状态落库，重启后仍暂停；on 恢复。"""
+    autonomy, path = _fresh_autonomy("pause")
+    try:
+        assert not autonomy.paused()
+        autonomy.pause(True)
+        assert autonomy.paused()
+        assert "暂停" in autonomy.status()
+        autonomy.close()
+        autonomy.init(path, "qq-u1", 1)
+        assert autonomy.paused(), "暂停状态没有从库里恢复"
+        autonomy.pause(False)
+        assert not autonomy.paused()
+        assert "运行" in autonomy.status()
+    finally:
+        autonomy.close()
+    print("自主作息开关: OK 暂停落库 / 重启恢复 / on 恢复")
+
+
 def test_autonomy_plan_and_tick():
     """R99：日计划校验/兜底 + 报点静默与开口配额，不写 turns。"""
     import asyncio
@@ -4439,6 +4512,71 @@ def test_compression_pipeline_shadow():
     print("C2/C3/C8 集成: OK 归档原子 / shadow 闭环 / 审核 / 状态快照")
 
 
+def test_merge_ann_candidates():
+    """合并候选：向量能找出近义对，跨说话人不配，shadow 对比能算出模型漏并。"""
+    rows = [
+        {"id": 1, "fact": "主人喜欢蓝色", "speaker": "主人", "turn_end": 5},
+        {"id": 2, "fact": "主人偏爱蓝色", "speaker": "主人", "turn_end": 9},
+        {"id": 3, "fact": "猫叫团子", "speaker": "主人", "turn_end": 7},
+        {"id": 4, "fact": "喜欢蓝色", "speaker": "瑾瑜", "turn_end": 11},
+    ]
+    vecs = {1: [1.0, 0.0, 0.0], 2: [0.99, 0.05, 0.0],
+            3: [0.0, 1.0, 0.0], 4: [0.9, 0.0, 0.1]}
+    found = merge_ann.pairs(rows, vecs, threshold=0.7, top_k=2)
+    assert {(p["a"], p["b"]) for p in found} == {(1, 2)}, found   # 跨说话人 1↔4 不配
+    loose = merge_ann.pairs(rows, vecs, threshold=0.7, same_speaker=False)
+    assert (1, 4) in {(p["a"], p["b"]) for p in loose}, loose
+    covered = merge_ann.compare(found, [{"sources": [{"id": 1}, {"id": 2}]}])
+    assert covered["covered"] == 1 and not covered["ann_only"], covered
+    missed = merge_ann.compare(found, [])
+    assert len(missed["ann_only"]) == 1, missed
+    print("合并候选: OK 近义召回 / 跨人不配 / shadow 漏并统计")
+
+
+def test_card_merge_protected():
+    """压缩写过的卡（meta_json）不参与合并：原子和 episode 证据不会被删掉。"""
+    mw, _ = run_session("/tmp/rp_merge_protect.db", "s1", SCRIPT)
+    db = mw.db
+    rows = db.card_rows("s1", "c1")
+    assert len(rows) >= 2, rows
+    keep, drop = rows[0], rows[1]
+    with db._c() as c:
+        c.execute("UPDATE event_cards SET meta_json=? WHERE event_id=?",
+                  ('{"episode_id": "e1"}', drop["event_id"]))
+    removed, dropped = db.apply_card_merge(
+        "c1", keep["event_id"], [drop["event_id"]], "合并摘要",
+        keep["turn_start"], keep["turn_end"])
+    assert (removed, dropped) == (0, []), (removed, dropped)
+    assert drop["event_id"] not in [r["event_id"] for r in db.card_rows("s1", "c1")]
+    with db._c() as c:
+        assert c.execute("SELECT 1 FROM event_cards WHERE event_id=?",
+                         (drop["event_id"],)).fetchone()
+    print("卡片合并保护: OK 带 meta_json 的卡不删")
+
+
+def test_bubble_split_rules():
+    """分气泡：一句一个；句子首尾的括号动作单独成泡；超限均分不堆一大坨。"""
+    cases = [
+        ("嗯。好。知道了。", ["嗯。", "好。", "知道了。"]),
+        ("（歪头）主人今天好累啊。那我陪你坐会儿。",
+         ["（歪头）", "主人今天好累啊。", "那我陪你坐会儿。"]),
+        ("慢走。（挥手）", ["慢走。", "（挥手）"]),
+        ("我（小声）跟你说个事。", ["我（小声）跟你说个事。"]),      # 句中括号不切
+        ("看看这个[[img:abc]]。真好看。", ["看看这个[[img:abc]]。", "真好看。"]),
+        ("第一行\n第二行。", ["第一行", "第二行。"]),
+    ]
+    for text, want in cases:
+        got = bubbles.split(text)
+        assert got == want, (text, got)
+
+    long_reply = "".join(f"第{i}句。" for i in range(1, 16))
+    parts = bubbles.split(long_reply, limit=10)
+    assert len(parts) == 8, parts                    # ceil(15/10)=2 → 8 条
+    assert max(p.count("。") for p in parts) == 2, parts
+    assert "第15句。" in parts[-1], parts
+    print("气泡拆分: OK 一句一泡 / 括号独立 / 超限均分")
+
+
 if __name__ == "__main__":
     for fn in (test_archive_deterministic, test_no_duplicate_user_message,
                test_shutdown_flush_odd_turn, test_shutdown_segmented_flush,
@@ -4511,7 +4649,9 @@ if __name__ == "__main__":
                test_scoring_floor_and_inflation, test_gradient_ladder_and_freeze,
                test_must_keep_atoms_and_coverage, test_question_ledger_and_gate,
                test_sealing_matrix, test_retention_pin_and_soft_archive,
-               test_compression_pipeline_shadow):
+               test_compression_pipeline_shadow, test_bubble_split_rules,
+               test_merge_ann_candidates, test_card_merge_protected,
+               test_autonomy_pause_switch, test_llm_fallback_switch):
         fn()
     print("\nall regression tests passed")
 

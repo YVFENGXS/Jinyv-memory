@@ -26,13 +26,16 @@ RECENT_KEEP = 20                    # 只留最近这些 run 供自检，不无�
 class Run:
     """一次生成的运行态：状态只前进不回退，sent 一旦置真就不再允许取消。"""
 
-    __slots__ = ("lane", "task", "status", "sent", "started", "finished")
+    __slots__ = ("lane", "task", "status", "sent", "media", "started", "finished")
 
     def __init__(self, lane, task):
         self.lane = lane
         self.task = task
         self.status = RUNNING
         self.sent = False
+        # 这一轮带着图片/语音等媒体：取消就等于把主人发的东西整条吞掉，
+        # 视觉还没读完时来一条文字消息不该把图片轮一起作废。
+        self.media = False
         self.started = time.monotonic()
         self.finished = False
 
@@ -46,6 +49,7 @@ class Run:
 
     def snapshot(self) -> dict:
         return {"lane": self.lane, "status": self.status, "sent": self.sent,
+                "media": self.media,
                 "age": round(time.monotonic() - self.started, 2)}
 
 
@@ -122,13 +126,18 @@ class LaneSupervisor:
                 "stats": dict(self.stats)}
 
     async def preempt(self, lane: str) -> int:
-        """取消该 lane 里所有「还没发过消息」的旧任务；返回取消数量。"""
+        """取消该 lane 里所有「还没发过消息」的旧任务；返回取消数量。
+
+        带媒体的轮（图片/语音/卡片）不动：它可能还在等视觉判读，取消就等于把
+        主人刚发的东西整条吞掉（发图后马上补一句话，图就再也没有回复）。
+        这类轮让它照常回完，新消息在后面排队等锁，两条都答。
+        """
         self._prune(lane)
         me = asyncio.current_task()
         victims = []
         for task in list(self._tasks.get(lane, ())):
             run = self._runs.get(task)
-            if task is me or task.done() or run is None or run.sent:
+            if task is me or task.done() or run is None or run.sent or run.media:
                 continue
             run.status = CANCELLED           # 先置状态再 cancel，调用方可能正检查它
             victims.append(task)

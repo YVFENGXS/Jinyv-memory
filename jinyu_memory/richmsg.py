@@ -89,12 +89,16 @@ def tts_voice() -> str:
     return (os.environ.get("RP_TTS_VOICE") or "zh-CN-XiaoyiNeural").strip()
 
 
-def _front_key() -> str:
-    return (os.environ.get("RP_FRONT_KEY") or "").strip()
+def _vision_fb_key() -> str:
+    return (os.environ.get("RP_VISION_KEY") or "").strip()
 
 
-def _tag_model() -> str:
-    return (os.environ.get("RP_TAG_MODEL") or "deepseek-flash").strip()
+def _vision_fb_base() -> str:
+    return (os.environ.get("RP_VISION_BASE") or "").rstrip("/")
+
+
+def _vision_fb_model() -> str:
+    return (os.environ.get("RP_VISION_MODEL") or "").strip()
 
 
 def _glm_key() -> str:
@@ -767,18 +771,27 @@ def _run_with_deadline(func, seconds: float):
 
 
 def _glm_vision(data: bytes, prompt: str, label: str) -> Optional[str]:
-    """GLM 优先判读；任何失败都返回 None，由 _vision_call 回退后台模型。"""
+    """GLM 优先判读；失败返回 None，由 _vision_call 决定还有没有备用视觉模型。"""
     global _glm_down_until
     key = _glm_key()
     if not key or time.time() < _glm_down_until:
         return None
     import httpx
     b64 = base64.b64encode(data).decode()
+    url = f"{_glm_base()}/chat/completions"
+    # 智谱忙时整段不回包；截图文字多时也要给够时间，超时就尽快换下一家
+    timeout = httpx.Timeout(30.0, connect=8.0)
+
+    def post(payload):
+        with httpx.Client(timeout=timeout) as client:
+            return client.post(url, headers={"Authorization": f"Bearer {key}"},
+                               json=payload)
+
     payload = {
         "model": _glm_model(),
         "temperature": 0.1,
         "max_tokens": 4096,
-        # 5.3-flash 始终思考，只能用 low 档压低延迟（关闭会直接 400）
+        # 5.3-flash 始终思考（传 disabled 直接 400），只能用 low 档压低延迟
         "thinking": {"type": "enabled", "level": "low"},
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
@@ -786,30 +799,19 @@ def _glm_vision(data: bytes, prompt: str, label: str) -> Optional[str]:
              "image_url": {"url": f"data:{_mime_of(data)};base64,{b64}"}},
         ]}],
     }
-    url = f"{_glm_base()}/chat/completions"
-    # 智谱忙时整段不回包，读超时给 25 秒：正常 6~12 秒出参，超时就尽快换后台模型
-    timeout = httpx.Timeout(25.0, connect=8.0)
-
-    def post():
-        with httpx.Client(timeout=timeout) as client:
-            return client.post(url, headers={"Authorization": f"Bearer {key}"},
-                               json=payload)
-
     try:
-        resp = _run_with_deadline(post, 30.0)
+        resp = _run_with_deadline(lambda p=payload: post(p), 30.0)
         if resp is None:
             raise TimeoutError("glm_total_timeout")
-    except Exception as exc:            # noqa: BLE001 连不上就回退，别拖慢聊天
-        _glm_down_until = time.time() + (
-            120.0 if isinstance(exc, (TimeoutError, httpx.TimeoutException))
-            else GLM_DOWN_SECONDS)
-        logger.info("[jinyu] GLM 视觉不可用 用途=%s：%s，改用后台模型",
+    except Exception as exc:                # noqa: BLE001 连不上就停，别拖慢聊天
+        _glm_down_until = time.time() + 120.0
+        logger.info("[jinyu] GLM 视觉不可用 用途=%s：%s，本次放弃判读",
                     label, type(exc).__name__)
         return None
     if resp.status_code != 200:
         _glm_down_until = time.time() + (
             600.0 if resp.status_code in (400, 401, 403, 404) else 60.0)
-        logger.info("[jinyu] GLM 视觉失败 用途=%s HTTP %s %s，改用后台模型",
+        logger.info("[jinyu] GLM 视觉失败 用途=%s HTTP %s %s，本次放弃判读",
                     label, resp.status_code, _brief_text(resp.text, 160))
         return None
     content, finish = "", ""
@@ -818,36 +820,53 @@ def _glm_vision(data: bytes, prompt: str, label: str) -> Optional[str]:
         choice = (body.get("choices") or [{}])[0]
         finish = str(choice.get("finish_reason") or "")
         content = str((choice.get("message") or {}).get("content") or "").strip()
-    except Exception:                   # noqa: BLE001 结构不对按失败处理
+    except Exception:                       # noqa: BLE001 结构不对按失败处理
         content = ""
-    if not content or finish == "length":      # 截断的 JSON 解析不了，直接回退
-        _glm_down_until = time.time() + 60.0
-        logger.info("[jinyu] GLM 视觉空结果 用途=%s finish=%s，改用后台模型",
-                    label, finish or "-")
-        return None
-    logger.info("[jinyu] GLM 视觉出参 用途=%s 模型=%s %r",
-                label, _glm_model(), _brief_text(content))
-    return content
+    if content and finish != "length":
+        logger.info("[jinyu] GLM 视觉出参 用途=%s 模型=%s %r",
+                    label, _glm_model(), _brief_text(content))
+        return content
+    _glm_down_until = time.time() + 60.0
+    logger.info("[jinyu] GLM 视觉空结果 用途=%s finish=%s，本次放弃判读",
+                label, finish or "-")
+    return None
 
 
 def _vision_call(data: bytes, prompt: str, label: str = "图片判读") -> str:
-    """视觉请求：配了 GLM 就先问 GLM，失败再走后台模型。"""
+    """视觉请求：先走秒级的备用视觉（RP_VISION_*），失败再走 GLM。
+
+    GLM 5.3-flash 始终思考，一张真实聊天图实测 20-40s，经常比本轮取图时限还长，
+    每张图先白等半分钟、图却赶不上回复；聊天优先，所以把快的那家放前面，
+    GLM 只作兜底。没配 RP_VISION_* 时仍然只用 GLM（它是唯一能看图的通道）。
+
+    聊天模型不一定看得见图（DeepSeek v4-pro 就明确拒绝图片），别再盲目发过去——
+    切主模型后，原来那条回退会打到 Plan 上不存在的 deepseek-flash，直接 404。
+    """
+    key, base, model = _vision_fb_key(), _vision_fb_base(), _vision_fb_model()
+    if key and base and model:
+        fast = _fast_vision(data, prompt, label, key, base, model)
+        if fast:
+            return fast
+        logger.info("[jinyu] 备用视觉失败 用途=%s，改试 GLM", label)
     glm = _glm_vision(data, prompt, label)
     if glm:
         return glm
-    key = _front_key()
-    if not key:
-        raise RuntimeError("no_key")
+    logger.info("[jinyu] 视觉不可用 用途=%s：没有可用视觉模型，跳过", label)
+    return ""
+
+
+def _fast_vision(data: bytes, prompt: str, label: str,
+                 key: str, base: str, model: str) -> str:
+    """走 RP_VISION_* 那家视觉模型（实测 1-3s 就能出结果），失败返回空。"""
     import httpx
-    base = (os.environ.get("RP_LLM_BASE") or "https://api.deepseek.com").rstrip("/")
     b64 = base64.b64encode(data).decode()
     want = 6000
     content = ""
-    logger.info("[jinyu] 后台模型 视觉入参 用途=%s 模型=%s 提示词=%r",
-                label, _tag_model(), _brief_text(prompt))
-    for _ in range(3):
+    logger.info("[jinyu] 备用视觉 入参 用途=%s 模型=%s 提示词=%r",
+                label, model, _brief_text(prompt))
+    for _ in range(2):
         payload = {
-            "model": _tag_model(),
+            "model": model,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
                 {"type": "image_url",
@@ -858,23 +877,30 @@ def _vision_call(data: bytes, prompt: str, label: str = "图片判读") -> str:
         }
         if _think_off():
             payload["thinking"] = {"type": "disabled"}
-        resp = httpx.post(base + "/chat/completions",
-                          headers={"Authorization": f"Bearer {key}"},
-                          json=payload, timeout=60)
+        try:
+            resp = httpx.post(base + "/chat/completions",
+                              headers={"Authorization": f"Bearer {key}"},
+                              json=payload, timeout=30)
+        except Exception as exc:              # noqa: BLE001  失败就交给 GLM 兜底
+            logger.info("[jinyu] 备用视觉 请求失败 用途=%s：%s",
+                        label, type(exc).__name__)
+            return ""
         if resp.status_code != 200:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:120]}")
+            logger.info("[jinyu] 备用视觉 失败 用途=%s HTTP %s %s",
+                        label, resp.status_code, _brief_text(resp.text, 120))
+            return ""
         choice = (resp.json().get("choices") or [{}])[0]
         content = (choice.get("message", {}).get("content") or "").strip()
         finish = choice.get("finish_reason")
         if content and finish != "length":
-            logger.info("[jinyu] 后台模型 视觉出参 用途=%s %r", label,
+            logger.info("[jinyu] 备用视觉 出参 用途=%s %r", label,
                         _brief_text(content))
             return content
         if finish == "length" and want < 16000:
             want *= 2
             continue
         if content:
-            logger.info("[jinyu] 后台模型 视觉出参 用途=%s %r", label,
+            logger.info("[jinyu] 备用视觉 出参 用途=%s %r", label,
                         _brief_text(content))
             return content                   # 截断且预算到顶：交给调用方判错
         time.sleep(1.0)
@@ -1673,8 +1699,8 @@ def rich_hint() -> str:
 大多数回复应该只有文字。你能用的标记只有这些：
 - [[sticker:标签]] 从贴纸库随机发一张贴纸（[[sticker:开心*2]] 随机发两张，最多 *3），可用标签：{tag_line}
 - [[search:两三个关键词]] 搜一张贴合语境的图发出来：要表情包/梗图就在末尾写
-  「表情包」；主人要照片、风景、插画、原画、壁纸时按内容原样写，别加「表情包」
-  和「二次元」（例如 [[search:北京 风景照]]、[[search:原神 插画]]）
+  「表情包」；主人要照片、风景、插画、原画、壁纸时按内容原样写，不加「表情包」
+  （例如 [[search:北京 风景照]]、[[search:原神 插画]]）
   找角色时带上发色、服饰等外观特征，别只写名字（例如 [[search:Claude娘 橙发少女 插画]]）
   本轮工具列表里如果有 search_image，要发图就调用它：它会先把画面描述返回给你，
   你按描述说话，图由插件附上；这时不要再写 [[search:...]]。只有没有这个工具时
@@ -1692,10 +1718,9 @@ def rich_hint() -> str:
 【黄豆小表情 [[face:id]] 默认禁用】主人不喜欢，尤其是争议大的那几款
 （滑稽、斜眼笑、doge、吃瓜、微笑这类）。只有主人自己先发黄豆斗图时才跟着用；
 日常回复一个黄豆都不要加。
-【搜图风格不设限】服务端不按动漫/二次元风格筛图，关键词只描述画面内容：要表情包
-就在末尾带「表情包」（例如 [[search:哭泣 表情包]]）；要实拍照片、建筑、风景、插画，
-按内容原样写（例如 [[search:深圳 高楼 建筑]]、[[search:北京 风景照]]），不要加
-「二次元」「动漫」，也别加「图片」这种泛词。
+【搜图风格不设限】关键词只描述画面内容：要表情包就在末尾带「表情包」
+（例如 [[search:哭泣 表情包]]）；要实拍照片、建筑、风景、插画，按内容原样写
+（例如 [[search:深圳 高楼 建筑]]、[[search:北京 风景照]]），别加「图片」这种泛词。
 【搜图关键词怎么取】主人转过参考图，或说「这种 / 类似这种 / 还有嘛」时，关键词必须
 沿用参考图的外形（发色、服装、角色、动作），不能只用主人顺口的称呼。例：参考图是
 蓝发女仆鲸鱼娘，就写 [[search:蓝发 鲸鱼娘 女仆 表情包]]；只写「蓝色大鱼」会搜回普通

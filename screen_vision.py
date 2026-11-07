@@ -5,7 +5,7 @@
 - 输入是浏览器 canvas 导出的 JPEG（base64 解码后的 bytes）；
 - 屏幕帧的长图（竖屏/长截图）自动切段逐段读，避免只读到开头；
 - 摄像头帧按人物/环境读，不抄证件号、不评价外貌；
-- 优先走 GLM 视觉（RP_GLM_KEY），失败再走后台模型（RP_FRONT_KEY + RP_TAG_MODEL）；
+- 优先走 GLM 视觉（RP_GLM_KEY），失败再走显式配置的备用视觉（RP_VISION_*）；
 - 输出固定 JSON：屏幕读窗口/报错/文件/文字，摄像头读环境/人物/动作/文字。
 
 没有密钥时抛 NoVisionKey；本地联调可设 RP_VISION_MOCK=1 返回固定样例。
@@ -96,15 +96,15 @@ def mock_enabled():
 
 def configured():
     """是否有可用的读屏通道（模拟模式或任一密钥）。"""
-    return mock_enabled() or bool(_glm_key() or _front_key())
+    return mock_enabled() or bool(_glm_key() or _vision_key())
 
 
 def _glm_key():
     return (os.environ.get("RP_GLM_KEY") or "").strip()
 
 
-def _front_key():
-    return (os.environ.get("RP_FRONT_KEY") or "").strip()
+def _vision_key():
+    return (os.environ.get("RP_VISION_KEY") or "").strip()
 
 
 def _glm_model():
@@ -112,8 +112,7 @@ def _glm_model():
 
 
 def _vision_model():
-    return (os.environ.get("RP_VISION_MODEL")
-            or os.environ.get("RP_TAG_MODEL") or "deepseek-flash").strip()
+    return (os.environ.get("RP_VISION_MODEL") or "").strip()
 
 
 def _glm_base():
@@ -122,8 +121,7 @@ def _glm_base():
 
 
 def _llm_base():
-    return (os.environ.get("RP_LLM_BASE")
-            or "https://api.deepseek.com").rstrip("/")
+    return (os.environ.get("RP_VISION_BASE") or "").rstrip("/")
 
 
 def _mime_of(data):
@@ -264,12 +262,13 @@ def _call_glm(data, prompt):
 
 
 def _call_model(data, prompt):
-    key = _front_key()
-    if not key:
-        raise NoVisionKey("缺少视觉密钥：请设置 RP_GLM_KEY 或 RP_FRONT_KEY")
+    key, base, model = _vision_key(), _llm_base(), _vision_model()
+    if not (key and base and model):
+        raise NoVisionKey("缺少备用视觉模型：请设置 RP_VISION_KEY / "
+                          "RP_VISION_BASE / RP_VISION_MODEL")
     b64 = base64.b64encode(data).decode()
     payload = {
-        "model": _vision_model(),
+        "model": model,
         "max_tokens": 6000,
         "temperature": 0.1,
         "messages": [{"role": "user", "content": [
@@ -424,8 +423,8 @@ def read_frame(data, focus=""):
         out = dict(MOCK_READING, files=list(MOCK_READING["files"]),
                    mode="screen", truncated=False, provider="mock", segments=1)
         return out
-    if not (_glm_key() or _front_key()):
-        raise NoVisionKey("缺少视觉密钥：请设置 RP_GLM_KEY 或 RP_FRONT_KEY")
+    if not (_glm_key() or _vision_key()):
+        raise NoVisionKey("缺少视觉密钥：请设置 RP_GLM_KEY 或 RP_VISION_KEY")
 
     segments = split_tall(data)
     parts = []
@@ -471,8 +470,8 @@ def read_camera(data, focus=""):
         raise ValueError("空帧")
     if mock_enabled():
         return dict(MOCK_CAMERA, provider="mock", truncated=False, segments=1)
-    if not (_glm_key() or _front_key()):
-        raise NoVisionKey("缺少视觉密钥：请设置 RP_GLM_KEY 或 RP_FRONT_KEY")
+    if not (_glm_key() or _vision_key()):
+        raise NoVisionKey("缺少视觉密钥：请设置 RP_GLM_KEY 或 RP_VISION_KEY")
 
     jpeg = prepare_jpeg(data)
     if not jpeg:

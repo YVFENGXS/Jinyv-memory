@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS self_state(
   last_report TEXT NOT NULL DEFAULT '',
   next_intent TEXT NOT NULL DEFAULT '',
   next_wake_ts REAL NOT NULL DEFAULT 0,
+  paused INTEGER NOT NULL DEFAULT 0,
   updated_ts REAL NOT NULL DEFAULT 0);
 
 CREATE TABLE IF NOT EXISTS diary(
@@ -208,6 +209,10 @@ def init(path, sid: str, uid: int, gid: int = 0, char: str = "jinyu") -> None:
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA busy_timeout=10000")
         con.executescript(_SCHEMA)
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(self_state)")}
+        if "paused" not in cols:
+            con.execute("ALTER TABLE self_state ADD COLUMN"
+                        " paused INTEGER NOT NULL DEFAULT 0")
         con.commit()
         _conn = con
     _char, _sid, _uid, _gid = char, str(sid or ""), int(uid or 0), int(gid or 0)
@@ -242,8 +247,27 @@ def close() -> None:
 
 
 def pause(value: bool = True) -> None:
+    """暂停/恢复自主作息，并持久化：重启后仍保持。
+
+    暂停只挡 worker（`_loop` 里判断 `_paused`），不改已排的 job：
+    恢复后过期 job 由 `_tick_skip_reason` / 宽限期自然跳过。
+    """
     global _paused
-    _paused = bool(value)
+    value = bool(value)
+    changed = value != _paused
+    _paused = value
+    if not ready():
+        return
+    try:
+        with _lock:
+            con = _db()
+            con.execute("UPDATE self_state SET paused=?, updated_ts=? WHERE id=1",
+                        (int(value), _now()))
+            con.commit()
+    except Exception as exc:                    # noqa: BLE001 写库失败不阻塞开关
+        print(f"[autonomy] pause persist failed: {exc}")
+    if changed:
+        _event("pause", {"value": value})
 
 
 def paused() -> bool:
@@ -326,11 +350,14 @@ def _bump(day: str, field: str, amount: float = 1) -> None:
 
 
 def _ensure_state() -> None:
+    global _paused
     with _lock:
         con = _db()
         if not con.execute("SELECT 1 FROM self_state WHERE id=1").fetchone():
             con.execute("INSERT INTO self_state(id) VALUES (1)")
             con.commit()
+        row = con.execute("SELECT paused FROM self_state WHERE id=1").fetchone()
+    _paused = bool(row["paused"]) if row else False
 
 
 def state() -> dict:
@@ -725,17 +752,22 @@ async def _run_tick(job: dict) -> None:
     recent = _recent()
     last_user = _cut(recent.get("last_user") or "", 120) or "（没有记录）"
     recent_talk = _cut(recent.get("recent") or "", 260) or "（最近没有对话）"
+    recent_facts = _cut(recent.get("facts") or "", 200) or "（最近没有新记下的事）"
+    said = _cut(recent.get("said") or "", 300)
     now_dt = datetime.fromtimestamp(now)
     messages = [
         {"role": "system",
          "content": _persona_line() +
          "\n这是你自己的整点报点：想一想现在有没有真的想对主人说的话。"
-         "不要打卡式问候，不要重复上一次的话；没有话说就保持安静。"
+         "不要打卡式问候，不要重复上一次的话；最近记下的都是已经聊过的事，"
+         "别再当成还没问过。没有话说就保持安静。"
          "只输出 JSON：{\"speak\": true/false, \"text\": \"要说的话\","
          " \"reason\": \"为什么说或不说\"}。text 最多 80 字，不要带系统词。"},
         {"role": "user",
          "content": (f"现在是 {now_dt:%Y-%m-%d %H:%M} 星期{'一二三四五六日'[now_dt.weekday()]}。\n"
                      f"主人最后一句：{last_user}\n最近对话：{recent_talk}\n"
+                     f"主人近三小时说过：{said or '（没有）'}\n"
+                     f"最近记下的：{recent_facts}\n"
                      f"{_state_block()}\n今天还能主动开口 {left} 次。"
                      "现在想说话吗？")},
     ]
@@ -914,6 +946,8 @@ async def _run_wake(job: dict) -> None:
              "content": (f"现在是 {datetime.fromtimestamp(started):%Y-%m-%d %H:%M}。\n"
                          f"计划意图：{payload.get('intent') or '随便看看'}\n"
                          f"最近对话：{_cut(recent.get('recent') or '', 220)}\n"
+                         f"主人近三小时说过：{_cut(recent.get('said') or '', 260) or '（无）'}\n"
+                         f"最近记下的：{_cut(recent.get('facts') or '', 200) or '（无）'}\n"
                          f"{_state_block()}\n{_diary_block()}\n"
                          f"今天还剩外部动作 "
                          f"{min(EXTERNAL_UNITS_WAKE, max(0, EXTERNAL_UNITS_DAY - int(usage.get('t1') or 0)))} 次、"

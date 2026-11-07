@@ -5,6 +5,10 @@
   RP_FRONT_KEY / RP_BACK_KEY        必填
   RP_FRONT_MODEL / RP_BACK_MODEL    选填，默认 deepseek-v4-pro / deepseek-flash
   RP_LLM_BASE                       选填，默认 https://api.deepseek.com
+  RP_FALLBACK_KEY                   选填，主模型欠费/鉴权失败时自动切到这家
+  RP_FALLBACK_BASE                  选填，备用接口地址，默认 https://api.deepseek.com
+  RP_FALLBACK_FRONT_MODEL           选填，备用前台模型，默认 deepseek-v4-pro
+  RP_FALLBACK_BACK_MODEL            选填，备用后台模型，默认 deepseek-flash
 urllib 会读取 http(s)_proxy，适配远端沙箱的出口代理。
 """
 import json
@@ -166,9 +170,22 @@ def _retry_after(error):
         return None
 
 
+def _quota_error(code, detail) -> bool:
+    """主模型是否「这家不能用了」：鉴权失败、欠费/额度耗尽。
+
+    这类错误重试没意义，直接切备用；普通 429 限流仍按原逻辑退避重试。
+    """
+    if code in (401, 402, 403):
+        return True
+    low = str(detail or "").lower()
+    return any(w in low for w in ("quota", "balance", "insufficient", "arrear",
+                                  "exhaust", "fuel", "payment", "billing",
+                                  "欠费", "额度"))
+
+
 class LLM:
     def __init__(self, key, model, base=None, timeout=120, retries=4, thinking=None,
-                 role=""):
+                 role="", fallback=None):
         if not key:
             raise ValueError("缺少 API key：请设置 RP_FRONT_KEY / RP_BACK_KEY")
         self.key, self.model = key, model
@@ -179,6 +196,11 @@ class LLM:
         self.role = role
         self.calls = 0
         self.last_usage = {}                 # 最近一次 API usage（水位实测用）
+        fb = fallback or {}
+        self.fb_key = str(fb.get("key") or "")
+        self.fb_model = str(fb.get("model") or "")
+        self.fb_base = str(fb.get("base") or "https://api.deepseek.com").rstrip("/")
+        self._fallback_active = False        # 主模型欠费后，本进程内持续走备用
 
     def chat(self, messages, temperature=0.7, max_tokens=1200, json_mode=False):
         payload = {"model": self.model, "messages": messages,
@@ -221,16 +243,36 @@ class LLM:
         return content, calls
 
     def _complete(self, payload, max_tokens):
-        """带重试的补全，返回原始 message（可能只有 tool_calls 没有 content）。"""
-        want = max_tokens
-        last = None
+        """带重试与欠费兜底的补全，返回原始 message（可能有 tool_calls 没 content）。"""
         started = time.time()
+        primary = {"key": self.key, "model": self.model, "base": self.base}
+        fb = None
+        if self.fb_key and self.fb_model:
+            fb = {"key": self.fb_key, "model": self.fb_model, "base": self.fb_base}
+        if self._fallback_active and fb:       # 已确认欠费：不再浪费一次主请求
+            return self._complete_one(fb, payload, max_tokens, started)
+        try:
+            return self._complete_one(primary, payload, max_tokens, started)
+        except RuntimeError as exc:
+            if not fb:
+                raise
+            sticky = bool(getattr(exc, "switch_sticky", False))
+            logger.warning("[jinyu] 主模型 %s 不可用，切备用 %s（%s）：%s",
+                           self.model, fb["model"],
+                           "本进程后续都用备用" if sticky else "仅本次",
+                           str(exc)[:200])
+            self._fallback_active = self._fallback_active or sticky
+            return self._complete_one(fb, payload, max_tokens, started)
+
+    def _complete_one(self, prov, payload, want, started):
+        payload = dict(payload, model=prov["model"])
+        last = None
         if self.role == "back":                        # 后台模型的输入也进 monitor 日志
             logger.info("[jinyu] 后台模型 入参 模型=%s %s",
-                        self.model, _messages_brief(payload["messages"]))
+                        prov["model"], _messages_brief(payload["messages"]))
         for i in range(self.retries):
             try:
-                with urllib.request.urlopen(self._req(payload, want),
+                with urllib.request.urlopen(self._req(payload, want, prov),
                                             timeout=self.timeout) as r:
                     body = json.loads(r.read().decode())
                 self.last_usage = body.get("usage") or {}
@@ -240,10 +282,10 @@ class LLM:
                     total = (hit or 0) + (miss or 0)
                     rate = ((hit or 0) / total * 100) if total else 0.0
                     logger.info("[jinyu] 缓存命中 模型=%s hit=%s miss=%s 命中率=%.1f%%",
-                                self.model, hit or 0, miss or 0, rate)
+                                prov["model"], hit or 0, miss or 0, rate)
                 elif cs.get("cached_tokens") is not None:
                     logger.info("[jinyu] 缓存命中 模型=%s cached=%s",
-                                self.model, cs["cached_tokens"])
+                                prov["model"], cs["cached_tokens"])
                 choice = body["choices"][0]
                 message = choice.get("message") or {}
                 content = (message.get("content") or "").strip()
@@ -258,7 +300,7 @@ class LLM:
                     self.calls += 1
                     if self.role == "back":
                         logger.info("[jinyu] 后台模型 出参 模型=%s 耗时=%.1fs %s",
-                                    self.model, time.time() - started,
+                                    prov["model"], time.time() - started,
                                     _brief(content or "[tool_calls]"))
                     return message
                 # 推理模型可能把预算全花在 reasoning 上；截断则加倍重试
@@ -270,6 +312,10 @@ class LLM:
             except urllib.error.HTTPError as e:
                 detail = e.read().decode(errors="ignore")[:300]
                 last = f"HTTP {e.code}: {detail}"
+                if _quota_error(e.code, detail):
+                    err = RuntimeError(last)
+                    err.switch_sticky = True
+                    raise err from e
                 if e.code in (429, 500, 502, 503, 504):
                     time.sleep(retry_delay(i, _retry_after(e)))
                     continue
@@ -279,25 +325,38 @@ class LLM:
             except Exception as e:                      # 超时/网络抖动：退避后重试
                 last = f"{type(e).__name__}: {e}"
                 time.sleep(retry_delay(i))
-        raise RuntimeError(f"LLM 调用失败（{self.retries} 次）：{last}")
+        err = RuntimeError(f"LLM 调用失败（{self.retries} 次）：{last}")
+        err.switch_sticky = True               # 连续失败：本进程后续直接走备用
+        raise err
 
-    def _req(self, payload, max_tokens):
+    def _req(self, payload, max_tokens, prov):
         body = dict(payload, max_tokens=max_tokens)
         return urllib.request.Request(
-            self.base + "/chat/completions",
+            prov["base"] + "/chat/completions",
             data=json.dumps(body, ensure_ascii=False).encode(),
             headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + self.key})
+                     "Authorization": "Bearer " + prov["key"]})
 
 
 def from_env(role):
     """role='front' | 'back'"""
     prefix = "RP_FRONT" if role == "front" else "RP_BACK"
     default = "deepseek-v4-pro" if role == "front" else "deepseek-flash"
+    fb_key = (os.environ.get("RP_FALLBACK_" + role.upper() + "_KEY")
+              or os.environ.get("RP_FALLBACK_KEY") or "").strip()
+    fallback = None
+    if fb_key:
+        fallback = {
+            "key": fb_key,
+            "model": (os.environ.get("RP_FALLBACK_" + role.upper() + "_MODEL")
+                      or default),
+            "base": (os.environ.get("RP_FALLBACK_BASE")
+                     or "https://api.deepseek.com"),
+        }
     return LLM(os.environ.get(prefix + "_KEY", ""),
                os.environ.get(prefix + "_MODEL", default),
                thinking=os.environ.get(prefix + "_THINKING", ""),
-               role=role)
+               role=role, fallback=fallback)
 
 
 # ---------- 账户余额（DeepSeek /user/balance） ----------

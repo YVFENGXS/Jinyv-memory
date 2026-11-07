@@ -16,12 +16,13 @@ R6-R9 阶段二：事件卡扩列（rel_hooks / knowledge_boundary / importance 
 保留：turns 同步落库、游标只在卡落库后推进、账本按 (sid,cid) 隔离。
 演示：python demo.py；回归：python test_regression.py
 """
-import copy, difflib, hashlib, json, logging, math, os, queue, re, sqlite3, threading, time, uuid
+import copy, difflib, hashlib, json, logging, math, os, queue, re, sqlite3, struct
+import threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import conflict, context_budget, control, disclosure, embedding, gate, gradient
-import compression, promise, questions, retention, retriever, scoring, sealing
+import compression, merge_ann, promise, questions, retention, retriever, scoring, sealing
 from persona_guard import PersonaGuard
 from summarizer import parse as parse_json, summarize
 
@@ -196,6 +197,16 @@ def _query_variants(query):
     return out
 
 
+def _recall_cap(query):
+    """本轮最多给前台几张事件卡：单话题 4 张，每个额外分句 +2 张，封顶 10。
+
+    长句里常有两个以上话题，固定 4 张会让后面的话题一张都分不到；
+    但也不能无限给，卡是原始事件，越多越挤注意力。词条不走这个上限。
+    """
+    parts = [p for p in _QUERY_SPLIT.split(str(query or "")) if len(p.strip()) >= 4]
+    return min(RECALL_CAP_MAX, RECALL_CAP_BASE + 2 * max(0, len(parts) - 1))
+
+
 def _cos(a, b):
     if not a or not b:
         return 0.0
@@ -356,6 +367,30 @@ CARD_VERIFY_PROMPT = """你在做事件卡合并的最后审核。逐组判断�
 same：是不是同一件事；extra：合并结果有没有来源卡里没有的内容。拿不准都填 false。"""
 
 
+# 词条改写判定：字面不重合的两条也可能只是换个说法（同一件事说两遍），
+# 但字面分不开它和「同话题不同事」（实测两者都落在 Jaccard 0.19~0.28），
+# 只能让模型按「同主语 + 同谓语」判一次。判定失败按驳回处理。
+FACT_REPHRASE_PROMPT = """你在判断两条长期记忆词条是不是「同一件事换了个说法」。
+
+只有下面四条同时成立时才填 same=true：
+- 主语相同：指同一个人／同一件东西（都提到「主人」不算，要真的指同一对象）；
+- 关系相同：命名/称呼、偏好、归属、能力、外形设定、事件，必须是同一种；
+- 差距只在措辞、语气、时间状语，没有换对象、没有换内容；
+- 多出来的那一点只能是对同一件事的细节补充。
+
+填 false 的典型情况：
+- 同一场景下的两件不同的事（「主人上课时把评论区的话分享给瑾瑜看」与「主人上课时给瑾瑜发消息和表情包」）；
+- 同一人物的不同关系、不同清单条目；
+- 一条在说事实，另一条在说这条事实要记住／怎么处理。
+
+待判（组号｜A｜B）：
+{rows}
+
+逐条输出 JSON：
+{"pairs":[{"n":1,"same":true,"why":"..."}]}
+same 只填 true/false；拿不准填 false。不要照抄示例。"""
+
+
 # 词条合并二次复核：实测第一轮判组把「共享人物但谓语不同」的事实并到一起
 # （误并 10/15），提示词规则压不住，落库前再让模型逐组做一次同谓词判定。
 # 复核失败按「全部驳回」处理：漏并只是多留一条，错并会永久改坏记忆。
@@ -401,10 +436,20 @@ def _novel_ratio(merged, sources):
 
 # 自动词条合并的置信门槛：只有「几乎同一句话」或「同一事实的时间线更新」才落库。
 # 实测 2 条来源的误并 Jaccard 都在 0.21 以下，真正的重复表述在 0.40 以上；
-# 时间线更新则要求合并结果同时写出旧态与新态（原/曾 → 现/已/修好）。
+# 时间线更新则要求合并结果同时写出旧态与新态（原来/之前 → 现在/已经/修好）。
 AUTO_MERGE_JACCARD = 0.40
-OLD_MARKS = ("原来", "原先", "原本", "原", "曾", "之前", "本来")
-NEW_MARKS = ("现在", "现", "已", "目前", "后来", "不再", "修好", "改成", "补充")
+# 三条以上时不再要求「两两都 ≥0.40」（组里只要有一对是改写表述整组就被毙，
+# 实测多事实组几乎全灭）：改为至少一对 ≥0.40、其余 ≥0.20。
+AUTO_MERGE_SOFT_JACCARD = 0.20
+# 时间线标记只用双字以上：「现」「原」「已」「曾」这类单字会被「发现」「原因」
+# 「而已」「曾经」里的字误命中，让 Jaccard=0 的组也能绕过门槛。
+OLD_MARKS = ("原来", "原先", "原本", "之前", "本来", "曾经")
+NEW_MARKS = ("现在", "目前", "后来", "不再", "修好", "改成", "改为", "补充")
+
+# ANN 对子送审门槛：0.85 以下同话题不同事的比例太高（实测 0.887 的两对都是真不同事），
+# 交给模型判不划算；0.85 以上 8 对里 5 对同一件事、3 对真不同，判定能筛住。
+ANN_JUDGE_COS = 0.85
+ANN_JUDGE_MAX = 20        # 每批最多送 20 对，防止一轮成本失控
 
 
 def _confident_fact_merge(texts, merged):
@@ -418,7 +463,8 @@ def _confident_fact_merge(texts, merged):
             return True
         return (any(m in merged for m in OLD_MARKS)
                 and any(m in merged for m in NEW_MARKS))
-    return min(js) >= AUTO_MERGE_JACCARD
+    return (max(js) >= AUTO_MERGE_JACCARD
+            and min(js) >= AUTO_MERGE_SOFT_JACCARD)
 
 
 def _fact_tags(raw):
@@ -558,6 +604,13 @@ try:
     VEC_POOL = max(4, int(os.environ.get("RP_VEC_POOL") or 8))
 except ValueError:
     VEC_POOL = 8
+# 本轮注入给前台的事件卡配额：按话题数放宽，封顶 10。
+# 词条不受这个上限约束——词条是压缩后的结论，一条就够用，且自带热力兜底。
+RECALL_CAP_BASE = max(1, int(os.environ.get("RP_RECALL_CAP") or 4))
+RECALL_CAP_MAX = max(RECALL_CAP_BASE, int(os.environ.get("RP_RECALL_CAP_MAX") or 10))
+# 低关联过滤只对事件卡：既没有字面钩子命中、相对分又低于此值，判为本轮噪音。
+# 不作用于词条，也不删任何记忆——只是这轮不塞进 prompt。
+RECALL_MIN_REL = 0.35
 # 后台查询分解：只在「字面命中 ≤1 且像在问旧事」时触发；MockBack/无后台时自动跳过。
 # 真实后台实测对 recall 无增益（0.650→0.650），默认关，保留给后续换更强的检索器再试。
 QDECOMP_ON = (os.environ.get("RP_QDECOMP") or "0").strip().lower() not in {
@@ -657,21 +710,26 @@ def _to_midnight(now: datetime) -> str:
 
 
 def _now_line(last_dt=None) -> str:
-    """「现在几点」锚：随账本每轮注入，并分两档交代「上次说话是什么时候」。
+    """「现在几点」锚 + 距上一条消息多久，随账本每轮注入。
 
-    - 30 分钟 ~ 2 小时：只给时长，模型知道「刚过了一会儿」；
+    模型看不到墙上的钟，也量不出「隔了 3 分钟」和「隔了 3 小时」的差别：
+    - 1 分钟以内：同一口气连发，不写；
+    - 1 分钟 ~ 2 小时：只给时长，让它知道是刚聊完还是隔了一阵；
     - ≥2 小时：写出上次发言的完整日期时间 + 差值，跨天时点明，避免把
       「昨晚 21:30」当成「刚才」。时间一律服务端算好，不让模型心算。
+    last_dt 是同一会话窗口里的上一条消息；会话轮换后没有更早消息时写明是第一条。
     """
     now = datetime.now().astimezone()
-    line = f"当前时间：{now:%Y-%m-%d %H:%M} {_week(now)}（距零点还有 {_to_midnight(now)}）"
+    head = (f"当前时间：{now:%Y-%m-%d %H:%M} {_week(now)}"
+            f"（距零点还有 {_to_midnight(now)}")
     if last_dt is None:
-        return line
+        return head + "）\n距上一条消息：本会话还没有更早的消息（这是这个会话窗口的第一句）"
     sec = max(0.0, (now - last_dt).total_seconds())
-    if sec < RECENT_GAP_SECONDS:
-        return line
+    if sec < 60:
+        return head + "）"
     if sec < LONG_GAP_SECONDS:
-        return line + f"（距最近一条消息已约 {_human_gap(sec)}）"
+        return head + f"，距上一条消息 {_human_gap(sec)}）"
+    line = head + "）"
     days = (now.date() - last_dt.date()).days
     line += (f"\n上次发言：{last_dt:%Y-%m-%d %H:%M} {_week(last_dt)}"
              f"（{_day_label(last_dt, now)}），距今 {_human_gap(sec)}")
@@ -804,6 +862,9 @@ CREATE TABLE IF NOT EXISTS merge_log(
   keep_id TEXT NOT NULL, merged TEXT NOT NULL, sources TEXT NOT NULL,
   created_at TEXT DEFAULT (datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_merge_log ON merge_log(character_id, id);
+CREATE TABLE IF NOT EXISTS merge_state(
+  character_id TEXT PRIMARY KEY,
+  last_run TEXT NOT NULL DEFAULT (datetime('now')));
 CREATE TABLE IF NOT EXISTS dream_runs(
   character_id TEXT NOT NULL, day TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',
   created_at TEXT DEFAULT (datetime('now')), PRIMARY KEY(character_id, day));
@@ -1055,6 +1116,22 @@ FACT_EXTRA_COLS = {
 }
 
 
+def _compressed_meta(raw) -> bool:
+    """卡是否被压缩/梯度写过：meta 里有 episode、原子或闭环字段。
+
+    列默认值是 '{}'，不能拿「非空」当判据，否则所有卡都会被当成已压缩。
+    """
+    if isinstance(raw, dict):
+        meta = raw
+    else:
+        try:
+            meta = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return bool(str(raw or "").strip())
+    return any(k in meta for k in ("episode_id", "must_keep_atoms", "source_turns",
+                                   "closure_state"))
+
+
 def _card(row) -> dict:
     """行 → 卡片 dict：JSON 列解析 + 新列兜底默认值（兼容阶段一的老行）。"""
     d = dict(row)
@@ -1211,6 +1288,25 @@ class DB:
         with self._c() as c:
             return c.execute(f"SELECT COUNT(*) FROM turns WHERE character_id=? AND {cond}",
                              [cid] + args).fetchone()[0]
+
+    def turn_time(self, sid, cid, upto=None):
+        """上一轮落库时间（UTC 文本），用来算「距上一条消息多久」。
+
+        不能拿热窗 turns[-1] 算：压缩后 hot_lo / open episode 会把起点抬到
+        upto 之后，热窗虽然空了，上一句其实还在（只是被挤出了窗口），
+        按空窗口算就会误报「这是本会话第一句」。
+        """
+        cond, id_args = _sid_filter(sid)
+        sql = ("SELECT created_at FROM turns"
+               f" WHERE character_id=? AND {cond}")
+        args = [cid] + id_args
+        if upto is not None:
+            sql += " AND turn_idx<=?"
+            args.append(int(upto))
+        sql += " ORDER BY turn_idx DESC LIMIT 1"
+        with self._c() as c:
+            row = c.execute(sql, args).fetchone()
+        return str(row["created_at"]) if row else ""
 
     def get_turns(self, sid, cid, lo=1, hi=None, include_archived=False):
         """闭区间 [lo, hi]；hi=None 到最新。默认跳过软归档原文，审计回捞时显式打开。"""
@@ -1424,9 +1520,13 @@ class DB:
                     text_hit = 1
             hit = (3.0 if tag_hit else 0.0) + text_hit
             spk = str(r["speaker"] or "")
-            label = f"[{spk}] {r['fact']}" if spk else r["fact"]
-            item = {"id": r["id"], "label": label, "tags": tags,
-                    "turn_end": int(r["turn_end"] or 0)}
+            day = _mmdd(r["created_at"])
+            # 词条必须自带日期：不带日期时模型会把「昨天没课」当成永久设定，
+            # 今天照样按它判断。设定类不标日期（本来就长期有效），其余标到天。
+            mark = "[设定]" if cat == "设定" else f"[{day + ' ' if day else ''}{cat}]"
+            label = f"{mark} " + (f"[{spk}] {r['fact']}" if spk else r["fact"])
+            item = {"id": r["id"], "label": label, "tags": tags, "date": day,
+                    "cat": cat, "turn_end": int(r["turn_end"] or 0)}
             bias = SPEAKER_BIAS if (speaker and spk == speaker) else 1.0
             if not FACT_SCORE_ON:
                 scored.append((hit * (0.5 + heat) * bias if hit else 0.0,
@@ -1597,6 +1697,24 @@ class DB:
                 (cid, base_sid, base_sid + "#%")).fetchall()
         return [dict(r) for r in rows]
 
+    def recent_facts(self, cid, base_sid, hours=3, limit=6):
+        """最近几小时新落库的词条：给自主作息当「刚聊过什么」。
+
+        整点报点只看最近几轮对话，午饭这种十几轮前的事会看不见，
+        醒来就又问一遍。这里直接按写入时间捞，和新词的时效一致。
+        """
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT fact FROM durable_facts WHERE character_id=?"
+                " AND (session_id=? OR session_id LIKE ?)"
+                " AND IFNULL(retracted_at,'')=''"
+                " AND (IFNULL(expires_at,'')='' OR expires_at >= datetime('now'))"
+                " AND created_at >= datetime('now', ?)"
+                " ORDER BY created_at DESC, id DESC LIMIT ?",
+                (cid, base_sid, base_sid + "#%",
+                 f"-{max(1, int(hours))} hours", max(1, int(limit)))).fetchall()
+        return [str(r["fact"]) for r in rows]
+
     def apply_fact_merge(self, cid, keep_id, drop_facts, fact, tags, importance,
                          category, expires_at):
         """把一组重复事实并到 keep_id：改正文/标签/热力，删掉其余（含 epoch 副本）。"""
@@ -1630,6 +1748,9 @@ class DB:
                           " WHERE id=? AND character_id=?",
                           (params[1], params[2], params[3], params[4],
                            max(0, removed), keep_id, cid))
+            # 正文改过，旧向量作废；下次 ANN 会按新正文重新算
+            c.execute("DELETE FROM vectors WHERE kind='fact' AND ref_id=?",
+                      (str(keep_id),))
         return removed
 
     def count_cards(self, sid, cid) -> int:
@@ -1638,18 +1759,21 @@ class DB:
                              " WHERE session_id=? AND character_id=?",
                              (sid, cid)).fetchone()[0]
 
-    def card_rows(self, sid, cid, limit=500):
+    def card_rows(self, sid, cid, limit=500, protect=True):
         """事件卡合并用：本会话明细卡，按时间线升序（旧→新）。
 
         只取 layer='event'：章节卡是索引，不能被管理员合并当成普通卡删掉，
-        否则 covers/layer 一起丢失。
+        否则 covers/layer 一起丢失。protect 时跳过已带 meta_json 的卡——
+        压缩写过的卡挂着 must-keep 原子和 episode 证据，合并只改摘要不会迁移。
         """
         with self._c() as c:
             rows = c.execute("SELECT * FROM event_cards WHERE session_id=? AND character_id=?"
                              " AND COALESCE(layer,'event')='event'"
                              " ORDER BY turn_start, turn_end LIMIT ?",
                              (sid, cid, max(2, int(limit)))).fetchall()
-        return [_card(r) for r in rows]
+        cards = [_card(r) for r in rows]
+        return [k for k in cards
+                if not (protect and _compressed_meta(k.get("meta_json") or {}))]
 
     def card_owners(self, cid):
         """事件卡合并用：按 base_sid 聚合卡片数（epoch 分开算，合并落在最新 epoch）。"""
@@ -1668,15 +1792,22 @@ class DB:
         返回 (实际删除数, 实际被删的 event_id 列表)，合并记录据此只登记真删的卡。
         """
         with self._c() as c:
-            keep = c.execute("SELECT event_id, importance FROM event_cards"
+            keep = c.execute("SELECT event_id, importance, meta_json FROM event_cards"
                              " WHERE event_id=? AND character_id=?",
                              (keep_id, cid)).fetchone()
-            if not keep:
-                return 0, []
+            if not keep or _compressed_meta(keep["meta_json"]):
+                return 0, []                 # 压缩写过的卡不合并（原子/证据不迁移）
             drop = []
             for eid in drop_ids:
                 if eid == keep_id:
                     continue
+                row = c.execute("SELECT meta_json FROM event_cards"
+                                " WHERE event_id=? AND character_id=?",
+                                (eid, cid)).fetchone()
+                if not row:
+                    continue
+                if _compressed_meta(row["meta_json"]):
+                    continue                 # 带压缩元数据的卡挂着证据，跳过
                 if c.execute("SELECT 1 FROM cross_session_pin WHERE event_id=?",
                              (eid,)).fetchone():
                     continue                     # 被人工置顶的卡不删
@@ -1720,6 +1851,23 @@ class DB:
                 f" FROM merge_log WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
                 args + [max(1, int(limit)), max(0, int(offset))]).fetchall()
         return [dict(r) for r in rows], total
+
+    def merge_last_run(self, cid):
+        """上一次合并扫描的时间（SQLite UTC 文本）；从没跑过返回空串。"""
+        with self._c() as c:
+            row = c.execute("SELECT last_run FROM merge_state WHERE character_id=?",
+                            (cid,)).fetchone()
+        return str(row["last_run"]) if row else ""
+
+    def mark_merge_run(self, cid, when=""):
+        """记下本轮扫描时间：重启后按它算下一次，不把等待窗口重新计时。"""
+        with self._c() as c:
+            c.execute("INSERT INTO merge_state(character_id,last_run)"
+                      " VALUES(?, COALESCE(NULLIF(?,''), datetime('now')))"
+                      " ON CONFLICT(character_id) DO UPDATE SET"
+                      " last_run=COALESCE(NULLIF(?,''), datetime('now'))",
+                      (cid, str(when or ""), str(when or "")))
+        return self.merge_last_run(cid)
 
     def get_merge_log(self, log_id, cid):
         with self._c() as c:
@@ -1919,14 +2067,42 @@ class DB:
                 (str(model), sid, cid)).fetchall()
         return [(r["event_id"], r["vec"], int(r["dim"])) for r in rows]
 
-    def sweep_vectors(self, cid):
-        """清掉已删除卡片的孤儿向量；返回清理条数。"""
+    def fact_vectors(self, cid, base_sid, model):
+        """某会话（含 epoch 副本）已有向量的事实：[(id, blob, dim)]。"""
         with self._c() as c:
-            cur = c.execute(
+            rows = c.execute(
+                "SELECT f.id, v.vec, v.dim FROM durable_facts f"
+                " JOIN vectors v ON v.kind='fact' AND v.ref_id=CAST(f.id AS TEXT)"
+                " AND v.model=?"
+                " WHERE f.character_id=? AND (f.session_id=? OR f.session_id LIKE ?)",
+                (str(model), cid, base_sid, base_sid + "#%")).fetchall()
+        return [(int(r["id"]), r["vec"], int(r["dim"])) for r in rows]
+
+    def facts_missing_vectors(self, cid, base_sid, model, limit=64):
+        """还没算过向量的事实（按新到旧，单次限量，避免一次打爆 embedding）。"""
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT f.id, f.fact FROM durable_facts f"
+                " LEFT JOIN vectors v ON v.kind='fact' AND v.ref_id=CAST(f.id AS TEXT)"
+                " AND v.model=?"
+                " WHERE f.character_id=? AND (f.session_id=? OR f.session_id LIKE ?)"
+                " AND v.ref_id IS NULL ORDER BY f.id DESC LIMIT ?",
+                (str(model), cid, base_sid, base_sid + "#%",
+                 max(1, int(limit)))).fetchall()
+        return [{"id": int(r["id"]), "fact": str(r["fact"])} for r in rows]
+
+    def sweep_vectors(self, cid):
+        """清掉已删除卡/事实的孤儿向量；返回清理条数。"""
+        with self._c() as c:
+            card = c.execute(
                 "DELETE FROM vectors WHERE character_id=? AND kind='card'"
                 " AND ref_id NOT IN (SELECT event_id FROM event_cards"
                 " WHERE character_id=?)", (cid, cid))
-        return max(0, cur.rowcount)
+            fact = c.execute(
+                "DELETE FROM vectors WHERE character_id=? AND kind='fact'"
+                " AND ref_id NOT IN (SELECT CAST(id AS TEXT) FROM durable_facts"
+                " WHERE character_id=?)", (cid, cid))
+        return max(0, card.rowcount) + max(0, fact.rowcount)
 
     def latest_sid(self, base_sid, cid):
         """某会话最新 epoch 的 sid；事件卡按 session_id 存，合并要落在当前 epoch。"""
@@ -2415,6 +2591,21 @@ class RPContextMiddleware:
             "回答时间相关问题前调用，不要自己心算。",
             {"type": "object", "properties": {}},
             self._tool_now)
+        self.register_tool(
+            "manage_promises",
+            "整理自己的未兑现承诺（账本里带 P-xxx 编号的那些）。"
+            "主人同意你自己整理，或某条已经做完、不再需要时调用："
+            "keep=长期保留、不再按临时指令过期；drop=收起（移出账本，可召回）；"
+            "done=已完成销账；goal=给它定一个明确目标。原文不会丢失。",
+            {"type": "object",
+             "properties": {
+                 "action": {"type": "string", "enum": ["keep", "drop", "done", "goal"]},
+                 "ids": {"type": "array", "items": {"type": "string"},
+                         "description": "承诺编号，如 P-003；一次最多 8 条"},
+                 "note": {"type": "string",
+                          "description": "goal 填目标；done 填完成凭据（可选）"}},
+             "required": ["action", "ids"]},
+            self._tool_manage_promises)
 
     def _tool_query_memory(self, args, sid, cid, ctx=None) -> str:
         args = args or {}
@@ -2514,6 +2705,21 @@ class RPContextMiddleware:
         now = datetime.now().astimezone()
         return (now.strftime("%Y-%m-%d %H:%M:%S ") + _week(now)
                 + f"（{now.tzname() or '本地时间'}）；距零点还有 {_to_midnight(now)}")
+
+    def _tool_manage_promises(self, args, sid, cid, ctx=None) -> str:
+        """角色自己整理承诺：只改当前账本，drop/done 保留原文，全部留日志。"""
+        args = args or {}
+        ids = args.get("ids") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        lg = self._ledger(sid, cid)
+        out = promise.manage(lg, args.get("action"), ids,
+                             note=str(args.get("note") or ""),
+                             turn=self.db.max_turn(sid, cid))
+        self.db.save_ledger(sid, cid, lg)
+        logger.info("承诺自整理 sid=%s action=%s ids=%s -> %s",
+                    sid, args.get("action"), ids, out)
+        return out
 
     def _tool_reply(self, msgs, sid, cid, tool_context=None) -> str:
         """前台调用：有工具就最多跑两步，之后强制不带工具收尾。
@@ -3065,11 +3271,14 @@ class RPContextMiddleware:
                                           exclude_ids=recall_exclude)
                 hits = [(s, c) for s, c in hits
                         if not retriever.suspicious(c["summary"])]
-        last_dt = _parse_utc(turns[-1].get("created_at")) if turns else None
+        # 说话间隔要直接查库：热窗会被压缩/换段清空，turns[-1] 空了不代表当时没有上一句
+        last_dt = _parse_utc(self.db.turn_time(sid, cid, upto)) if upto else None
         ledger_txt = _now_line(last_dt) + (
             f"\n情绪：{lg['mood']}\n地点：{lg['location'] or '未知'}\n关系："
             + json.dumps(lg["relationship"], ensure_ascii=False))
-        open_promises = [retriever.clean_text(t, 40) for t in promise.texts(lg)]
+        logger.info("账本时间锚 sid=%s %s", sid, ledger_txt.splitlines()[0])
+        # 承诺行带登记日期：旧指令不能冒充今天还在执行
+        open_promises = promise.inject_lines(lg)
         if open_promises:
             ledger_txt += "\n未兑现承诺：" + "；".join(open_promises)
         anchors = [{"role": "system", "content": persona["core"]},   # 头锚：宪法层，永不截断
@@ -3175,15 +3384,41 @@ class RPContextMiddleware:
                     score += ASSOC_CACHE_BONUS
                 hits = hits + [(score, c) for c in assoc_cards]
                 hits.sort(key=lambda x: float(x[0] or 0.0), reverse=True)
+        # 本轮卡配额：钩子 + 标签回捞 + 向量融合 + 联想是四条路叠加，单路各自的
+        # limit 管不住总数（实测一轮能到 17 张，真正相关的只有 1 张）。
+        # 只截事件卡，不截词条：词条是压缩结论，走 list_facts_detail 自己的预算。
+        if hits:
+            hits.sort(key=lambda x: float(x[0] or 0.0), reverse=True)
+            cap = _recall_cap(query_used)
+            top_hit = float(hits[0][0] or 0.0)
+            kept = []
+            for score, card in hits:
+                if len(kept) >= cap:
+                    break
+                rel = (float(score or 0.0) / top_hit) if top_hit > 0 else 1.0
+                # 低关联过滤：字面钩子命中过的卡一律保留（多话题里的第二张常有字面证据），
+                # 只有「字面没命中 + 相对分太低」才算这轮的噪音。
+                if rel < RECALL_MIN_REL and not retriever.match_cue(card, query_used):
+                    continue
+                kept.append((score, card))
+            if len(kept) < len(hits):
+                logger.info("召回配额 sid=%s 上限=%d 候选=%d 注入=%d 丢弃=%d",
+                            sid, cap, len(hits), len(kept), len(hits) - len(kept))
+            hits = kept
         if facts:
-            anchors[1]["content"] += "\n已记录事实（长期有效）：" + "；".join(facts)
+            anchors[1]["content"] += (
+                "\n已记录事实（方括号是记录日期与类别）：" + "；".join(facts)
+                + "\n带日期的只说明那一天，「今天/明天」不等于现在；拿不准就先问一句，"
+                  "别当成今天仍成立。")
         # 让前台明确知道自己有一整套记忆库：相关的必须先查，查不到才说不记得
         if facts or all_cards:
             anchors[1]["content"] += (
                 f"\n【记忆库】本会话已存 {self.db.count_facts(sid, cid)} 条长期词条、"
                 f"{len(all_cards)} 张事件卡，覆盖过去所有对话。凡是涉及认识的人、发生过的事、"
-                "答应过的事，先对照下列记忆回答，不许说「不记得」；"
-                "只有确实查不到相关记录时，才可以说不记得。")
+                "答应过的事，先对照下列记忆回答，不许说「不记得」。"
+                "但只能对【本轮记忆】里列出的内容声称「记得/翻到过」；"
+                "里面没有的，就直接说这边没翻到，不许编造「我在旧记录里翻到一条残片」这类内容，"
+                "也不许把猜的当成记过的。")
         # (level, weight, msg)：level 越小越先丢；同层里 weight 小的先丢。
         # level 沿用旧 priority 的数字：召回补充 1 < 最近事件/召回首位 2 < 跨会话 3 < 承诺 4。
         sections = []
@@ -3563,11 +3798,12 @@ class RPContextMiddleware:
         return sid
 
     def merge_facts(self, base_sid, cid, apply=False, limit=None,
-                    batch=400, overlap=40):
+                    batch=400, overlap=40, seed_pairs=None):
         """后台模型判重并合并同一会话的长期事实（覆盖整库，不再只看最近 160 条）。
 
         默认一屏装下 400 条：绝大多数会话一次就能看完整库，跨窗口的重复也能一并判掉。
         超过 400 条才滑窗，块间重叠 40 条兜住边界；apply=False 只返回拟合并结果。
+        seed_pairs 是 ANN 找到的相似对（[(a, b, sim)]），补进判定队列，见 _merge_fact_chunk。
         """
         rows = self.db.merge_rows(cid, base_sid)
         if limit:
@@ -3580,14 +3816,53 @@ class RPContextMiddleware:
         while start < len(rows):
             chunk = rows[start:start + size]
             if len(chunk) >= 2:
-                reports += self._merge_fact_chunk(chunk, cid, apply, used)
+                reports += self._merge_fact_chunk(chunk, cid, apply, used, seed_pairs)
             if start + size >= len(rows):
                 break
             start += step
         return reports
 
-    def _merge_fact_chunk(self, rows, cid, apply, used):
-        """滑窗里的一批事实：模型判组 → 校验 → 落地。used 防止跨批重复合并。"""
+    def merge_facts_ann(self, base_sid, cid, threshold=0.72, top_k=4, warm=64):
+        """向量候选（shadow 用）：补算缺向量的事实，输出「可能是同一件事」的对子。
+
+        不改任何合并结果：调用方拿它和模型判出的组做对比，看模型漏了哪些近义重复。
+        每次最多补 warm 条向量，整库几轮就追平，不会把 embedding 一次打爆。
+        """
+        rows = self.db.merge_rows(cid, base_sid)
+        if len(rows) < 2 or not embedding.enabled():
+            return {"rows": len(rows), "vectors": 0, "pairs": []}
+        model = embedding.model_name()
+        miss = self.db.facts_missing_vectors(cid, base_sid, model, warm)
+        if miss:
+            try:
+                vecs = embedding.embed_documents([r["fact"] for r in miss])
+            except embedding.EmbeddingError as e:
+                logger.info("词条向量回填失败，等下一轮：%s", e)
+                vecs = []
+            items = []
+            for r, vec in zip(miss, vecs):
+                try:
+                    items.append((str(r["id"]), embedding.pack(vec), embedding.dim()))
+                except embedding.EmbeddingError:
+                    continue
+            if items:
+                self.db.put_vectors("fact", cid, model, items)
+        vectors = {}
+        for fid, blob, dim in self.db.fact_vectors(cid, base_sid, model):
+            try:
+                vectors[fid] = struct.unpack(f"{dim}f", blob)
+            except struct.error:
+                continue
+        return {"rows": len(rows), "vectors": len(vectors),
+                "pairs": merge_ann.pairs(rows, vectors, threshold=threshold,
+                                         top_k=top_k)}
+
+    def _merge_fact_chunk(self, rows, cid, apply, used, seed_pairs=None):
+        """滑窗里的一批事实：模型判组 → 校验 → 落地。used 防止跨批重复合并。
+
+        seed_pairs 是 ANN 的相似对：字面近重复直接进候选（仍过二次复核），
+        其余按「同主语同谓语」送改写判定。ANN 负责找，判定负责筛。
+        """
         index = {i + 1: r for i, r in enumerate(rows)}
         lines = "\n".join(
             f"{i}｜{r.get('turn_end') or 0}｜{_mmdd(r.get('created_at')) or '—'}｜{r['fact']}"
@@ -3599,7 +3874,7 @@ class RPContextMiddleware:
             temperature=0.2, max_tokens=2000, json_mode=True)
         data = parse_json(reply) or {}
         groups = data.get("groups") if isinstance(data, dict) else None
-        cands, seen = [], set()
+        cands, seen, rephrased = [], set(), []
         for g in groups or []:
             try:
                 ids = [int(x) for x in (g.get("ids") or [])]
@@ -3635,11 +3910,59 @@ class RPContextMiddleware:
             # 最后一道确定性门：只有近重复或时间线更新才值得花复核调用。
             # 复核本身有随机性（v3 演练 F#11 仍被放行），这道门兜住它。
             if not _confident_fact_merge(src_texts, fact):
-                logger.info("词条合并驳回：未达到自动合并置信门槛")
+                # 两条一组、字面不重合：可能只是换个说法，送模型按「同主语同谓语」判一次；
+                # 三条以上仍直接驳回，多几条一起改写的情况字面证据太弱，不值得冒险。
+                if len(ids) == 2:
+                    rephrased.append({"ids": ids, "keep": keep, "fact": fact,
+                                      "extra_tags": g.get("tags") or []})
+                else:
+                    logger.info("词条合并驳回：未达到自动合并置信门槛")
                 continue
             seen.update(index[i]["id"] for i in ids)
             cands.append({"ids": ids, "keep": keep, "fact": fact,
                           "extra_tags": g.get("tags") or []})
+        # ANN 找到的对子补进队列：字面近重复直接进候选（仍过二次复核），
+        # 其余交给改写判定。之前只送模型自己提的组，0.9 以上的重复全被漏掉。
+        ann_added, seeds = 0, []
+        have = {frozenset(c["ids"]) for c in rephrased}
+        # ANN 对子里存的是事实 id，模型组用的是本批位置号，先转一次
+        pos = {str(r["id"]): i for i, r in index.items()}
+        for p in seed_pairs or ():
+            try:
+                a, b, sim = pos.get(str(p["a"])), pos.get(str(p["b"])), \
+                    float(p.get("sim") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not a or not b or sim < ANN_JUDGE_COS or a == b:
+                continue
+            seeds.append((sim, min(a, b), max(a, b)))
+        for sim, a, b in sorted(seeds, reverse=True)[:ANN_JUDGE_MAX]:
+            ia, ib = index[a], index[b]
+            if any(index[i]["id"] in used or index[i]["id"] in seen for i in (a, b)):
+                continue
+            if str(ia.get("speaker") or "") != str(ib.get("speaker") or ""):
+                continue                    # 跨人：合并提示词本来就禁止
+            pair = frozenset((a, b))
+            if pair in have:
+                continue
+            ta, tb = str(ia["fact"]), str(ib["fact"])
+            keep = a if len(ta) >= len(tb) else b
+            fact = _clip_sentence(index[keep]["fact"], 160)
+            group = {"ids": [a, b], "keep": keep, "fact": fact, "extra_tags": []}
+            if _confident_fact_merge([ta, tb], fact + ta + tb):
+                cands.append(group)
+            else:
+                rephrased.append(group)
+            have.add(pair)
+            ann_added += 1
+        if ann_added:
+            logger.info("词条 ANN 送审 %d 对（相似度≥%.2f）", ann_added, ANN_JUDGE_COS)
+        # 改写判定通过的两条并进候选，之后和近重复组走同一道二次复核
+        for c in self._judge_fact_rephrases(rephrased, index):
+            if any(index[i]["id"] in seen for i in c["ids"]):
+                continue
+            seen.update(index[i]["id"] for i in c["ids"])
+            cands.append(c)
         # 二次复核：只放行同主语 + 同谓语的重复/补充/时间线更新，失败则全部驳回
         reports = []
         for c in self._verify_fact_groups(cands, index):
@@ -3679,6 +4002,41 @@ class RPContextMiddleware:
                             "tags": tags, "removed": removed, "sources": sources,
                             "log_id": log_id})
         return reports
+
+    def _judge_fact_rephrases(self, cands, index, batch=20):
+        """字面不重合、但可能是「同一件事换个说法」的两条词条：模型逐对判一次。
+
+        两道确定性护栏能挡住换对象/换内容，挡不住纯改写：实测 164 对语义近邻里
+        163 对字面 Jaccard < 0.40，而真正的「同话题不同事」也落在 0.19~0.28，
+        两者字面分不开，只能用语义判定。按批送审（默认 20 对一次）。
+        判定失败按驳回处理：漏并只是多留一条，错并会永久改坏记忆。
+        """
+        if not cands:
+            return []
+        size = max(1, int(batch))
+        picked = []
+        for start in range(0, len(cands), size):
+            chunk = cands[start:start + size]
+            lines = [f"{n}｜A：{index[c['ids'][0]]['fact']}"
+                     f"｜B：{index[c['ids'][1]]['fact']}"
+                     for n, c in enumerate(chunk, 1)]
+            try:
+                reply = self.back.chat(
+                    [{"role": "user",
+                      "content": FACT_REPHRASE_PROMPT.replace("{rows}", "\n".join(lines))}],
+                    temperature=0.0, max_tokens=1200, json_mode=True)
+                data = parse_json(reply) or {}
+                ok = {int(p.get("n")) for p in (data.get("pairs") or [])
+                      if isinstance(p, dict) and p.get("same") is True
+                      and str(p.get("n")).strip().isdigit()}
+            except Exception as e:                  # noqa: BLE001 判定失败不能错并
+                logger.warning("词条改写判定失败，本批全部驳回：%s", e)
+                continue
+            got = [c for n, c in enumerate(chunk, 1) if n in ok]
+            picked += got
+            logger.info("词条改写判定 送审=%d 放行=%d 驳回=%d",
+                        len(chunk), len(got), len(chunk) - len(got))
+        return picked
 
     def _verify_fact_groups(self, cands, index):
         """二次复核模型提出的词条组：一次调用判定整批。
