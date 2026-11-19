@@ -1,0 +1,22 @@
+# Koishi 运行时配置：连 KOOK，并把 Satori 协议开在本机 5140 给 Python 侧车。
+# 部署时把 ${KOOK_TOKEN} / ${SATORI_TOKEN} 就地替换成真实值，不要把真实 token 提交到仓库。
+prefix:
+  - .
+
+plugins:
+  # 底层 HTTP 服务：下面两个插件都 inject http/server
+  "@koishijs/plugin-server":
+    host: 127.0.0.1
+    port: 5140
+
+  # KOOK 官方适配器：出网与平台鉴权只发生在这里
+  adapter-kook:
+    token: ${KOOK_TOKEN}
+    # 官方适配器取值是 ws / http；ws 即长连接模式
+    protocol: ws
+
+  # Satori 协议层：挂在上面的 HTTP 服务上，侧车连 ws://127.0.0.1:5140/v1/events
+  "@satorijs/plugin-server":
+    # 默认挂载在 /satori 前缀下；置空后端点就是 /v1/events
+    path: ""
+    token: ${SATORI_TOKEN}

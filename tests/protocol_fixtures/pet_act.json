@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "id": "01HQ8ZAK3M9T2R5W7X1Y4C0B8A",
+  "type": "pet.act",
+  "ts": 1793427760000,
+  "seq": 2,
+  "device_id": "dev_01HQ8Z7K3M9T2R5W7X1Y4C0B8",
+  "payload": {
+    "action": "headpat",
+    "emotion": "shy",
+    "loop": 1,
+    "interrupt": true,
+    "priority": 2
+  }
+}

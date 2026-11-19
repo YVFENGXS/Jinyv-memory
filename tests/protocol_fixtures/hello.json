@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "01HQ8Z0K3M9T2R5W7X1Y4C0B8A",
+  "type": "hello",
+  "ts": 1793427694000,
+  "seq": 0,
+  "payload": {
+    "protocol": "desktop-v1",
+    "device_id": "dev_01HQ8Z7K3M9T2R5W7X1Y4C0B8",
+    "device_name": "书房台式机",
+    "client_version": "0.1.0",
+    "capabilities": ["bubble.v1", "video.webm", "region.hit", "presence.report"],
+    "presence": "active",
+    "pairing": { "code": "483920" }
+  }
+}

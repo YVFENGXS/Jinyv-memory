@@ -1,0 +1,23 @@
+[Unit]
+Description=Jinyu QQ bot (NoneBot2 + RP memory)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 与 README 的部署步骤一致：账号、目录、venv 路径按你自己的实际值改
+User=qqbot
+Group=qqbot
+WorkingDirectory=/opt/qqbot/bot
+# 密钥与 NoneBot 配置都放这个文件，权限 600
+EnvironmentFile=/opt/qqbot/bot/.env
+ExecStart=/opt/qqbot/bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+# 退出时分段冲刷归档，内部总超时默认 60s，给 systemd 留出余量
+TimeoutStopSec=75
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
