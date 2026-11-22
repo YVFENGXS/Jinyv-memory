@@ -52,7 +52,6 @@ class JinyuHost:
                  front_llm=None, back_llm=None, persona: Optional[dict] = None,
                  max_tokens: Optional[int] = None, output_reserve: Optional[int] = None,
                  profile: Optional[str] = None):
-        # legacy 契约，勿改：默认 owner 键 jinyu，历史库按它归档
         self.cid = str(cid or os.environ.get("RP_CID") or "jinyu")
         self.continuity = str(continuity or os.environ.get("RP_CONTINUITY")
                               or self.cid + "-main")

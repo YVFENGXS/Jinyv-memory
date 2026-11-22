@@ -21,8 +21,9 @@ import threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-import conflict, context_budget, control, disclosure, embedding, gate, gradient
+import conflict, context_budget, control, disclosure, embedding, gate, gradient, intimacy
 import compression, merge_ann, promise, questions, retention, retriever, scoring, sealing
+import style_middleware
 from persona_guard import PersonaGuard
 from summarizer import parse as parse_json, summarize
 
@@ -755,6 +756,154 @@ def _now_line(last_dt=None) -> str:
     return line
 
 
+_STYLE_SYS = re.compile(r"^[（(]\s*系统")
+_STYLE_COMFORT = re.compile(
+    r"难过|委屈|想哭|哭了|难受|累了|好累|有点累|很累|太累|真累|累死|"
+    r"疼|害怕|焦虑|失眠|睡不着|心慌")
+
+
+def _style_directive(query: str, warmth: float = 0.5) -> str:
+    """按消息长度和关系温度，给本轮一个具体的回合形状。
+
+    warmth 0..1 来自状态账本的 relationship.trust；主人/高好感接近 1。
+    长度决定「说多少」，好感决定「说多软」；短不等于冷。
+    """
+    q = str(query or "").strip()
+    if not q:
+        return ""
+    try:
+        w = max(0.0, min(1.0, float(warmth)))
+    except (TypeError, ValueError):
+        w = 0.5
+    warm = w >= 0.75
+    cool = w < 0.4
+
+    if _STYLE_SYS.match(q):
+        if warm:
+            return ("【本轮说话方式】这是你主动开口，不是回复：一到两句，先说要紧的事；"
+                    "语气可以软一点，但不要铺陈动作，也不要每条都用（尾巴……）开头。")
+        return ("【本轮说话方式】这是你主动开口，不是回复：一到两句，先说要紧的事；"
+                "不要铺陈动作，也不要每条都用（尾巴……）开头。")
+
+    n = len(re.findall(r"[\u4e00-\u9fff]", q))
+    if intimacy.triggered(q):
+        if warm:
+            return ("【本轮说话方式】亲密场景（对方是高好感/主人）：可以写到三到五句，"
+                    "先说内容，动作最多两个；不要每条都用（尾巴……）开头。")
+        return ("【本轮说话方式】对方好感不足：不要进入亲密场景，也不要写身体细节；"
+                "用一两句把话题轻轻岔开，保持礼貌和距离。")
+
+    if _STYLE_COMFORT.search(q):
+        if warm:
+            return ("【本轮说话方式】他这条在难受：两到三句，不超过 70 字；先接住感受，"
+                    "语气软一点；不要总结、不要讲道理；最多一个动作。")
+        if cool:
+            return ("【本轮说话方式】他这条在难受：两到三句，不超过 50 字；关心但不越界，"
+                    "不要套近乎；最多一个动作。")
+        return ("【本轮说话方式】他这条在难受：两到三句，不超过 60 字；先接住感受，"
+                "不要总结、不要讲道理；最多一个动作。")
+
+    if n <= 5:
+        if warm:
+            return (f"【本轮说话方式】他这条只有 {n} 个字：只回一句，不超过 18 字；"
+                    "不要只回「嗯。」「在。」这种单字；用口语短句，像「在呢」「我在呀」"
+                    "「怎么啦」「嗯嗯，在」；句尾不要加句号；不要写动作段，不要带称呼。")
+        if cool:
+            return (f"【本轮说话方式】他这条只有 {n} 个字：只回一句，不超过 12 字；"
+                    "客气、简短，不要撒娇，不要套近乎。")
+        return (f"【本轮说话方式】他这条只有 {n} 个字：只回一句，不超过 15 字；"
+                "可以只回「嗯」「在」「对」。不要写动作段，不要带称呼。")
+
+    if n <= 20:
+        if warm:
+            return (f"【本轮说话方式】他这条 {n} 个字：回一到两句，不超过 45 字；"
+                    "先接住他的话，最多一个短动作放在句中或句末；语气软一点，"
+                    "不要用（尾巴……）开头。")
+        if cool:
+            return (f"【本轮说话方式】他这条 {n} 个字：回一到两句，不超过 35 字；"
+                    "客气，不要套近乎；最多一个短动作。")
+        return (f"【本轮说话方式】他这条 {n} 个字：回一到两句，不超过 40 字；"
+                "最多一个短动作，放在句中或句末，不要用（尾巴……）开头。")
+
+    if n <= 50:
+        if warm:
+            return (f"【本轮说话方式】他这条 {n} 个字：回两到三句，不超过 90 字；"
+                    "最多一个动作段；可以带一点关心，但不要每句叫主人。")
+        if cool:
+            return (f"【本轮说话方式】他这条 {n} 个字：回两到三句，不超过 70 字；"
+                    "就事论事，保持距离。")
+        return (f"【本轮说话方式】他这条 {n} 个字：回两到三句，不超过 80 字；"
+                "最多一个动作段；大多数句子直接用「你」，不要每句叫主人。")
+
+    if warm:
+        return (f"【本轮说话方式】他这条 {n} 个字：可以展开，但不超过三段；"
+                "先说内容，动作最多一个；语气可以亲近，但不要过度抒情。")
+    if cool:
+        return (f"【本轮说话方式】他这条 {n} 个字：可以展开，但不超过两段；"
+                "就事论事，不要过度亲近。")
+    return (f"【本轮说话方式】他这条 {n} 个字：可以展开，但不超过三段；"
+            "先说内容，动作最多一个；不要每条都用（尾巴……）开头。")
+
+
+_OWNER_STYLE_CACHE = {}
+_OWNER_STYLE_TTL = 1800
+_OWNER_SID = (os.environ.get("RP_OWNER_SID") or "qq-u3521544885").strip()
+_OWNER_SKIP = re.compile(r"^(【B站@】|（|[【\[])")
+
+
+def _owner_style_note(db_path, sid: str, cid: str) -> str:
+    """从主人最近私聊里抽一个轻量风格画像，只给主人私聊注入。
+
+    只用短句，排除 B 站/系统事件这类长模板；30 分钟缓存一次。
+    失败就返回空串，不影响本轮生成。
+    """
+    if str(sid) != _OWNER_SID:
+        return ""
+    key = (str(db_path), str(sid), str(cid))
+    now = time.time()
+    hit = _OWNER_STYLE_CACHE.get(key)
+    if hit and now - hit[0] < _OWNER_STYLE_TTL:
+        return hit[1]
+    note = ""
+    try:
+        con = connect(str(db_path))
+        try:
+            rows = con.execute(
+                "SELECT content FROM turns WHERE session_id=? AND character_id=?"
+                " AND role='user' ORDER BY id DESC LIMIT 300",
+                (str(sid), str(cid))).fetchall()
+        finally:
+            con.close()
+        msgs = []
+        for row in rows:
+            m = str(row["content"] or "").strip()
+            if not m or len(m) > 80 or _OWNER_SKIP.match(m):
+                continue
+            if not re.search(r"[\u4e00-\u9fff]", m):
+                continue
+            msgs.append(m)
+        if len(msgs) >= 20:
+            lens = sorted(len(re.findall(r"[\u4e00-\u9fff]", m)) for m in msgs)
+            mid = lens[len(lens) // 2]
+            short = sum(1 for x in lens if x <= 10) * 100 // len(lens)
+            period = sum(1 for m in msgs if "。" in m) * 100 // len(msgs)
+            period_txt = "几乎不用句号" if period == 0 else f"只有 {period}% 用句号"
+            particles = [p for p in ("哦", "啊", "吧", "啦", "哇", "嘛", "呀")
+                         if sum(1 for m in msgs if p in m) * 25 >= len(msgs)]
+            warm_words = [w for w in ("抱抱", "摸摸", "亲亲", "爱你", "贴贴", "蹭蹭", "好哦")
+                          if sum(1 for m in msgs if w in m) >= 3]
+            note = (f"【学主人说话】他最近 {len(msgs)} 条私聊：中位 {mid} 字，"
+                    f"{short}% 不超过 10 字；{period_txt}。"
+                    + (f"常用语气词：{'/'.join(particles)}。" if particles else "")
+                    + (f"常说：{'、'.join(warm_words)}。" if warm_words else "")
+                    + "回他时贴近这个节奏：短、口语、句尾可以不带标点，偶尔用他的口头禅；"
+                      "不要复读原句，也不要为了学他丢掉瑾瑜自己的语气。")
+    except Exception:
+        note = ""
+    _OWNER_STYLE_CACHE[key] = (now, note)
+    return note
+
+
 def _stamp(dt: datetime, now: datetime, gap=None) -> str:
     """热窗消息戳：日期 + 星期；间隔 ≥2 小时再补一句「距上一条多久」。"""
     fmt = "%Y-%m-%d %H:%M" if dt.year != now.year else "%m-%d %H:%M"
@@ -1182,6 +1331,10 @@ INSERT_CARD = ("INSERT INTO event_cards(event_id,session_id,character_id,turn_st
                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
                " COALESCE(NULLIF(?,''), datetime('now')))")
 
+# 承诺类句子的确定性兜底：摘要可以压缩，答应过什么必须留原话
+MUST_KEEP_RE = re.compile(
+    r"答应|约定|约好|说好|保证|我以后|下次|明天(?:一早|早上)?(?:再|就)|等你")
+
 
 def _card_params(card):
     sid = card["session_id"]
@@ -1214,6 +1367,7 @@ class DB:
         conn = connect(self.path)
         try:
             conn.executescript(SCHEMA)
+            intimacy.ensure_schema(conn)
             self._migrate(conn)
             conn.commit()
         finally:
@@ -1379,6 +1533,7 @@ class DB:
         try:
             with self._c() as c:
                 c.execute(INSERT_CARD, _card_params(card))
+                self._stamp_must_keep(c, card)
             return True
         except sqlite3.IntegrityError:
             return False
@@ -1393,6 +1548,7 @@ class DB:
             try:
                 c.execute(INSERT_CARD, _card_params(card))
                 inserted = True
+                self._stamp_must_keep(c, card)
             except sqlite3.IntegrityError:
                 inserted = False
             if inserted:
@@ -1818,6 +1974,7 @@ class DB:
         with self._c() as c:
             rows = c.execute("SELECT * FROM event_cards WHERE session_id=? AND character_id=?"
                              " AND COALESCE(layer,'event')='event'"
+                             " AND COALESCE(precision,'normal')!='low'"
                              " ORDER BY turn_start, turn_end LIMIT ?",
                              (sid, cid, max(2, int(limit)))).fetchall()
         cards = [_card(r) for r in rows]
@@ -1987,6 +2144,42 @@ class DB:
             c.execute("DELETE FROM vectors WHERE kind='card' AND ref_id=?", (event_id,))
         return str(row["summary"] or ""), True
 
+    def _stamp_must_keep(self, c, card):
+        """把承诺原话钉进 quotes，并打 must_keep 标记（失败不影响入卡）。"""
+        try:
+            start = int(card.get("turn_start") or 0)
+            end = int(card.get("turn_end") or 0)
+            if end <= 0:
+                return
+            rows = c.execute(
+                "SELECT role, content FROM turns WHERE session_id=?"
+                " AND character_id=? AND turn_idx>=? AND turn_idx<=?"
+                " ORDER BY turn_idx, id",
+                (card["session_id"], card["character_id"], start, end)).fetchall()
+            got = []
+            for r in rows:
+                text = " ".join(str(r["content"] or "").split())
+                if len(text) < 6 or not MUST_KEEP_RE.search(text):
+                    continue
+                who = "主人" if r["role"] == "user" else "瑾瑜"
+                got.append(f"{who}：{text[:90]}")
+                if len(got) >= 3:
+                    break
+            if not got:
+                return
+            try:
+                exist = json.loads(card.get("quotes") or "[]")
+            except (TypeError, ValueError):
+                exist = []
+            merged = exist + [q for q in got if q not in exist]
+            c.execute(
+                "UPDATE event_cards SET quotes=?, meta_json=json_set("
+                "COALESCE(NULLIF(meta_json,''),'{}'),'$.must_keep',1)"
+                " WHERE event_id=?",
+                (json.dumps(merged, ensure_ascii=False), card["event_id"]))
+        except Exception:
+            logger.warning("must-keep 提取失败", exc_info=True)
+
     def add_card(self, sid, cid, summary, turn=0):
         """手工补一张卡：钩子用确定性规则提取，幂等键带 uuid。返回 event_id。"""
         eid = uuid.uuid4().hex
@@ -1999,6 +2192,7 @@ class DB:
                 "idempotency_key": f"manual:{eid}"}
         with self._c() as c:
             c.execute(INSERT_CARD, _card_params(card))
+            self._stamp_must_keep(c, card)
         return eid
 
     def update_card_meta(self, event_id, meta) -> bool:
@@ -2985,6 +3179,24 @@ class RPContextMiddleware:
                         evidence_id=evidence, topic=topic)
             except Exception as exc:              # noqa: BLE001 门禁失败不能吞掉回复
                 logger.warning("重问门禁异常 sid=%s cid=%s：%s", sid, cid, exc)
+        # 中间层 P0：在落库和发送前，用代码做回合形状干预。
+        # 工具已经改过状态时不重采样，避免重复副作用。
+        try:
+            reply = style_middleware.apply(
+                reply, user_input, sid, cid, db=self.db,
+                regenerate=(lambda: self.front.chat(msgs)),
+                allow_resample=not (isinstance(tool_context, dict)
+                                    and tool_context.get("tools")))
+        except Exception as exc:                  # noqa: BLE001 中间层失败不能吞回复
+            logger.warning("中间层干预失败 sid=%s cid=%s：%s", sid, cid, exc)
+        if self.compression_on:                  # C4-03：把本轮问出口的问题落账
+            try:
+                _qs = questions.detect_questions(reply)
+                if _qs:
+                    questions.remember(self.db, cid, _qs, user_input,
+                                       topic=questions.topic_of(user_input))
+            except Exception as exc:             # noqa: BLE001 落账失败不影响回复
+                logger.warning("问题落账异常 sid=%s cid=%s：%s", sid, cid, exc)
         # 上下文构建失败（如召回代码报错）不等于库写失败：用户轮已落库就要接着存回复，
         # 否则这一轮会从记忆里凭空消失（2026-10-30 视频报告丢失事故）。
         if self.compression_on:
@@ -3525,8 +3737,9 @@ class RPContextMiddleware:
                 f"{len(all_cards)} 张事件卡，覆盖过去所有对话。凡是涉及认识的人、发生过的事、"
                 "答应过的事，先对照下列记忆回答，不许说「不记得」。"
                 "但只能对【本轮记忆】里列出的内容声称「记得/翻到过」；"
-                "里面没有的，就直接说这边没翻到，不许编造「我在旧记录里翻到一条残片」这类内容，"
-                "也不许把猜的当成记过的。"
+                "里面没有的，不当场否定主人：先说「这条瑾瑜这边没存到原话」，"
+                "再按主人的说法认下来；不许编造「我在旧记录里翻到一条残片」，"
+                "也不许把猜的当成记过的，更不许同一件事反复说「没翻到」。"
                 "【历史事件】里「」中的原话就是对方已经说过的内容：同一件事不许换个问法再问一遍，"
                 "先按原话里给的条件回答。"
                 "主人改了时间、取消或改主意时，立刻用 update_plan 改掉你自己的旧计划。")
@@ -3539,6 +3752,48 @@ class RPContextMiddleware:
         # (level, weight, msg)：level 越小越先丢；同层里 weight 小的先丢。
         # level 沿用旧 priority 的数字：召回补充 1 < 最近事件/召回首位 2 < 跨会话 3 < 承诺 4。
         sections = []
+        # 未结约定：不靠语义召回。最近一段里带约定词的卡每轮固定带上，
+        # 这样热窗一过，「答应过什么」也不会取决于这次提问的措辞。
+        try:
+            with self.db._c() as _c:
+                _rows = _c.execute(
+                    "SELECT event_id, turn_start, turn_end, summary, quotes FROM event_cards"
+                    " WHERE session_id=? AND character_id=? AND turn_end>=?"
+                    " AND COALESCE(precision,'normal')!='low'"
+                    " AND (summary LIKE '%答应%' OR summary LIKE '%约定%'"
+                    " OR summary LIKE '%约好%' OR summary LIKE '%说好%')"
+                    " ORDER BY turn_end DESC LIMIT 4",
+                    (sid, cid, max(0, self.db.max_turn(sid, cid) - 600))).fetchall()
+            _seen = {str(c.get("event_id")) for c in (cards or [])}
+            _seen |= {str(c.get("event_id")) for _, c in (hits or [])}
+            _extra = [dict(r) for r in _rows if str(r["event_id"]) not in _seen][:3]
+            if _extra:
+                _lines = []
+                for c in _extra:
+                    _q = ""
+                    try:
+                        _qs = json.loads(c.get("quotes") or "[]")
+                        _q = "；".join("「" + str(x)[:50] + "」" for x in _qs[:2])
+                    except (TypeError, ValueError):
+                        _q = ""
+                    _lines.append("- [t%s-%s] %s%s" % (
+                        c["turn_start"], c["turn_end"],
+                        retriever.clean_text(c["summary"], 140),
+                        ("｜原话：" + _q) if _q else ""))
+                sections.append((4, 0.0, {"role": "system", "content":
+                    "【未结约定·每轮必看】\n" + MEMORY_LABEL + "\n"
+                    + "\n".join(_lines)}))
+        except Exception:
+            logger.warning("未结约定注入失败", exc_info=True)
+        # 亲密记事本：私聊 + 这轮确实提到才注入；没填内容就什么也不加
+        try:
+            if intimacy.is_private(sid) and intimacy.triggered(query):
+                with self.db._c() as _c:
+                    _ib = intimacy.block(_c, sid, cid)
+                if _ib:
+                    sections.append((4, 0.0, {"role": "system", "content": _ib}))
+        except Exception:
+            logger.warning("亲密记事本注入失败", exc_info=True)
         if cards:
             # 最近卡带原话（safe：私密卡仍只给摘要）。摘要只有结论，原话里才有
             # 「容器怎么封的、温度多少」这类细节；不带原话时，模型过几轮会重复追问
@@ -3673,6 +3928,23 @@ class RPContextMiddleware:
                     anchors[1]["content"] += seal_note
             except Exception as exc:                  # noqa: BLE001
                 logger.warning("账本/封口注入失败 sid=%s cid=%s：%s", sid, cid, exc)
+        # 本轮说话方式：长度决定说多少，关系温度决定说多软（受众设计）。
+        # 温度取账本 relationship.trust；社交圈模式的每人好感由 _social_hint 单独注入。
+        try:
+            _warmth = 0.5
+            if not self.social:
+                try:
+                    _warmth = float((lg.get("relationship") or {}).get("trust", 0.5))
+                except (TypeError, ValueError, AttributeError):
+                    _warmth = 0.5
+            _style = _style_directive(query, _warmth)
+            if _style:
+                anchors[1]["content"] += "\n" + _style
+            _owner_note = _owner_style_note(getattr(self.db, "path", ""), sid, cid)
+            if _owner_note:
+                anchors[1]["content"] += "\n" + _owner_note
+        except Exception:
+            logger.warning("说话方式注入失败 sid=%s cid=%s", sid, cid, exc_info=True)
         recent, prev_dt = [], None                          # 热窗时间标注：见 _stamp / RECENT_GAP_SECONDS
         now = datetime.now().astimezone()
         has_source = bool(source_label(source)) or any(

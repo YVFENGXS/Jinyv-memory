@@ -139,7 +139,7 @@ def _chapter_cards(db, cid, cutoff):
 
 
 def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
-               dry_run=False, now=None):
+               dry_run=False, now=None, only_bases=None):
     """把足够老的明细卡合成章节卡（T2）。
 
     安全边界：只合并同一 (车道, audience, bot_id, knowledge_boundary) 的卡，
@@ -155,10 +155,14 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
     stamp = _utc_stamp(now)
     cutoff = (stamp - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     cards, capped = _chapter_cards(db, cid, cutoff)
+    allow = ({str(b).split("#")[0] for b in only_bases}
+             if only_bases else None)
     groups = {}
     for card in cards:
         key = (lane_base(card.get("session_id")), card.get("audience") or "",
                card.get("bot_id") or "", card.get("knowledge_boundary") or "both")
+        if allow is not None and key[0] not in allow:
+            continue                      # 自主整理按作用域收窄：别的会话不碰
         groups.setdefault(key, []).append(card)
     stats = {"chapters": 0, "cards": 0, "scan_capped": bool(capped)}
     if capped:
@@ -226,7 +230,8 @@ def chapterize(db, cid, days=None, min_cards=None, max_chapters=None,
     return stats
 
 
-def run(mw, cid, dry_run=False, day=None, min_facts=20, max_sessions=8, now=None):
+def run(mw, cid, dry_run=False, day=None, min_facts=20, max_sessions=8, now=None,
+        only_bases=None):
     """执行一次整理，返回统计字典；dry_run 只统计、不写库也不调后台模型。
 
     min_facts：同一会话词条达到多少条才值得花后台模型合并（与自动合并同口径）。
@@ -242,7 +247,12 @@ def run(mw, cid, dry_run=False, day=None, min_facts=20, max_sessions=8, now=None
         return stats
     try:
         stats["expired"] = mw.db.expire_temp_facts(cid, dry_run=dry_run)
+        allow = ({str(b).split("#")[0] for b in only_bases}
+                 if only_bases else None)
         owners = sorted(mw.db.fact_owners(cid), key=lambda o: int(o["n"] or 0), reverse=True)
+        if allow is not None:
+            owners = [o for o in owners
+                      if str(o["base"]).split("#")[0] in allow]
         for owner in owners:
             if stats["sessions"] >= max(0, int(max_sessions)):
                 break
@@ -260,7 +270,8 @@ def run(mw, cid, dry_run=False, day=None, min_facts=20, max_sessions=8, now=None
                                      for g in groups[:6]))
         # 章节生成与词条合并在同一个 try 里：chapterize 抛异常同样要放开当日占坑，
         # 否则「失败放开、当天还能补跑」的承诺在章节这一步就不成立。
-        chapter = chapterize(mw.db, cid, dry_run=dry_run, now=now)
+        chapter = chapterize(mw.db, cid, dry_run=dry_run, now=now,
+                             only_bases=only_bases)
         stats["chapters"] = int(chapter.get("chapters") or 0)
         stats["chapter_cards"] = int(chapter.get("cards") or 0)
         stats["scan_capped"] = bool(chapter.get("scan_capped"))
