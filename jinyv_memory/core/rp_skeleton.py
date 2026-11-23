@@ -615,6 +615,12 @@ try:
     VEC_POOL = max(4, int(os.environ.get("RP_VEC_POOL") or 8))
 except ValueError:
     VEC_POOL = 8
+# 重排候选池：cross-encoder 只在候选集合内改顺序，候选不够就救不回排在第 5~50 名的 GT。
+# 真实语料 46 题实测：池 20 与池 50 同为 0.696，再大只多付请求。
+try:
+    RERANK_POOL = max(4, int(os.environ.get("RP_RERANK_POOL") or 20))
+except ValueError:
+    RERANK_POOL = 20
 # 本轮注入给前台的事件卡配额：按话题数放宽，封顶 10。
 # 词条不受这个上限约束——词条是压缩后的结论，一条就够用，且自带热力兜底。
 RECALL_CAP_BASE = max(1, int(os.environ.get("RP_RECALL_CAP") or 4))
@@ -635,8 +641,10 @@ CARD_TEXT_ON = (os.environ.get("RP_CARD_TEXT") or "0").strip().lower() not in {
 CARD_TEXT_MODE = (os.environ.get("RP_CARD_TEXT") or "1").strip().lower()
 GENERIC_HOOKS = {"主人", "瑾瑜"}   # 几乎每张卡都有，算进卡向量会稀释事件特征
 _CARD_VEC = {}
-# Cross-encoder 重排：只对融合后的候选重排，默认关（多一次外部请求）。
-RERANK_ON = (os.environ.get("RP_RERANK") or "0").strip().lower() not in {
+# Cross-encoder 重排：只对融合后的候选重排，默认开。
+# 真实 46 题实测：向量召回 0.565 → 0.696（池 20）。无 key / 超时 / 空结果时
+# 自动保持原序，不会拦住前台；需要回滚时设 RP_RERANK=0。
+RERANK_ON = (os.environ.get("RP_RERANK") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 # 词条四因子打分（衰减 / 情感 / 权威 / 注意力）。0 = 回退旧公式，便于线上回滚。
 FACT_SCORE_ON = (os.environ.get("RP_FACT_SCORE") or "1").strip().lower() not in {
@@ -2776,6 +2784,11 @@ class RPContextMiddleware:
         if self.output_reserve >= self.max_tokens:
             self.output_reserve = self.max_tokens // 2
         self.budget = self.max_tokens - self.output_reserve  # 水位作用在扣掉输出预留后的预算上
+        # 账本 + 人设是两块硬锚，实测约 2.36k token 且不可裁；预算低于此值时
+        # 每轮都会超水位、静默丢掉召回段。留一点余量后提前告警，避免「配小了却不知道」。
+        if self.budget < 2600:
+            logger.warning("[jinyu] 上下文预算偏低：budget=%d（建议 >= 3000），"
+                           "账本与人设会挤掉召回段", self.budget)
         # 梯度记忆与压缩（方案 C1/C8）：默认关闭；shadow 只记录不改变 prompt。
         self.compression_on = (os.environ.get("RP_COMPRESSION_ENABLED") or "0"
                                ).strip().lower() not in {"0", "false", "no", "off"}
@@ -3440,12 +3453,15 @@ class RPContextMiddleware:
         重排结果必须换算成可比分数：后面的选择按分数排序，只改顺序会被排序抹掉。
         相关分（0~1）映射到 0.5~3.8，与钩子原始分同一刻度，高相关卡能压过泛钩子。
         """
-        docs = [str(c.get("summary") or "")[:200] for _, c in fused]
+        docs = [str(c.get("summary") or "")[:300] for _, c in fused]
         scored = embedding.rerank(query, docs)
         if not scored:
             return fused[:self.recall_limit]
         order = sorted(scored, key=lambda x: x[1], reverse=True)[:self.recall_limit]
-        return [(0.5 + 3.3 * max(0.0, min(1.0, float(s))), fused[i][1]) for i, s in order]
+        # 映射下限抬到 1.4：重排后的第 2~4 名若落在 0.5，会被后面的相对闸门
+        # （rel < RECALL_MIN_REL）当噪音丢掉——语义重排已经排过序，不该再被
+        # 字面分尺度的相对阈值二次过滤。1.4/3.8 ≈ 0.37，刚好高于 0.35。
+        return [(1.4 + 2.4 * max(0.0, min(1.0, float(s))), fused[i][1]) for i, s in order]
 
     def _decompose(self, query, sid, cid):
         """后台查询分解：只在困难问句上拆出 ≤3 条短查询，仅供向量通道使用。
@@ -3745,16 +3761,27 @@ class RPContextMiddleware:
             vec_exclude |= {c["event_id"] for _, c in hits}
         vec = [] if time_only else self._vector_recall(
             sid, cid, query_used, all_cards, vec_exclude,
-            limit=max(self.recall_limit, VEC_POOL), extra=extra_q)
+            limit=max(self.recall_limit, RERANK_POOL if RERANK_ON else VEC_POOL),
+            extra=extra_q)
         vec_ids = {c["event_id"] for _, c in vec}
         if vec:
             # RRF 分（0.01~0.05）与钩子原始分（0.6~3.8）不同量纲，直接混在 hits 里
             # 会让披露层的相对分算错。披露开启时两路各自除以本路最高分，统一成 0~1；
             # 关闭时保持旧刻度，保证这一阶段可以整体回滚。
             fused = retriever.fuse(
-                hits, vec, limit=max(2, self.recall_limit, VEC_POOL if RERANK_ON else 0))
-            if RERANK_ON and len(fused) > self.recall_limit:
-                fused = self._rerank_fused(query_used, fused)
+                hits, vec, limit=max(2, self.recall_limit, RERANK_POOL if RERANK_ON else 0))
+            if RERANK_ON:
+                # 重排候选必须是「向量池 ∪ 钩子命中」，不能只吃 RRF 截断后的前 N：
+                # 关键词命中的错误卡会占掉名额，把向量第 5~20 名的正确卡挤出去。
+                cand, seen = [], set()
+                for s, c in list(vec) + list(hits):
+                    eid = c["event_id"]
+                    if eid in seen:
+                        continue
+                    seen.add(eid)
+                    cand.append((s, c))
+                if len(cand) > self.recall_limit:
+                    fused = self._rerank_fused(query_used, cand)
             kw_top = max((float(s or 0.0) for s, _ in hits), default=0.0)
             f_top = max((float(s or 0.0) for s, _ in fused), default=0.0)
             # 向量只做补充，不许挤掉钩子已经命中的卡：recall_limit=2 时向量权重

@@ -33,6 +33,8 @@ MODEL = (os.environ.get("RP_EMBED_MODEL") or "BAAI/bge-m3").strip()
 DIM = max(1, int(float(os.environ.get("RP_EMBED_DIM") or 1024)))
 BATCH = max(1, int(float(os.environ.get("RP_EMBED_BATCH") or 16)))
 TIMEOUT = max(3.0, float(os.environ.get("RP_EMBED_TIMEOUT") or 15))
+# 重排单独给更短的超时：它挂在每轮 prompt 构建的同步路径上，15 秒会把回复拖死。
+RERANK_TIMEOUT = max(2.0, float(os.environ.get("RP_RERANK_TIMEOUT") or 4))
 BASE = (os.environ.get("RP_EMBED_BASE") or "https://api.siliconflow.cn/v1").rstrip("/")
 RERANK_MODEL = (os.environ.get("RP_RERANK_MODEL")
                 or "BAAI/bge-reranker-v2-m3").strip()
@@ -181,7 +183,7 @@ def rerank(query, documents):
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + key()})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT) as r:
             body = json.loads(r.read().decode())
         rows = body.get("results") or []
         return [(int(x["index"]), float(x["relevance_score"]))

@@ -385,13 +385,24 @@ def keyword_rank(db: DB, query: str, sid: str, limit: int = 4, cid: str = ""):
 
 
 def hybrid_rank(mw, db: DB, query: str, sid: str, limit: int = 4, cid: str = ""):
-    """混合召回：关键词 + 向量，按线上 fuse 同一权重合并。"""
+    """混合召回：关键词 + 向量，按线上 fuse 同一权重合并；重排与线上同池。"""
     cid = cid or CID
     cards = db.all_cards(sid, cid)
+    pool = max(limit, rp.RERANK_POOL if rp.RERANK_ON else rp.VEC_POOL)
     kw = retriever.retrieve(cards, query, limit=limit)
-    vec = mw._vector_recall(sid, cid, query, cards, set(), limit=limit)
-    fused = retriever.fuse(kw, vec, limit=limit)
-    return [c["event_id"] for _, c in fused]
+    vec = mw._vector_recall(sid, cid, query, cards, set(), limit=pool)
+    fused = retriever.fuse(kw, vec, limit=pool)
+    if rp.RERANK_ON:
+        cand, seen = [], set()
+        for s, c in list(vec) + list(kw):
+            eid = c["event_id"]
+            if eid in seen:
+                continue
+            seen.add(eid)
+            cand.append((s, c))
+        if len(cand) > limit:
+            fused = mw._rerank_fused(query, cand)
+    return [c["event_id"] for _, c in fused[:limit]]
 
 
 def prompt_text(mw, query: str, sid: str, upto: int, cid: str = "") -> str:
