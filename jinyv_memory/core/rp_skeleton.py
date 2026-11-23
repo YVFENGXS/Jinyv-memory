@@ -16,7 +16,7 @@ R6-R9 阶段二：事件卡扩列（rel_hooks / knowledge_boundary / importance 
 保留：turns 同步落库、游标只在卡落库后推进、账本按 (sid,cid) 隔离。
 演示：python demo.py；回归：python test_regression.py
 """
-import copy, difflib, hashlib, json, logging, math, os, queue, re, sqlite3, struct
+import bisect, copy, difflib, hashlib, json, logging, math, os, queue, re, sqlite3, struct
 import threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -122,12 +122,8 @@ _ASSOC_CUE = re.compile(
     r"之前|上次|那时|那会儿|当年|以前|曾经|过去|那件|那天|那次|旧事|当初")
 
 
-def _tag_index(cards, facts_detail=(), limit=None):
-    """把事件卡钩子 + 词条标签压成「标签表」：标签 → 出现次数。
-
-    这张表只用于给后台做联想时的候选词，不参与召回打分；按次数降序截断，
-    让高频实体（主角/常用物品）排在前面，短表比长表更利于模型聚焦。
-    """
+def _tag_counts(cards, facts_detail=()):
+    """标签 → 出现次数（事件卡实体/关系钩子 + 本轮词条标签）。不做截断。"""
     counts = {}
     for c in cards or ():
         for key in ("entity_hooks", "rel_hooks"):
@@ -146,8 +142,205 @@ def _tag_index(cards, facts_detail=(), limit=None):
             t = str(t or "").strip()[:12]
             if len(t) >= 2:
                 counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def _tag_index(cards, facts_detail=(), limit=None):
+    """标签 → 出现次数，按次数降序；limit 为 None 时给全量。
+
+    旧实现固定只留 top 60，长尾标签（叫醒约定、尾鳍）永远进不了检索；
+    现在默认全量，需要短表的地方（后台联想 prompt）由 `_assoc_tags` 按相关性挑。
+    """
+    counts = _tag_counts(cards, facts_detail)
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return dict(ranked[:limit] if limit else ranked)
+
+
+def _tag_hit(tag, text):
+    """标签与问句的匹配强度：整串命中 1.0，三字以上标签的双字切片 0.55。
+
+    切片解决「问『约定』能撞到标签『叫醒约定』」；但切片任一边是停用字就跳过
+    （「人的」这类组合几乎每张卡都有，留着只会把候选表灌满噪声）。
+    """
+    t = str(tag or "").strip().lower()
+    if len(t) < 2:
+        return 0.0
+    if t in text:
+        return 1.0
+    if len(t) < 3:
+        return 0.0
+    for i in range(len(t) - 1):
+        p = t[i:i + 2]
+        if (p in GENERIC_HOOKS or p[0] in retriever.STOP_CHARS
+                or p[-1] in retriever.STOP_CHARS):
+            continue
+        if p in text:
+            return 0.55
+    return 0.0
+
+
+def tag_recall(cards, query, limit=12, exclude_ids=()):
+    """标签倒排召回：拿问句去撞「全部」实体/关系标签，按 IDF 加权。
+
+    和关键词通道的区别：retriever 只认钩子原样出现在问句里，且对泛词无权重；
+    这里按标签稀有度打分，长尾标签命中一次也能被问到，泛标签不会占满候选表。
+    不依赖 embedding，未配置向量时也能独立工作。返回 [(score, card)]。
+    """
+    text = str(query or "").strip().lower()
+    if not text or not cards:
+        return []
+    vocab, docs = {}, []
+    for c in cards:
+        tags = set()
+        for key in ("entity_hooks", "rel_hooks"):
+            vals = c.get(key) or []
+            if isinstance(vals, str):
+                try:
+                    vals = json.loads(vals or "[]")
+                except (TypeError, ValueError):
+                    vals = []
+            for h in vals:
+                h = str(h or "").strip()[:12]
+                if len(h) >= 2:
+                    tags.add(h)
+        docs.append((c, tags))
+        for t in tags:
+            vocab[t] = vocab.get(t, 0) + 1
+    if not vocab:
+        return []
+    total = len(docs)
+    weights = {}
+    for t, df in vocab.items():
+        factor = _tag_hit(t, text)
+        if factor <= 0:
+            continue
+        idf = 1.0 + math.log(1.0 + total / (1.0 + df)) + 0.15 * (len(t) - 2)
+        weights[t] = idf * factor
+    if not weights:
+        return []
+    skip = set(exclude_ids or ())
+    scored = []
+    for c, tags in docs:
+        eid = c["event_id"]
+        if eid in skip:
+            continue
+        if (c.get("knowledge_boundary") or "both") == "player":
+            continue
+        if retriever.suspicious(c.get("summary")):
+            continue
+        matched = [weights[t] for t in tags if t in weights]
+        if not matched:
+            continue
+        score = sum(matched) + 0.3 * (len(matched) - 1)
+        scored.append((score, c))
+    scored.sort(key=lambda x: (x[0], x[1].get("importance", 0.5),
+                               x[1].get("turn_end", 0)), reverse=True)
+    return scored[:max(1, int(limit))]
+
+
+def _assoc_tags(cards, query="", facts_detail=(), limit=None):
+    """给后台联想挑标签：先按问句相关性排序，再用高频标签补满。
+
+    后台看到的必须是「全部标签库里对这句话最可能有用的一批」，而不是
+    出现次数 top 60——长尾标签正是旧实现漏掉的部分。
+    """
+    counts = _tag_counts(cards, facts_detail)
+    if not counts:
+        return {}
+    text = str(query or "").strip().lower()
+    ranked = sorted(
+        counts.items(),
+        key=lambda kv: (-((_tag_hit(kv[0], text) + 0.05) * (1 + math.log(1 + kv[1]))),
+                        -kv[1], kv[0]))
     return dict(ranked[:limit or ASSOC_TAG_MAX])
+
+
+# 词法检索停用字：两侧任一是这些字，双字组合基本没有区分度（「人的」「这就」）。
+_LEX_STOP = set(
+    "的了是我你他她它这那吗呢吧啊呀哦嗯嘛啦哟哈在有个和就都也很不没要会能说去来到着过"
+    "给对把被让与而且但所以如果因为什么怎么多少哪谁")
+
+
+def _lex_terms(text):
+    """问句词项：中文双字（滤停用边界）+ 英文词。纯词法，和问句原样对齐。"""
+    out = set()
+    low = str(text or "").lower()
+    for run in re.findall(r"[\u4e00-\u9fff]+", low):
+        for i in range(len(run) - 1):
+            g = run[i:i + 2]
+            if g[0] in _LEX_STOP or g[-1] in _LEX_STOP:
+                continue
+            out.add(g)
+        if len(run) == 1 and run not in _LEX_STOP:
+            out.add(run)
+    for w in re.findall(r"[a-z][a-z0-9_]{1,15}", low):
+        out.add(w)
+    return out
+
+
+def _bm25_scores(texts, terms):
+    """对一组小写文本算 BM25（k1=1.2, b=0.75）；terms 是问句词项集合。
+
+    文档都很短（卡摘要 ~80 字、词条 ~30 字），用 `term in text` / `count`
+    就够了，不必建倒排；一次召回约 1600 条文本，实测在毫秒级。
+    """
+    if not texts or not terms:
+        return [0.0] * len(texts)
+    n = len(texts)
+    df = {t: sum(1 for x in texts if t in x) for t in terms}
+    idf = {t: math.log(1.0 + (n - df[t] + 0.5) / (df[t] + 0.5)) for t in terms}
+    avg = sum(len(x) for x in texts) / n or 1.0
+    out = []
+    for x in texts:
+        s = 0.0
+        for t in terms:
+            tf = x.count(t)
+            if not tf:
+                continue
+            s += idf[t] * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * len(x) / avg))
+        out.append(s)
+    return out
+
+
+def summary_recall(cards, query, limit=12, exclude_ids=()):
+    """摘要正文 BM25 召回：把「养的猫叫团子」这类事实句本身变成索引。
+
+    关键词通道只看 entity_hooks，摘要正文从未参与匹配；而 97.8% 的标准答案
+    就写在摘要里。这一路纯词法、不依赖 embedding，命中后仍交给重排裁决。
+    """
+    terms = _lex_terms(query)
+    if not terms or not cards:
+        return []
+    docs, items = [], []
+    for c in cards:
+        hooks = []
+        for key in ("entity_hooks", "rel_hooks"):
+            vals = c.get(key) or []
+            if isinstance(vals, str):
+                try:
+                    vals = json.loads(vals or "[]")
+                except (TypeError, ValueError):
+                    vals = []
+            hooks += [str(h).strip() for h in vals if len(str(h).strip()) >= 2]
+        txt = ((c.get("summary") or "") + " " + " ".join(hooks)).lower()
+        docs.append(txt)
+        items.append(c)
+    scores = _bm25_scores(docs, terms)
+    skip = set(exclude_ids or ())
+    scored = []
+    for s, c in zip(scores, items):
+        if s <= 0:
+            continue
+        if c["event_id"] in skip:
+            continue
+        if (c.get("knowledge_boundary") or "both") == "player":
+            continue
+        if retriever.suspicious(c.get("summary")):
+            continue
+        scored.append((s, c))
+    scored.sort(key=lambda x: (x[0], x[1].get("importance", 0.5),
+                               x[1].get("turn_end", 0)), reverse=True)
+    return scored[:max(1, int(limit))]
 
 
 def assoc_gate(query, kw_hits, tag_index, vec_top=None):
@@ -592,8 +785,11 @@ ASSOC_ON = (os.environ.get("RP_ASSOC") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 ASSOC_GATE_ON = (os.environ.get("RP_ASSOC_GATE") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
-ASSOC_MAX = 3            # 单轮最多补几张卡：联想是线索，不是第二条召回通道
-ASSOC_TAG_MAX = 60       # 标签表上限：短表更像「索引」，长表会稀释后台注意力
+ASSOC_MAX = 4            # 单轮最多补几张卡：联想是线索，不是第二条召回通道
+try:
+    ASSOC_TAG_MAX = max(20, int(os.environ.get("RP_ASSOC_TAG_MAX") or 120))
+except ValueError:
+    ASSOC_TAG_MAX = 120      # 标签表上限：全量标签按相关性筛后给后台，短表会漏长尾
 ASSOC_BELOW_VEC = 0.55   # 向量最高分低于此值算「语义也没找到」
 # P2 cue→card 联想缓存：后台联想成功过的 cue（标签）记在内存里；同一个 cue 再次
 # 出现在困难问句里时，直接按同一套确定性规则解析成卡，省掉一次后台调用。
@@ -621,6 +817,29 @@ try:
     RERANK_POOL = max(4, int(os.environ.get("RP_RERANK_POOL") or 20))
 except ValueError:
     RERANK_POOL = 20
+# 标签倒排召回：不看 embedding，靠「全部」实体/关系标签 + IDF 捞长尾。
+# 关掉用 RP_TAG_RECALL=0，增益不够时整体回滚。
+TAG_RECALL_ON = (os.environ.get("RP_TAG_RECALL") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+try:
+    TAG_RECALL_LIMIT = max(4, int(os.environ.get("RP_TAG_LIMIT") or 12))
+except ValueError:
+    TAG_RECALL_LIMIT = 12
+# 摘要正文 BM25：钩子召回只看实体词，摘要里的事实句（「养的猫叫团子」）完全没进
+# 关键词索引，这正是库里 97.8% 答案所在的位置。纯词法，不依赖 embedding。
+SUMMARY_RECALL_ON = (os.environ.get("RP_SUMMARY_RECALL") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+try:
+    SUMMARY_RECALL_LIMIT = max(4, int(os.environ.get("RP_SUMMARY_LIMIT") or 12))
+except ValueError:
+    SUMMARY_RECALL_LIMIT = 12
+# 词条 BM25：长期词条是「一条结论」，按 turn_end 映射回事件卡，补摘要漏掉的细节。
+FACT_RECALL_ON = (os.environ.get("RP_FACT_RECALL") or "1").strip().lower() not in {
+    "0", "false", "no", "off"}
+try:
+    FACT_RECALL_LIMIT = max(2, int(os.environ.get("RP_FACT_RECALL_LIMIT") or 10))
+except ValueError:
+    FACT_RECALL_LIMIT = 10
 # 本轮注入给前台的事件卡配额：按话题数放宽，封顶 10。
 # 词条不受这个上限约束——词条是压缩后的结论，一条就够用，且自带热力兜底。
 RECALL_CAP_BASE = max(1, int(os.environ.get("RP_RECALL_CAP") or 4))
@@ -2337,6 +2556,17 @@ class DB:
                 (str(model), cid, base_sid, base_sid + "#%")).fetchall()
         return [(int(r["id"]), r["vec"], int(r["dim"])) for r in rows]
 
+    def fact_turn_map(self, cid, base_sid):
+        """词条 id → (归档轮号, 正文)，供词条检索命中后映射回事件卡。"""
+        with self._c() as c:
+            rows = c.execute(
+                "SELECT id, fact, turn_end FROM durable_facts"
+                " WHERE character_id=? AND IFNULL(retracted_at,'')=''"
+                " AND (session_id=? OR session_id LIKE ?)",
+                (cid, base_sid, base_sid + "#%")).fetchall()
+        return {int(r["id"]): (int(r["turn_end"] or 0), str(r["fact"] or ""))
+                for r in rows}
+
     def facts_missing_vectors(self, cid, base_sid, model, limit=64):
         """还没算过向量的事实（按新到旧，单次限量，避免一次打爆 embedding）。"""
         with self._c() as c:
@@ -3499,7 +3729,7 @@ class RPContextMiddleware:
         """
         if not ASSOC_ON or not self.back or not all_cards:
             return [], []
-        tags = _tag_index(all_cards, facts_detail)
+        tags = _assoc_tags(all_cards, query, facts_detail)
         if not tags:
             return [], []
         text = retriever.clean_text(query, 120)
@@ -3594,6 +3824,62 @@ class RPContextMiddleware:
             if len(cards) >= ASSOC_MAX:
                 break
         return cards, hit
+
+    def _fact_recall(self, sid, cid, query, cards, exclude, limit=10):
+        """词条 BM25 召回：长期词条是「一条结论」，按 turn_end 映射回事件卡。
+
+        摘要向量/正文描述「整段发生了什么」，用户只差一个称谓/数字时，结论层
+        更直接。纯词法，不依赖 embedding；同一张卡取最高分词条。
+        """
+        terms = _lex_terms(query)
+        if not terms or not cards:
+            return []
+        base = lane_base(sid)
+        try:
+            turns = self.db.fact_turn_map(cid, base)
+        except Exception as e:                      # noqa: BLE001 词条通道失败不能拦住召回
+            logger.warning("读取词条失败 sid=%s cid=%s：%s", sid, cid, e)
+            return []
+        if not turns:
+            return []
+        fids = list(turns)
+        scores = _bm25_scores([turns[f][1].lower() for f in fids], terms)
+        ends = sorted(((int(c.get("turn_end") or 0), c) for c in cards),
+                      key=lambda x: x[0])
+        end_turns = [t for t, _ in ends]
+
+        def _card_of(turn):
+            i = bisect.bisect_left(end_turns, turn)
+            near = []
+            if i < len(ends):
+                near.append(ends[i][1])
+            if i > 0:
+                near.append(ends[i - 1][1])
+            for c in near:
+                if int(c.get("turn_start") or 0) <= turn <= int(c.get("turn_end") or 0):
+                    return c
+            return near[0] if near else None
+
+        skip = set(exclude or ())
+        best = {}
+        for fid, s in zip(fids, scores):
+            if s <= 0:
+                continue
+            card = _card_of(turns[fid][0])
+            if card is None:
+                continue
+            eid = card["event_id"]
+            if eid in skip:
+                continue
+            if (card.get("knowledge_boundary") or "both") == "player":
+                continue
+            if retriever.suspicious(card.get("summary")):
+                continue
+            if s > best.get(eid, (0.0, card))[0]:
+                best[eid] = (s, card)
+        return sorted(best.values(), key=lambda x: (x[0], x[1].get("importance", 0.5),
+                                                    x[1].get("turn_end", 0)),
+                      reverse=True)[:max(1, int(limit))]
 
     def _vector_recall(self, sid, cid, query, cards, exclude, limit=4, extra=()):
         """语义召回：查询向量 vs 本会话卡向量（bge-m3）。
@@ -3763,6 +4049,15 @@ class RPContextMiddleware:
             sid, cid, query_used, all_cards, vec_exclude,
             limit=max(self.recall_limit, RERANK_POOL if RERANK_ON else VEC_POOL),
             extra=extra_q)
+        # 第三、四、五路候选：摘要正文 BM25 + 词条 BM25（结论层）+ 全量标签倒排。
+        # 三路都只往重排池里送候选，不直接决定注入顺序；词法两路不依赖 embedding。
+        # base_mode 是评测消融，不掺新通道。
+        sum_hits = [] if (time_only or base_mode or not SUMMARY_RECALL_ON) else summary_recall(
+            all_cards, query_used, limit=SUMMARY_RECALL_LIMIT, exclude_ids=vec_exclude)
+        fvec = [] if (time_only or base_mode or not FACT_RECALL_ON) else self._fact_recall(
+            sid, cid, query_used, all_cards, vec_exclude, limit=FACT_RECALL_LIMIT)
+        tag_hits = [] if (time_only or base_mode or not TAG_RECALL_ON) else tag_recall(
+            all_cards, query_used, limit=TAG_RECALL_LIMIT, exclude_ids=vec_exclude)
         vec_ids = {c["event_id"] for _, c in vec}
         if vec:
             # RRF 分（0.01~0.05）与钩子原始分（0.6~3.8）不同量纲，直接混在 hits 里
@@ -3771,15 +4066,18 @@ class RPContextMiddleware:
             fused = retriever.fuse(
                 hits, vec, limit=max(2, self.recall_limit, RERANK_POOL if RERANK_ON else 0))
             if RERANK_ON:
-                # 重排候选必须是「向量池 ∪ 钩子命中」，不能只吃 RRF 截断后的前 N：
-                # 关键词命中的错误卡会占掉名额，把向量第 5~20 名的正确卡挤出去。
+                # 重排候选必须是「多路召回并集」，不能只吃 RRF 截断后的前 N：
+                # 关键词命中的错误卡会占掉名额，把向量第 5~20 名的正确卡挤出去；
+                # 词条向量与标签倒排的候选也要进来，否则它们只会在池外空转。
                 cand, seen = [], set()
-                for s, c in list(vec) + list(hits):
+                for s, c in (list(sum_hits) + list(vec) + list(fvec)
+                             + list(tag_hits) + list(hits)):
                     eid = c["event_id"]
                     if eid in seen:
                         continue
                     seen.add(eid)
                     cand.append((s, c))
+                cand = cand[:max(2 * RERANK_POOL, 60)]
                 if len(cand) > self.recall_limit:
                     fused = self._rerank_fused(query_used, cand)
             kw_top = max((float(s or 0.0) for s, _ in hits), default=0.0)
@@ -3801,6 +4099,30 @@ class RPContextMiddleware:
             else:
                 fused += [(s, c) for s, c in hits if c["event_id"] not in kept]
             hits = fused
+        # 联想排除只看「传统召回」（钩子/向量）已经拿到的卡；摘要/词条/标签是新加
+        # 的候选层，若同一张卡被它们先捞到，联想仍要记录线索，但不再重复注入。
+        base_ids = {c["event_id"] for _, c in hits}
+        # 没有向量（或重排关闭）时，按各路自己的最高分归一后加权合并：
+        # 摘要正文最可信（单独 recall@4 就 0.65），词条/标签次之，钩子关键词最弱。
+        # 这一步只在无 embedding 的降级路径生效；有向量时交给重排裁决。
+        if (sum_hits or fvec or tag_hits) and not base_mode and not (RERANK_ON and vec):
+            merged, have = [], set()
+
+            def _absorb(rows, weight):
+                peak = max((float(s or 0.0) for s, _ in rows), default=0.0) or 1.0
+                for s, c in rows:
+                    eid = c["event_id"]
+                    if eid in have:
+                        continue
+                    have.add(eid)
+                    merged.append((weight * float(s or 0.0) / peak, c))
+
+            _absorb(sum_hits, 1.0)
+            _absorb(fvec, 0.5)
+            _absorb(tag_hits, 0.35)
+            _absorb(hits, 0.5)
+            merged.sort(key=lambda x: x[0], reverse=True)
+            hits = merged
         if base_mode:                                                  # 消融：外部基线替换召回结果
             shown_ids = {c["event_id"] for c in raw_cards}             # 热窗里已有，避免重复注入
             hits = ([(0.0, c) for c in all_cards if c["event_id"] not in shown_ids]
@@ -3810,30 +4132,33 @@ class RPContextMiddleware:
         assoc_notes, assoc_cues = [], []
         assoc_ids, cache_ids = set(), set()
         vec_top = max((float(s or 0.0) for s, _ in vec), default=None) if vec else None
-        if (not base_mode and not time_only and not guess_terms
-                and assoc_gate(query, kw_hits_n, _tag_index(all_cards, facts_detail),
-                               vec_top)):
-            assoc_exclude = (shown | {c["event_id"] for c in strict}
-                             | {c["event_id"] for _, c in hits})
-            # P2：同一个 cue 命中过就直接出卡，省一次后台调用；没命中再走后台联想。
+        if not base_mode and not time_only and not guess_terms:
+            assoc_exclude = (shown | {c["event_id"] for c in strict} | base_ids)
+            # P2：cue 缓存是确定性的，先查它——命中就直出，不调后台，也不受闸门限制。
             assoc_cards, assoc_cues = self._assoc_cache_lookup(
                 sid, cid, query, all_cards, exclude=assoc_exclude)
             if assoc_cards:
                 assoc_notes = [(cue, "缓存", 1.0) for cue in assoc_cues]
-            else:
+            elif assoc_gate(query, kw_hits_n, _tag_index(all_cards, facts_detail),
+                            vec_top):
+                # 闸门只管「要不要多打一次后台」；标签库是全量索引，这里不截断。
                 assoc_cards, assoc_notes = self._assoc_suggest(
                     query, sid, cid, all_cards, facts_detail, exclude=assoc_exclude)
                 if assoc_cards:
                     self._assoc_cache_learn(sid, cid, [t for t, _, _ in assoc_notes])
             if assoc_cards:
-                assoc_ids = {c["event_id"] for c in assoc_cards}
+                # 摘要/词条/标签可能已经捞到同一张卡；联想只补真正没进候选的。
+                have = {c["event_id"] for _, c in hits}
+                picked = [c for c in assoc_cards if c["event_id"] not in have]
+                assoc_ids = {c["event_id"] for c in picked}
                 cache_ids = set(assoc_ids) if assoc_cues else set()
                 top = max((float(s or 0.0) for s, _ in hits), default=0.0)
                 score = top * 0.8 if top > 0 else 0.8
                 if assoc_cues:               # 并列分时让缓存卡有一点先手
                     score += ASSOC_CACHE_BONUS
-                hits = hits + [(score, c) for c in assoc_cards]
-                hits.sort(key=lambda x: float(x[0] or 0.0), reverse=True)
+                if picked:
+                    hits = hits + [(score, c) for c in picked]
+                    hits.sort(key=lambda x: float(x[0] or 0.0), reverse=True)
         # 本轮卡配额：钩子 + 标签回捞 + 向量融合 + 联想是四条路叠加，单路各自的
         # limit 管不住总数（实测一轮能到 17 张，真正相关的只有 1 张）。
         # 只截事件卡，不截词条：词条是压缩结论，走 list_facts_detail 自己的预算。

@@ -108,7 +108,7 @@ def test_rhythm_decay_and_cap():
     conn.execute("INSERT INTO durable_facts(fact, importance, created_at)"
                  " VALUES('八天前的小事', 0.5, datetime('now','-8 day'))")
     conn.commit()
-    _rows, changes = rhythm.plan(conn)
+    _rows, changes = rhythm.plan(conn, decay=True)
     assert len(changes) == 1
     item = changes[0]
     assert item["new"] < 0.5
@@ -124,16 +124,33 @@ def test_rhythm_decay_and_cap():
     print("L4 衰减写库与审计: OK")
 
 
+def test_rhythm_longterm_no_drop():
+    """默认长线记忆：放再久也不降低，只有被想起时才加固。"""
+    path, conn = _db()
+    conn.execute("INSERT INTO durable_facts(fact, importance, created_at)"
+                 " VALUES('很久以前的小事', 0.5, datetime('now','-90 day'))")
+    conn.commit()
+    rows, changes = rhythm.plan(conn, decay=False)
+    assert not changes, changes
+    assert rows[0]["new"] == 0.5 and rows[0]["drop"] == 0.0, rows[0]
+    conn.close()
+    os.unlink(path)
+    print("L4b 长线不衰减: OK")
+
+
 def test_rhythm_reinforce():
     path, conn = _db()
     conn.execute("INSERT INTO durable_facts(fact, importance, attention_hits,"
                  " created_at) VALUES('被想起的事', 0.5, 1, datetime('now','-10 day'))")
     conn.commit()
-    _rows, changes = rhythm.plan(conn)
-    rhythm.apply(conn, changes, path)          # 记下 hits=1 的基线
+    _rows, changes = rhythm.plan(conn, decay=False)
+    rhythm.ensure(conn)
+    conn.execute("INSERT OR REPLACE INTO rhythm_state(ref_id, hits, last_used)"
+                 " VALUES('1', 1, '')")
+    conn.commit()
     conn.execute("UPDATE durable_facts SET attention_hits=4 WHERE id=1")
     conn.commit()
-    _rows, changes = rhythm.plan(conn)
+    _rows, changes = rhythm.plan(conn, decay=False)
     item = changes[0]
     assert item.get("reinforced", 0) > 0, item
     assert item["new"] <= rhythm.REINFORCE_CAP
@@ -160,6 +177,7 @@ if __name__ == "__main__":
     test_ledger_promise()
     test_rhythm_fresh_protected()
     test_rhythm_decay_and_cap()
+    test_rhythm_longterm_no_drop()
     test_rhythm_reinforce()
     test_shadow()
     print("\nledger / rhythm / shadow tests passed")

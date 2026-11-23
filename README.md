@@ -109,11 +109,13 @@ python tools/serve.py --port 8710 --db data/rp_memory.db
 | 模块 | 作用 | 命令 |
 |---|---|---|
 | `ledger.py` | 每条正文记 SHA256，只增不改；删除/合并走 `retire` 留痕 | `python -m jinyv_memory.core.ledger --db data/rp_memory.db --verify` |
-| `rhythm.py` | 按「新鲜度 × 重要性 × 回忆加固 × 情绪」衰减 `durable_facts.importance` | `python -m jinyv_memory.core.rhythm --db data/rp_memory.db --apply` |
+| `rhythm.py` | 长线记忆：默认只加固、不降低；`--decay` 才启用时间淡忘 | `python -m jinyv_memory.core.rhythm --db data/rp_memory.db --apply` |
 | `recall_shadow.py` | 只记录每轮召回特征与命中数，供以后定「什么时候该查」 | `python -m jinyv_memory.core.recall_shadow --db data/rp_memory.db` |
 
 - `ledger.retire` 记原因、被谁接管、原文片段；`/merge promises` 合并时自动调用。
-- `rhythm` 默认只演算；`--apply` 前先整库备份并 `integrity_check`。单日最多掉 `0.03`，`importance >= 0.70` 不衰减。
+- `rhythm` 默认只演算；`--apply` 前先整库备份并 `integrity_check`。
+  默认是**长线记忆**：放再久也不降低，只记录被想起时的加固；
+  确需淡忘时加 `--decay`（或 `RP_RHYTHM_DECAY=1`，单日最多掉 `0.03`，`importance >= 0.70` 不衰减）。
 - `recall_shadow` 由 `add_recall_trace` 顺带写入，任何异常都吞掉，不影响回复。
 
 ## 测试
@@ -225,6 +227,29 @@ Python 3.10–3.13。3.14 起标准库新增 `compression` 包，会与本仓库
 
 相关开关：`RP_RERANK`（默认 1，`0` 回滚）、`RP_RERANK_POOL`（默认 20）、
 `RP_RERANK_TIMEOUT`（默认 4 秒，防止重排把回复拖死）、`RP_EMBED_KEY` / `RP_ASR_KEY`。
+
+### 多路召回：摘要正文 / 词条 / 全量标签（2026-11-23）
+
+关键词通道只匹配 `entity_hooks`，而 97.8% 的标准答案其实写在卡摘要正文里。
+新增三路词法候选，全部并入重排池，不直接决定注入顺序：
+
+| 通道 | 作用 | recall@4（单独） |
+|---|---|---|
+| 摘要正文 BM25 | 「养的猫叫团子」这类事实句本身变成索引 | **0.652** |
+| 词条 BM25 | 长期词条按 `turn_end` 映射回事件卡（结论层） | 0.391 |
+| 全量标签倒排 | 2109+ 标签按 IDF 匹配，长尾标签也能被问到 | 0.152 |
+
+- 候选并集（重排池）覆盖率：**0.913**（`rerank top4 ∪ 摘要12 ∪ 词条10 ∪ 标签12`），
+  比只吃向量+钩子的 0.696 多出 10 条可救回的 GT。
+- 无 embedding 的降级路径（纯词法加权）recall@4 = **0.674**、MRR 0.491，
+  其中换说法（para）从 0.200 升到 **0.850**。
+- 三路一起算的固定开销约 **25 ms/轮**（1320 卡），远小于组 prompt 的 456 ms。
+- 后台联想的标签表不再截断到 top 60：改为「全量标签按问句相关性排序 + 高频补满」
+  （`RP_ASSOC_TAG_MAX` 默认 120），长尾标签第一次真正进入后台可见范围。
+
+相关开关：`RP_SUMMARY_RECALL` / `RP_SUMMARY_LIMIT`（默认 12）、
+`RP_FACT_RECALL` / `RP_FACT_RECALL_LIMIT`（默认 10）、
+`RP_TAG_RECALL` / `RP_TAG_LIMIT`（默认 12）。
 
 ### 复现
 

@@ -385,23 +385,47 @@ def keyword_rank(db: DB, query: str, sid: str, limit: int = 4, cid: str = ""):
 
 
 def hybrid_rank(mw, db: DB, query: str, sid: str, limit: int = 4, cid: str = ""):
-    """混合召回：关键词 + 向量，按线上 fuse 同一权重合并；重排与线上同池。"""
+    """混合召回：钩子 + 卡向量 + 摘要 BM25 + 词条 BM25 + 标签倒排，线上同款融合。"""
     cid = cid or CID
     cards = db.all_cards(sid, cid)
     pool = max(limit, rp.RERANK_POOL if rp.RERANK_ON else rp.VEC_POOL)
     kw = retriever.retrieve(cards, query, limit=limit)
     vec = mw._vector_recall(sid, cid, query, cards, set(), limit=pool)
+    summ = (rp.summary_recall(cards, query, limit=rp.SUMMARY_RECALL_LIMIT)
+            if rp.SUMMARY_RECALL_ON else [])
+    fvec = (mw._fact_recall(sid, cid, query, cards, set(), limit=rp.FACT_RECALL_LIMIT)
+            if rp.FACT_RECALL_ON else [])
+    tag = (rp.tag_recall(cards, query, limit=rp.TAG_RECALL_LIMIT)
+           if rp.TAG_RECALL_ON else [])
     fused = retriever.fuse(kw, vec, limit=pool)
-    if rp.RERANK_ON:
+    if rp.RERANK_ON and vec:
         cand, seen = [], set()
-        for s, c in list(vec) + list(kw):
+        for s, c in list(summ) + list(vec) + list(fvec) + list(tag) + list(kw):
             eid = c["event_id"]
             if eid in seen:
                 continue
             seen.add(eid)
             cand.append((s, c))
+        cand = cand[:max(2 * rp.RERANK_POOL, 60)]
         if len(cand) > limit:
             fused = mw._rerank_fused(query, cand)
+    elif summ or tag or fvec:
+        merged, have = [], set()
+        for weight, rows in ((1.0, summ), (0.5, fvec), (0.35, tag)):
+            peak = max((float(s or 0.0) for s, _ in rows), default=0.0) or 1.0
+            for s, c in rows:
+                if c["event_id"] in have:
+                    continue
+                have.add(c["event_id"])
+                merged.append((weight * float(s or 0.0) / peak, c))
+        peak = max((float(s or 0.0) for s, _ in fused), default=0.0) or 1.0
+        for s, c in fused:
+            if c["event_id"] in have:
+                continue
+            have.add(c["event_id"])
+            merged.append((0.5 * float(s or 0.0) / peak, c))
+        merged.sort(key=lambda x: x[0], reverse=True)
+        fused = merged
     return [c["event_id"] for _, c in fused[:limit]]
 
 
@@ -965,7 +989,8 @@ def run(real=False, out=None, corpus="small", ablate=False,
 
     for q, gt, snippet, layer in cases:
         kw = keyword_rank(db, q, sid, cid=cid)
-        ranks = hybrid_rank(mw, db, q, sid, cid=cid) if use_vec else kw
+        lex_on = rp.SUMMARY_RECALL_ON or rp.FACT_RECALL_ON or rp.TAG_RECALL_ON
+        ranks = hybrid_rank(mw, db, q, sid, cid=cid) if (use_vec or lex_on) else kw
         text = prompt_text(mw, q, sid, upto, cid=cid)
 
         b_ok, h_ok = gt in kw[:4], gt in ranks[:4]

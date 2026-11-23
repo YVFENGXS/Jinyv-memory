@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""重要性衰减：让「很久没被想起的事」自己慢慢变淡，而不是硬删。
+"""重要性衰减：可选的时间淡忘；默认长线记忆，只加固不降低。
 
-不是每天固定掉 1%：每条词条按自己的曲线走。
+产品定位是「长线记忆」：默认不遗忘，`importance` 只增不减——
+被召回一次仍会加固（attention_hits 增加 +0.02，封顶 0.68），
+但不会因为「很久没被想起」自己变淡。需要旧行为时显式加 `--decay`
+或设 `RP_RHYTHM_DECAY=1`。
 
+衰减模式（--decay）的曲线：
     rate = 0.008 × 新鲜度 × 重要性 × 回忆加固 × 情绪
     新值 = 旧值 × (1 - rate)，单日最多掉 0.03，最低 0.05
 
@@ -17,6 +21,7 @@
 用法：
     python -m jinyv_memory.core.rhythm --db data/rp_memory.db
     python -m jinyv_memory.core.rhythm --db data/rp_memory.db --apply
+    python -m jinyv_memory.core.rhythm --db data/rp_memory.db --decay --apply
     python -m jinyv_memory.core.rhythm --db data/rp_memory.db --explain 12
     python -m jinyv_memory.core.rhythm --db data/rp_memory.db --curve
 """
@@ -146,9 +151,18 @@ def _rows(conn: sqlite3.Connection, now: float):
     return out
 
 
-def plan(conn: sqlite3.Connection, now: float | None = None):
-    """算出每条词条今天该变成多少；不写库。"""
+def _decay_enabled(decay=None) -> bool:
+    """默认关闭衰减（长线记忆）；显式 True 或 RP_RHYTHM_DECAY=1 才开启。"""
+    if decay is not None:
+        return bool(decay)
+    return (os.environ.get("RP_RHYTHM_DECAY") or "0").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
+def plan(conn: sqlite3.Connection, now: float | None = None, decay=None):
+    """算出每条词条今天该变成多少；不写库。decay=None 时读 RP_RHYTHM_DECAY。"""
     ensure(conn)
+    decay = _decay_enabled(decay)
     now = time.time() if now is None else float(now)
     prev = {r["ref_id"]: r for r in conn.execute("SELECT * FROM rhythm_state")}
     rows, changes = [], []
@@ -165,10 +179,15 @@ def plan(conn: sqlite3.Connection, now: float | None = None):
             item["reinforced"] = round(new - item["importance"], 4)
         detail = explain(item["importance"], item["age"], item["hits"],
                          item["last_used"], item["emotion"])
-        new = max(FLOOR, new * (1.0 - detail["rate"]))
-        new = max(item["importance"] - MAX_DAILY_DROP, new)
-        new = round(new, 4)
         item.update(detail)
+        if decay:
+            new = max(FLOOR, new * (1.0 - detail["rate"]))
+            new = max(item["importance"] - MAX_DAILY_DROP, new)
+        else:
+            # 长线模式：只保留加固，不因时间下降；审计里把 rate/drop 记 0
+            item["rate"] = 0.0
+            item["drop"] = 0.0
+        new = round(new, 4)
         item["new"] = new
         item["phase"] = phase_of(new, item["age"])
         rows.append(item)
@@ -248,6 +267,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=os.environ.get("RP_DB") or "data/rp_memory.db")
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--decay", action="store_true",
+                    help="启用时间衰减（默认长线记忆：只加固、不降低）")
     ap.add_argument("--explain", type=int, metavar="ID")
     ap.add_argument("--curve", action="store_true")
     ap.add_argument("--json", action="store_true")
@@ -258,7 +279,7 @@ def main(argv=None) -> int:
         return 0
     conn = connect(args.db)
     try:
-        rows, changes = plan(conn)
+        rows, changes = plan(conn, decay=True if args.decay else None)
         if args.explain is not None:
             hit = next((r for r in rows if r["id"] == str(args.explain)), None)
             if not hit:
@@ -272,6 +293,8 @@ def main(argv=None) -> int:
             print(__import__("json").dumps(changes, ensure_ascii=False, indent=2))
         else:
             print(f"共 {len(rows)} 条词条，今天会变 {len(changes)} 条")
+            if not args.decay:
+                print("（长线模式：只加固、不淡忘；要启用旧衰减加 --decay）")
             for item in sorted(changes, key=lambda x: -x["drop"])[:20]:
                 print(f"  #{item['id']:<5} {item['importance']:.3f} → {item['new']:.3f}"
                       f"  掉 {item['drop']:.4f}  {item['phase']}  {item['text']}")
