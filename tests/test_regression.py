@@ -19,7 +19,7 @@ for _p in (_ROOT, _ROOT / "jinyv_memory", _ROOT / "jinyv_memory" / "core", _ROOT
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-# 回归只验证记忆语义；输出中间层会把 mock 回复里的动作/客套裁掉，
+# 回归只验证记忆语义；输出中间层会做去重/去总结等确定性干预，
 # 会干扰对原文的断言。中间层本身由 tests/test_style_middleware.py 单独覆盖。
 os.environ.setdefault("RP_STYLE_MIDDLE", "0")
 

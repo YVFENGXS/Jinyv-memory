@@ -3,8 +3,7 @@
 
 不依赖 prompt，也不改记忆/召回。只做：
 - 回合分类：closing / ack / share / comfort / invite / question / request / chat
-- 动作白名单：没被邀请就删动作；允许时最多一个，且不放在开头
-- 长度 / 句数 / 段落硬门禁
+- 动作和长度全部交回模型：不删动作，不截断字数
 - 删结尾总结句、短回复去句号、禁止不合时宜的追问
 - 与最近回复的重复门禁
 - 不合格时可选重采样（best-of-2）
@@ -47,10 +46,8 @@ BESTN = _env_int("RP_STYLE_BESTN", 2, 1, 4)
 JSONL = _env_bool("RP_STYLE_JSONL", True)
 MAX_LOG_BYTES = 20 * 1024 * 1024
 DUP_RATIO = float(os.environ.get("RP_STYLE_DUP_RATIO") or 0.55)
-ACTION_MODE = (os.environ.get("RP_STYLE_ACTION") or "strict").strip().lower()
 
 CJK = re.compile(r"[\u4e00-\u9fff]")
-ACTION = re.compile(r"[（(][^）)]{0,120}[）)]")
 PROTECT = re.compile(r"\[\[[^\]]{0,160}\]\]")
 TEMPLATE = re.compile(
     r"(总的来说|总而言之|总之|简而言之|说到底|值得注意的是|"
@@ -76,25 +73,13 @@ INVITE = re.compile(
     r"(抱|抱抱|抱一下|亲亲|摸摸|摸头|击掌|碰拳|握手|贴贴|蹭蹭|靠一下|躺|睡|拍|戳|揉|捏)")
 
 _SENT_SPLIT = re.compile(r"(?<=[。！？!?…~])")
-_PARA_SPLIT = re.compile(r"\n+")
 
 _lock = threading.Lock()
 _announced = False
 
 
-def _limits(kind: str) -> dict:
-    table = {
-        "closing": dict(chars=12, sents=1, paras=1, action=False, question=False),
-        "ack": dict(chars=12, sents=1, paras=1, action=False, question=False),
-        "share": dict(chars=45, sents=2, paras=2, action=False, question=False),
-        "comfort": dict(chars=70, sents=3, paras=2, action=True, question=False),
-        "invite": dict(chars=30, sents=2, paras=1, action=True, question=False),
-        "question": dict(chars=120, sents=3, paras=2, action=False, question=True),
-        "request": dict(chars=220, sents=4, paras=3, action=False, question=True),
-        "long": dict(chars=800, sents=10, paras=6, action=False, question=True),
-        "chat": dict(chars=90, sents=3, paras=2, action=False, question=True),
-    }
-    return table.get(kind, table["chat"])
+def _allow_question(kind: str) -> bool:
+    return kind in ("chat", "question", "request", "long")
 
 
 def classify(query: str) -> str:
@@ -124,10 +109,6 @@ def _sents(text: str) -> list:
     return [p for p in _SENT_SPLIT.split(text or "") if p.strip()]
 
 
-def _paras(text: str) -> list:
-    return [p for p in _PARA_SPLIT.split(text or "") if p.strip()]
-
-
 def _protect(text: str) -> tuple:
     marks = []
 
@@ -146,45 +127,6 @@ def _restore(text: str, marks: list) -> str:
     return re.sub(r"\x00(\d+)\x00", repl, text or "")
 
 
-def _action_budget(kind: str, query: str, recent: list) -> int:
-    lim = _limits(kind)
-    invited = bool(INVITE.search(query or ""))
-    if not lim["action"]:
-        if ACTION_MODE == "strict":
-            return 0
-        # normal：普通聊天允许一个动作，但上一轮已有动作时不再叠加
-        if recent and ACTION.search(recent[0] or ""):
-            return 0
-        return 1
-    if kind == "invite" or invited:
-        return 1
-    if recent and ACTION.search(recent[0] or ""):
-        return 0
-    return 1
-
-
-def _clean_actions(text: str, budget: int) -> str:
-    text = text or ""
-    m = ACTION.match(text.strip())
-    if m:
-        action = m.group(0)
-        rest = text.strip()[m.end():].lstrip()
-        if budget <= 0:
-            text = rest
-        elif rest:
-            text = rest.rstrip() + " " + action
-        else:
-            text = action
-    count = 0
-
-    def repl(match):
-        nonlocal count
-        count += 1
-        return match.group(0) if count <= budget else ""
-
-    return ACTION.sub(repl, text)
-
-
 def _drop_summary(text: str) -> str:
     parts = _sents(text)
     if len(parts) >= 2 and SUMMARY_END.match(parts[-1].strip()):
@@ -193,40 +135,10 @@ def _drop_summary(text: str) -> str:
 
 
 def _drop_question(text: str, kind: str) -> str:
-    if _limits(kind)["question"]:
+    if _allow_question(kind):
         return text
     parts = [p for p in _sents(text) if not QUESTION.search(p)]
     return "".join(parts).rstrip()
-
-
-def _cap_sentences(text: str, limit: int) -> str:
-    parts = _sents(text)
-    if len(parts) <= limit:
-        return text
-    return "".join(parts[:limit]).rstrip()
-
-
-def _cap_paras(text: str, limit: int) -> str:
-    parts = _paras(text)
-    return "\n".join(parts[:limit])
-
-
-def _clip_chars(text: str, limit: int) -> str:
-    if len(CJK.findall(text)) <= limit:
-        return text
-    out = []
-    count = 0
-    for ch in text:
-        out.append(ch)
-        if CJK.match(ch):
-            count += 1
-        if count >= limit:
-            break
-    clipped = "".join(out)
-    cut = max(clipped.rfind(x) for x in "。！？…，、")
-    if cut >= limit // 2:
-        clipped = clipped[:cut + 1]
-    return clipped.rstrip("，、") + "…"
 
 
 def _strip_final_period(text: str, kind: str) -> str:
@@ -270,14 +182,8 @@ def _fallback(kind: str, query: str) -> str:
 
 
 def clean(text: str, kind: str, query: str, recent: list) -> str:
-    lim = _limits(kind)
-    budget = _action_budget(kind, query, recent)
     text = _drop_summary(text)
-    text = _cap_paras(text, lim["paras"])
     text = _drop_question(text, kind)
-    text = _cap_sentences(text, lim["sents"])
-    text = _clean_actions(text, budget)
-    text = _clip_chars(text, lim["chars"])
     text = _strip_final_period(text, kind)
     text = re.sub(r"[ \t]+", " ", text or "").strip()
     if not text:
@@ -285,26 +191,9 @@ def clean(text: str, kind: str, query: str, recent: list) -> str:
     return text
 
 
-def _score(text: str, kind: str, query: str, recent: list, budget: int) -> tuple:
-    lim = _limits(kind)
+def _score(text: str, kind: str, query: str, recent: list) -> tuple:
     score = 0
     tags = []
-    if ACTION.match((text or "").strip()):
-        score += 3
-        tags.append("action_open")
-    actions = len(ACTION.findall(text or ""))
-    if actions > budget:
-        score += 2
-        tags.append("action_over")
-    if len(_paras(text)) > lim["paras"]:
-        score += 2
-        tags.append("para_over")
-    if len(_sents(text)) > lim["sents"]:
-        score += 2
-        tags.append("sent_over")
-    if len(CJK.findall(text or "")) > lim["chars"]:
-        score += 2
-        tags.append("char_over")
     if TEMPLATE.search(text or ""):
         score += 3
         tags.append("template")
@@ -312,7 +201,7 @@ def _score(text: str, kind: str, query: str, recent: list, budget: int) -> tuple
     if len(parts) >= 2 and SUMMARY_END.match(parts[-1].strip()):
         score += 2
         tags.append("summary_end")
-    if not lim["question"] and QUESTION.search(text or ""):
+    if not _allow_question(kind) and QUESTION.search(text or ""):
         score += 2
         tags.append("question")
     if (text or "").strip().endswith("。"):
@@ -325,10 +214,6 @@ def _score(text: str, kind: str, query: str, recent: list, budget: int) -> tuple
     if (text or "").count("主人") >= 2:
         score += 1
         tags.append("owner_dense")
-    if kind == "invite" and not ACTION.search(text or "") \
-            and len(CJK.findall(text or "")) <= 2:
-        score += 3
-        tags.append("invite_cold")
     return score, tags
 
 
@@ -419,19 +304,18 @@ def apply(reply, query, sid: str = "", cid: str = "", db=None,
     if not text or "[[pass]]" in text:
         return reply
     if not _announced:
-        logger.info("中间层已启用 version=p0 bestn=%d action=%s", BESTN, ACTION_MODE)
+        logger.info("中间层已启用 version=p0 bestn=%d", BESTN)
         _announced = True
     try:
         recent_list = list(recent) if recent is not None else _recent(db, sid, cid)
         kind = classify(query)
-        budget = _action_budget(kind, query, recent_list)
         original = text
 
         protected, marks = _protect(original)
         cleaned = _restore(clean(protected, kind, query, recent_list), marks)
 
         def evaluate(value: str) -> dict:
-            score, tags = _score(value, kind, query, recent_list, budget)
+            score, tags = _score(value, kind, query, recent_list)
             return {"text": value, "score": score, "tags": tags}
 
         cands = [evaluate(original), evaluate(cleaned)]
@@ -454,9 +338,6 @@ def apply(reply, query, sid: str = "", cid: str = "", db=None,
         need_fallback = best["score"] > 0 and kind in ("closing", "ack")
         if kind == "closing" and not re.search(
                 r"(晚安|拜拜|再见|明天见|好梦|去睡|早点睡|睡吧)", best["text"]):
-            need_fallback = True
-        if kind == "invite" and not ACTION.search(best["text"]) \
-                and len(CJK.findall(best["text"])) <= 2:
             need_fallback = True
         if need_fallback:
             fallback = _fallback(kind, query)

@@ -3,7 +3,7 @@
 
 重点验证「不靠 prompt」的确定性干预：
 - 回合分类（closing / ack / invite）
-- 没被邀请时删动作、短回复去句号
+- 动作和长度保留、短回复去句号
 - 结尾总结句、模板句、重复句降分
 """
 import os
@@ -33,19 +33,19 @@ def test_classify():
     print("S1 回合分类: OK")
 
 
-def test_closing_strips_action_and_summary():
+def test_closing_keeps_action_drops_summary():
     raw = "（尾巴轻轻卷了一下）主人今天辛苦了。早点睡，明天才有精神。总之，瑾瑜会一直在这儿。"
     out = sm.apply(raw, "晚安", recent=[])
     assert "总之" not in out, out
-    assert len(out) <= 20, out
+    assert "尾巴" in out, out
     assert ("晚安" in out) or ("睡" in out) or ("好梦" in out), out
-    print("S2 晚安短回复: OK", out)
+    print("S2 晚安保留动作去总结: OK", out)
 
 
-def test_uninvited_action_removed():
+def test_uninvited_action_kept():
     out = sm.apply("（尾巴晃了晃）我在。", "在吗", recent=[])
-    assert "尾巴" not in out, out
-    print("S3 未受邀动作删除: OK", out)
+    assert "尾巴" in out, out
+    print("S3 未受邀动作保留: OK", out)
 
 
 def test_invite_action_allowed():
@@ -63,8 +63,8 @@ def test_duplicate_suppressed():
 
 if __name__ == "__main__":
     test_classify()
-    test_closing_strips_action_and_summary()
-    test_uninvited_action_removed()
+    test_closing_keeps_action_drops_summary()
+    test_uninvited_action_kept()
     test_invite_action_allowed()
     test_duplicate_suppressed()
     print("\nstyle middleware tests passed")

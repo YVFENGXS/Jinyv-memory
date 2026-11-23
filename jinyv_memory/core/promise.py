@@ -383,22 +383,76 @@ def inject_lines(lg, days=RETIRE_DAYS, limit=6):
     return out
 
 
+def duplicates(lg, threshold=0.45):
+    """列出可能语义重复的承诺组（只读，不改账本）。
+
+    字面 bigram 只能抓措辞接近的；跨措辞的语义复述抓不全，所以这里只做
+    「审查候选」，真正合并仍要人/角色明确给 ID，避免误并。
+    """
+    ensure_shape(lg)
+    ps = list(lg["promises"])
+    used, groups = set(), []
+    for i, p in enumerate(ps):
+        if p["id"] in used:
+            continue
+        group = [p]
+        for q in ps[i + 1:]:
+            if q["id"] in used:
+                continue
+            if overlap(p["text"], q["text"]) >= threshold:
+                group.append(q)
+        if len(group) > 1:
+            used.update(x["id"] for x in group)
+            groups.append(group)
+    return groups
+
+
 def manage(lg, action, ids, note="", turn=0):
-    """角色自己整理承诺（keep / drop / done / goal）。
+    """角色自己整理承诺（keep / drop / done / goal / dups / merge）。
 
     只动本账本里存在的编号，最多 8 条；drop/done 都保留原文（进 dormant /
-    resolved），不物理删除。返回一句可读结果，交给工具回填。
+    resolved），不物理删除。dups 只列候选，merge 保留第一项、其余并入 dormant，
+    并记录 merged_into，方便事后审查。返回一句可读结果，交给工具回填。
     """
     ensure_shape(lg)
     action = str(action or "").strip().lower()
-    want = {str(i).strip().upper() for i in (ids or []) if str(i).strip()}
-    if action not in ("keep", "drop", "done", "goal"):
-        return "action 只能是 keep / drop / done / goal。"
+    if isinstance(ids, str):
+        ids = [ids]
+    ids = [str(i).strip() for i in (ids or []) if str(i).strip()]
+    want = {i.upper() for i in ids}
+    if action == "dups":
+        groups = duplicates(lg)
+        if not groups:
+            return "没有发现明显重复的承诺。"
+        lines = []
+        for n, group in enumerate(groups[:8], 1):
+            lines.append(f"{n}. " + " ／ ".join(
+                f"[{p['id']}] {sanitize(p['text'], 40)}" for p in group))
+        return ("可能重复的承诺（合并时 ids 第一项是保留项）：\n"
+                + "\n".join(lines))
+    if action not in ("keep", "drop", "done", "goal", "merge"):
+        return "action 只能是 keep / drop / done / goal / dups / merge。"
     if not want:
         return "缺少 ids：填账本里方括号中的承诺编号（如 P-003）。"
-    hit = [p for p in lg["promises"] if str(p.get("id") or "").upper() in want][:8]
+    order = {i.upper(): n for n, i in enumerate(ids)}
+    hit = sorted([p for p in lg["promises"]
+                  if str(p.get("id") or "").upper() in want],
+                 key=lambda p: order.get(str(p.get("id") or "").upper(), 99))[:8]
     if not hit:
         return "没有找到对应编号的承诺，未改动。"
+    if action == "merge":
+        if len(hit) < 2:
+            return "合并至少需要两条承诺：ids 第一项保留，后面的并入它。"
+        keep = hit[0]
+        merged = []
+        for p in hit[1:]:
+            lg["promises"].remove(p)
+            lg["dormant"].append({**p, "dormant_reason": "合并到 " + keep["id"],
+                                  "merged_into": keep["id"]})
+            merged.append(p["id"])
+        left = len(lg["promises"])
+        return (f"已合并到 {keep['id']}：{'、'.join(merged)} 进 dormant"
+                f"（保留原文，可召回）；账本剩余 {left} 条。")
     done = []
     for p in hit:
         if action == "keep":
