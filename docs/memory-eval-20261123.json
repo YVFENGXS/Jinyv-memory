@@ -1,0 +1,777 @@
+{
+  "meta": {
+    "sid": "qq-u3521544885",
+    "cid": "jinyu",
+    "budget": 26000,
+    "vector": "off (no RP_EMBED_KEY)",
+    "model": "off (offline)",
+    "generated_at": "2026-11-23 17:25:59",
+    "notes": "live=线上库 2026-11-23 备份；small=10-28 导出库；回答准确率用前台模型裁判"
+  },
+  "live": {
+    "corpus": {
+      "turns": 6261,
+      "cards": 1320,
+      "facts": 1605,
+      "turns_until_eval": 3135,
+      "time_span": [
+        "2026-10-25 08:14:25",
+        "2026-11-23 03:35:23"
+      ],
+      "card_importance": {
+        "min": 0.15,
+        "p50": 0.5,
+        "mean": 0.46,
+        "max": 0.9
+      },
+      "fact_importance": {
+        "p50": 0.5,
+        "mean": 0.581
+      },
+      "strict_cards": 110,
+      "boundaries": {
+        "both": 1312,
+        "player": 1,
+        "self": 7
+      },
+      "fact_categories": {
+        "": 1,
+        "临时": 201,
+        "事件": 970,
+        "设定": 433
+      },
+      "questions": 46,
+      "unique_gt": 38,
+      "gt_in_db": 38
+    },
+    "retrieval_keyword": {
+      "recall@4_keyword": 0.239,
+      "mrr_keyword": 0.185,
+      "inject_hit": 0.283,
+      "inject_hit_ci": [
+        0.173,
+        0.425
+      ],
+      "recall@4_used_ci": [
+        0.139,
+        0.379
+      ],
+      "layers": {
+        "literal": {
+          "n": 26,
+          "recall@4_keyword": 0.269,
+          "recall@4_used": 0.269
+        },
+        "para": {
+          "n": 20,
+          "recall@4_keyword": 0.2,
+          "recall@4_used": 0.2
+        },
+        "holdout": {
+          "n": 0,
+          "recall@4_keyword": null,
+          "recall@4_used": null
+        }
+      }
+    },
+    "retrieval_vector": {
+      "recall@4_used": 0.522,
+      "mrr_used": 0.417,
+      "inject_hit": 0.522,
+      "inject_hit_ci": [
+        0.381,
+        0.659
+      ],
+      "recall@4_used_ci": [
+        0.381,
+        0.659
+      ],
+      "layers": {
+        "literal": {
+          "n": 26,
+          "recall@4_keyword": 0.269,
+          "recall@4_used": 0.538
+        },
+        "para": {
+          "n": 20,
+          "recall@4_keyword": 0.2,
+          "recall@4_used": 0.5
+        },
+        "holdout": {
+          "n": 0,
+          "recall@4_keyword": null,
+          "recall@4_used": null
+        }
+      }
+    },
+    "answer_string_judge": {
+      "answer_accuracy": 0.174,
+      "answer_accuracy_ci": [
+        0.091,
+        0.307
+      ],
+      "avg_prompt_tokens": 4450,
+      "latency_p50_ms": 3243,
+      "latency_p95_ms": 7676
+    },
+    "answer_llm_judge": {
+      "n": 46,
+      "judged_ok": 26,
+      "accuracy": 0.565,
+      "ci": [
+        0.422,
+        0.708
+      ],
+      "failed_calls": 0
+    },
+    "failures": {
+      "n": 46,
+      "recalled": 11,
+      "missed": 35,
+      "reasons": {
+        "rank_beyond_100": 18,
+        "in_prompt_via_recent": 8,
+        "rank_low": 9
+      },
+      "missed_samples": [
+        {
+          "q": "家里那只猫叫什么名字",
+          "gt": "E-a278c76f",
+          "layer": "literal"
+        },
+        {
+          "q": "你记不记得claude姐姐是什么模样",
+          "gt": "E-92350ad4",
+          "layer": "para"
+        },
+        {
+          "q": "主人发的那张蓝发遮眼的图是谁",
+          "gt": "E-69b63dc1",
+          "layer": "para"
+        },
+        {
+          "q": "变光那次你说要吃几碗",
+          "gt": "E-d9458955",
+          "layer": "literal"
+        },
+        {
+          "q": "那个B站搜索结果你能看清吗",
+          "gt": "E-369796f4",
+          "layer": "para"
+        },
+        {
+          "q": "主人修东西受挫的时候发了什么",
+          "gt": "E-97686b97",
+          "layer": "literal"
+        },
+        {
+          "q": "你能不能发我指定的那张本地图",
+          "gt": "E-5546a53a",
+          "layer": "literal"
+        },
+        {
+          "q": "表情包要怎么发",
+          "gt": "E-d2074408",
+          "layer": "literal"
+        },
+        {
+          "q": "主人对你打字有什么要求",
+          "gt": "E-ccdd550a",
+          "layer": "literal"
+        },
+        {
+          "q": "主人平时怎么称呼你",
+          "gt": "E-9171f21d",
+          "layer": "para"
+        }
+      ]
+    },
+    "budget": [
+      {
+        "budget": 1000,
+        "inject_hit": 0.174,
+        "avg_tokens": 2360,
+        "over_budget": 1.0,
+        "sections_dropped": 292,
+        "recent_dropped": 8
+      },
+      {
+        "budget": 2000,
+        "inject_hit": 0.174,
+        "avg_tokens": 2360,
+        "over_budget": 1.0,
+        "sections_dropped": 292,
+        "recent_dropped": 0
+      },
+      {
+        "budget": 4000,
+        "inject_hit": 0.174,
+        "avg_tokens": 3063,
+        "over_budget": 0.0,
+        "sections_dropped": 200,
+        "recent_dropped": 0
+      },
+      {
+        "budget": 8000,
+        "inject_hit": 0.283,
+        "avg_tokens": 4823,
+        "over_budget": 0.0,
+        "sections_dropped": 0,
+        "recent_dropped": 0
+      },
+      {
+        "budget": 16000,
+        "inject_hit": 0.283,
+        "avg_tokens": 4824,
+        "over_budget": 0.0,
+        "sections_dropped": 0,
+        "recent_dropped": 0
+      },
+      {
+        "budget": 26000,
+        "inject_hit": 0.283,
+        "avg_tokens": 4824,
+        "over_budget": 0.0,
+        "sections_dropped": 0,
+        "recent_dropped": 0
+      }
+    ],
+    "redundancy": {
+      "cases": 46,
+      "snippet_in_facts": 0.5,
+      "snippet_in_cards": 0.826,
+      "second_source_available": 0.413,
+      "facts_total": 1605,
+      "cards_total": 1322
+    },
+    "ledger": {
+      "texts_added": 11142,
+      "entries": 11142,
+      "current": 11142,
+      "missing_after_sync": 0,
+      "changed_after_sync": 0,
+      "tamper_detected": 1,
+      "tampered_ref": "1",
+      "detect_ok": true
+    },
+    "rhythm": {
+      "facts": 1677,
+      "changed": 1092,
+      "applied": 1092,
+      "avg_importance_before": 0.5809,
+      "avg_importance_after": 0.5797,
+      "max_daily_drop": 0.0073,
+      "audit_rows": 1092,
+      "phases": {
+        "刻在心里": 585,
+        "有点模糊": 659,
+        "记得清楚": 355,
+        "快忘了": 65,
+        "几乎想不起": 6,
+        "还新鲜": 7
+      },
+      "inject_hit_after_decay": 0.283,
+      "note": "同一批库、同一批问句，衰减只改 importance，不改卡正文"
+    },
+    "perf": {
+      "retrieve_ms": {
+        "p50": 5.34,
+        "p95": 7.8
+      },
+      "build_messages_ms": {
+        "p50": 456.23,
+        "p95": 552.39
+      },
+      "n_retrieve": 138,
+      "n_build": 138
+    },
+    "privacy": {
+      "secret_cards": 8,
+      "suspicious_cards": 0,
+      "secret_leaks": [
+        {
+          "event_id": "E-cca2894e",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-7719b4e1",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-d1486c8c",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-e0d94db1",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-7c7aedc3",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-f71e4cab",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-092efce5",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-1b3d916c",
+          "boundary": "player",
+          "in_prompts": 0
+        }
+      ],
+      "leak_rate": 0.0
+    },
+    "prompt_structure": {
+      "total_tokens": 4439,
+      "total_chars": 3428,
+      "sections": [
+        {
+          "name": "历史事件",
+          "chars": 1061,
+          "share": 0.31
+        },
+        {
+          "name": "当前状态账本",
+          "chars": 1008,
+          "share": 0.294
+        },
+        {
+          "name": "相关回忆",
+          "chars": 562,
+          "share": 0.164
+        },
+        {
+          "name": "未结约定·每轮必看",
+          "chars": 372,
+          "share": 0.109
+        },
+        {
+          "name": "本轮记忆",
+          "chars": 190,
+          "share": 0.055
+        },
+        {
+          "name": "来源标签",
+          "chars": 132,
+          "share": 0.039
+        },
+        {
+          "name": "记忆库",
+          "chars": 73,
+          "share": 0.021
+        }
+      ]
+    },
+    "shadow": {
+      "logged": 46,
+      "rows": 46
+    },
+    "retrieval_rerank": {
+      "recall@4_used": 0.696,
+      "mrr_used": 0.607,
+      "inject_hit": 0.587,
+      "recall@4_used_ci": [
+        0.552,
+        0.809
+      ],
+      "inject_hit_ci": [
+        0.443,
+        0.717
+      ],
+      "layers": {
+        "literal": {
+          "n": 26,
+          "recall@4_keyword": 0.269,
+          "recall@4_used": 0.731
+        },
+        "para": {
+          "n": 20,
+          "recall@4_keyword": 0.2,
+          "recall@4_used": 0.65
+        },
+        "holdout": {
+          "n": 0,
+          "recall@4_keyword": null,
+          "recall@4_used": null
+        }
+      }
+    }
+  },
+  "small_lib_20261028": {
+    "corpus": {
+      "turns": 998,
+      "cards": 200,
+      "facts": 114,
+      "turns_until_eval": 499,
+      "time_span": [
+        "2026-10-25 08:14:25",
+        "2026-10-27 16:00:09"
+      ],
+      "card_importance": {
+        "min": 0.2,
+        "p50": 0.4,
+        "mean": 0.395,
+        "max": 0.7
+      },
+      "fact_importance": {
+        "p50": 0.6,
+        "mean": 0.647
+      },
+      "strict_cards": 23,
+      "boundaries": {
+        "both": 198,
+        "player": 1,
+        "self": 1
+      },
+      "fact_categories": {
+        "临时": 5,
+        "事件": 57,
+        "设定": 52
+      },
+      "questions": 46,
+      "unique_gt": 45,
+      "gt_in_db": 45
+    },
+    "retrieval": {
+      "recall@1": 0.174,
+      "recall@2": 0.217,
+      "recall@4": 0.239,
+      "recall@8": 0.239,
+      "recall@12": 0.239,
+      "recall@20": 0.239,
+      "mrr@4": 0.203,
+      "layers": {
+        "literal": {
+          "n": 26,
+          "recall@4": 0.269,
+          "ci": [
+            0.137,
+            0.461
+          ]
+        },
+        "para": {
+          "n": 20,
+          "recall@4": 0.2,
+          "ci": [
+            0.081,
+            0.416
+          ]
+        }
+      },
+      "recall@4_ci": [
+        0.139,
+        0.379
+      ]
+    },
+    "injection": {
+      "inject_hit": 0.435,
+      "inject_ci": [
+        0.302,
+        0.578
+      ],
+      "layers": {
+        "literal": {
+          "n": 26,
+          "hit": 0.385
+        },
+        "para": {
+          "n": 20,
+          "hit": 0.5
+        }
+      },
+      "tokens": {
+        "p50": 4167,
+        "max": 4643,
+        "used_pct_of_budget": 0.16
+      }
+    },
+    "failures": {
+      "n": 46,
+      "recalled": 11,
+      "missed": 35,
+      "reasons": {
+        "rank_beyond_100": 9,
+        "in_prompt_via_recent": 13,
+        "rank_low": 13
+      },
+      "missed_samples": [
+        {
+          "q": "家里那只猫叫什么名字",
+          "gt": "E-90808288",
+          "layer": "literal"
+        },
+        {
+          "q": "你记不记得claude姐姐是什么模样",
+          "gt": "E-92350ad4",
+          "layer": "para"
+        },
+        {
+          "q": "主人发的那张蓝发遮眼的图是谁",
+          "gt": "E-69b63dc1",
+          "layer": "para"
+        },
+        {
+          "q": "变光那次你说要吃几碗",
+          "gt": "E-d9458955",
+          "layer": "literal"
+        },
+        {
+          "q": "主人修东西受挫的时候发了什么",
+          "gt": "E-97686b97",
+          "layer": "literal"
+        },
+        {
+          "q": "你能不能发我指定的那张本地图",
+          "gt": "E-5546a53a",
+          "layer": "literal"
+        },
+        {
+          "q": "表情包要怎么发",
+          "gt": "E-d2074408",
+          "layer": "literal"
+        },
+        {
+          "q": "主人对你打字有什么要求",
+          "gt": "E-ccdd550a",
+          "layer": "literal"
+        },
+        {
+          "q": "主人平时怎么称呼你",
+          "gt": "E-9171f21d",
+          "layer": "para"
+        },
+        {
+          "q": "你是鱼吗",
+          "gt": "E-c0ca540f",
+          "layer": "literal"
+        }
+      ]
+    },
+    "budget": [
+      {
+        "budget": 1000,
+        "inject_hit": 0.261,
+        "avg_tokens": 2268,
+        "over_budget": 1.0,
+        "sections_dropped": 288,
+        "recent_dropped": 2
+      },
+      {
+        "budget": 2000,
+        "inject_hit": 0.261,
+        "avg_tokens": 2268,
+        "over_budget": 1.0,
+        "sections_dropped": 288,
+        "recent_dropped": 2
+      },
+      {
+        "budget": 4000,
+        "inject_hit": 0.348,
+        "avg_tokens": 3505,
+        "over_budget": 0.0,
+        "sections_dropped": 83,
+        "recent_dropped": 2
+      },
+      {
+        "budget": 8000,
+        "inject_hit": 0.435,
+        "avg_tokens": 4172,
+        "over_budget": 0.0,
+        "sections_dropped": 0,
+        "recent_dropped": 0
+      },
+      {
+        "budget": 16000,
+        "inject_hit": 0.435,
+        "avg_tokens": 4173,
+        "over_budget": 0.0,
+        "sections_dropped": 0,
+        "recent_dropped": 0
+      },
+      {
+        "budget": 26000,
+        "inject_hit": 0.435,
+        "avg_tokens": 4173,
+        "over_budget": 0.0,
+        "sections_dropped": 0,
+        "recent_dropped": 0
+      }
+    ],
+    "redundancy": {
+      "cases": 46,
+      "snippet_in_facts": 0.522,
+      "snippet_in_cards": 0.913,
+      "second_source_available": 0.457,
+      "facts_total": 114,
+      "cards_total": 200
+    },
+    "ledger": {
+      "texts_added": 1628,
+      "entries": 1628,
+      "current": 1628,
+      "missing_after_sync": 0,
+      "changed_after_sync": 0,
+      "tamper_detected": 1,
+      "tampered_ref": "1",
+      "detect_ok": true
+    },
+    "rhythm": {
+      "facts": 148,
+      "changed": 69,
+      "applied": 69,
+      "avg_importance_before": 0.6474,
+      "avg_importance_after": 0.6457,
+      "max_daily_drop": 0.0033,
+      "audit_rows": 69,
+      "phases": {
+        "刻在心里": 79,
+        "有点模糊": 49,
+        "记得清楚": 11,
+        "快忘了": 4,
+        "几乎想不起": 5
+      },
+      "inject_hit_after_decay": 0.435,
+      "note": "同一批库、同一批问句，衰减只改 importance，不改卡正文"
+    },
+    "perf": {
+      "retrieve_ms": {
+        "p50": 0.93,
+        "p95": 1.25
+      },
+      "build_messages_ms": {
+        "p50": 88.0,
+        "p95": 140.35
+      },
+      "n_retrieve": 138,
+      "n_build": 138
+    },
+    "privacy": {
+      "secret_cards": 2,
+      "suspicious_cards": 0,
+      "secret_leaks": [
+        {
+          "event_id": "E-092efce5",
+          "boundary": "self",
+          "in_prompts": 0
+        },
+        {
+          "event_id": "E-1b3d916c",
+          "boundary": "player",
+          "in_prompts": 0
+        }
+      ],
+      "leak_rate": 0.0
+    },
+    "prompt_structure": {
+      "total_tokens": 4207,
+      "total_chars": 3235,
+      "sections": [
+        {
+          "name": "当前状态账本",
+          "chars": 999,
+          "share": 0.309
+        },
+        {
+          "name": "相关回忆",
+          "chars": 968,
+          "share": 0.299
+        },
+        {
+          "name": "历史事件",
+          "chars": 727,
+          "share": 0.225
+        },
+        {
+          "name": "本轮记忆",
+          "chars": 222,
+          "share": 0.069
+        },
+        {
+          "name": "未结约定·每轮必看",
+          "chars": 218,
+          "share": 0.067
+        },
+        {
+          "name": "记忆库",
+          "chars": 71,
+          "share": 0.022
+        }
+      ]
+    }
+  },
+  "fix": {
+    "commit": "561510f",
+    "changes": [
+      "RERANK_ON 默认开",
+      "候选取向量池∪钩子",
+      "分数下限 1.4",
+      "rerank 4s 超时",
+      "budget<2600 告警"
+    ],
+    "before": {
+      "recall@4": 0.522,
+      "mrr": 0.417
+    },
+    "after": {
+      "recall@4": 0.696,
+      "mrr": 0.607
+    }
+  },
+  "multi_recall": {
+    "date": "2026-11-23",
+    "corpus": "live.db (1320 cards, 46 questions)",
+    "channels_recall_at_4": {
+      "summary_bm25": 0.652,
+      "fact_bm25": 0.391,
+      "tag_inverted": 0.152
+    },
+    "candidate_coverage": 0.935,
+    "candidate_limits": {
+      "vec": 20,
+      "summary": 20,
+      "fact": 15,
+      "tag": 20,
+      "rerank_cap": 60
+    },
+    "second_evidence_weights": {
+      "summary_bm25": 0.35,
+      "fact_bm25": 0.15
+    },
+    "final": {
+      "recall_at_4": 0.804,
+      "mrr": 0.643,
+      "ci95": [
+        0.668,
+        0.893
+      ],
+      "literal": 0.846,
+      "para": 0.75,
+      "inject": 0.587
+    },
+    "stages": {
+      "rerank_old_pool": 0.696,
+      "rerank_expanded_pool": 0.761,
+      "plus_second_evidence": 0.804
+    },
+    "fallback_lexical_only": {
+      "recall_at_4": 0.674,
+      "mrr": 0.491,
+      "para": 0.85,
+      "literal": 0.538
+    },
+    "latency_ms_per_turn": 25,
+    "vector": "BAAI/bge-m3 via SiliconFlow",
+    "reranker": "bge-reranker-v2-m3"
+  }
+}
