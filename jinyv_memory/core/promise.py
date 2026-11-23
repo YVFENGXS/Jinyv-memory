@@ -407,12 +407,15 @@ def duplicates(lg, threshold=0.45):
     return groups
 
 
-def manage(lg, action, ids, note="", turn=0):
+def manage(lg, action, ids, note="", turn=0, on_merge=None):
     """角色自己整理承诺（keep / drop / done / goal / dups / merge）。
 
     只动本账本里存在的编号，最多 8 条；drop/done 都保留原文（进 dormant /
     resolved），不物理删除。dups 只列候选，merge 保留第一项、其余并入 dormant，
     并记录 merged_into，方便事后审查。返回一句可读结果，交给工具回填。
+
+    on_merge(dropped, keep)：可选审计回调；合并发生时对每条被并掉的承诺调用，
+    用于写外部账本（不传则只改本地账本）。
     """
     ensure_shape(lg)
     action = str(action or "").strip().lower()
@@ -450,6 +453,11 @@ def manage(lg, action, ids, note="", turn=0):
             lg["dormant"].append({**p, "dormant_reason": "合并到 " + keep["id"],
                                   "merged_into": keep["id"]})
             merged.append(p["id"])
+            if on_merge is not None:
+                try:
+                    on_merge(p, keep)
+                except Exception:
+                    pass
         left = len(lg["promises"])
         return (f"已合并到 {keep['id']}：{'、'.join(merged)} 进 dormant"
                 f"（保留原文，可召回）；账本剩余 {left} 条。")

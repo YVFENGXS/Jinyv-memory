@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import conflict, context_budget, control, disclosure, embedding, gate, gradient, intimacy
-import compression, merge_ann, promise, questions, retention, retriever, scoring, sealing
+import compression, ledger, merge_ann, promise, questions, recall_shadow, retention, retriever, scoring, sealing
 import style_middleware
 from persona_guard import PersonaGuard
 from summarizer import parse as parse_json, summarize
@@ -2544,6 +2544,13 @@ class DB:
                       " AND id <= (SELECT MAX(id) FROM recall_trace"
                       "            WHERE session_id=? AND character_id=?) - ?",
                       (sid, cid, sid, cid, TRACE_KEEP))
+            try:
+                recall_shadow.log(
+                    c, "recall", sid, cid, query, hits=len(list(recalled)),
+                    dropped=dropped,
+                    channels=[(e or {}).get("via") for e in evidence if e])
+            except Exception:
+                pass
 
     def recent_recall_traces(self, sid, cid, limit=20):
         with self._c() as c:
@@ -2566,6 +2573,16 @@ class DB:
         with self._c() as c:
             c.execute("INSERT OR REPLACE INTO state_ledger VALUES(?,?,?)",
                       (sid, cid, json.dumps(ledger, ensure_ascii=False)))
+
+    def record_text(self, kind, ref_id, text, rev=None):
+        """文本账本：记一版正文（只增不改，审计用）。"""
+        with self._c() as c:
+            return ledger.record(c, kind, ref_id, text, rev)
+
+    def retire_text(self, kind, ref_id, reason="", replaced_by="", by="user", snippet=""):
+        """文本账本：登记合法删除/合并，之后不再算「丢了」。"""
+        with self._c() as c:
+            ledger.retire(c, kind, ref_id, reason, replaced_by, by, snippet)
 
     def load_ledger(self, sid, cid):
         """本车道账本优先；没有则继承基键账本（新号首次上线不丢关系状态）。"""
@@ -2977,9 +2994,19 @@ class RPContextMiddleware:
         if isinstance(ids, str):
             ids = [ids]
         lg = self._ledger(sid, cid)
+
+        def _audit_merge(dropped, keep):
+            """合并留痕：先记被并掉的原文，再登记它被谁接管。"""
+            self.db.record_text("promise", dropped["id"], dropped.get("text", ""))
+            self.db.retire_text(
+                "promise", dropped["id"], reason="合并到 " + keep["id"],
+                replaced_by=keep["id"], by="promise.merge",
+                snippet=dropped.get("text", ""))
+
         out = promise.manage(lg, args.get("action"), ids,
                              note=str(args.get("note") or ""),
-                             turn=self.db.max_turn(sid, cid))
+                             turn=self.db.max_turn(sid, cid),
+                             on_merge=_audit_merge)
         self.db.save_ledger(sid, cid, lg)
         logger.info("承诺自整理 sid=%s action=%s ids=%s -> %s",
                     sid, args.get("action"), ids, out)

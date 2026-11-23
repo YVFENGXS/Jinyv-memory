@@ -32,6 +32,7 @@ jinyv_memory/
     ├── context_budget.py / scoring.py / control.py / disclosure.py
     ├── embedding.py / merge_ann.py / dream.py / intimacy.py
     ├── questions.py / gate.py / persona_guard.py / llm.py
+    ├── ledger.py / rhythm.py / recall_shadow.py  # 文本审计 / 重要性衰减 / 召回埋点
     └── status.py / bubbles.py
 tools/                   # 宿主服务、健康检查、评测、Dream、backfill
 tests/                   # 核心回归 + 输出中间层回归
@@ -101,11 +102,26 @@ python tools/serve.py --port 8710 --db data/rp_memory.db
 - `core/persona.py` 是人设宪法层，由用户维护，不要自行改写。
 - 头尾双锚（人设 + 当前状态账本）永不截断。
 
+## 审计、衰减与埋点
+
+三个独立小工具，都不改记忆语义，默认只读或只演算：
+
+| 模块 | 作用 | 命令 |
+|---|---|---|
+| `ledger.py` | 每条正文记 SHA256，只增不改；删除/合并走 `retire` 留痕 | `python -m jinyv_memory.core.ledger --db data/rp_memory.db --verify` |
+| `rhythm.py` | 按「新鲜度 × 重要性 × 回忆加固 × 情绪」衰减 `durable_facts.importance` | `python -m jinyv_memory.core.rhythm --db data/rp_memory.db --apply` |
+| `recall_shadow.py` | 只记录每轮召回特征与命中数，供以后定「什么时候该查」 | `python -m jinyv_memory.core.recall_shadow --db data/rp_memory.db` |
+
+- `ledger.retire` 记原因、被谁接管、原文片段；`/merge promises` 合并时自动调用。
+- `rhythm` 默认只演算；`--apply` 前先整库备份并 `integrity_check`。单日最多掉 `0.03`，`importance >= 0.70` 不衰减。
+- `recall_shadow` 由 `add_recall_trace` 顺带写入，任何异常都吞掉，不影响回复。
+
 ## 测试
 
 ```bash
 python tests/test_regression.py        # 记忆语义全量回归
 python tests/test_style_middleware.py  # 输出中间层
+python tests/test_ledger_rhythm.py     # 审计 / 衰减 / 召回埋点
 python tools/eval_memory.py --min-recall 0.8 --min-holdout 0.7
 ```
 
