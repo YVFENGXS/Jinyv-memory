@@ -26,7 +26,7 @@ class MockFront:
         self.name = name
         self.last_messages = None
 
-    def chat(self, messages):
+    def chat(self, messages, temperature=0.0, **kwargs):
         self.last_messages = messages
         sys_n = sum(1 for m in messages if m["role"] == "system")
         ledger = next((m["content"] for m in messages if "账本" in m["content"]), "")
@@ -35,7 +35,7 @@ class MockFront:
 
 
 class MockBack:  # 从对话文本抽 mood/实体钩子，产事件卡 JSON（模拟廉价后台模型）
-    def chat(self, messages):
+    def chat(self, messages, temperature=0.0, **kwargs):
         body = messages[-1]["content"].split("对话片段：\n")[-1].strip()
         first = body.splitlines()[0][:40] if body else "(empty)"
         hooks = list(dict.fromkeys(re.findall(r"[\u4e00-\u9fa5]{2}", body)))[:4]

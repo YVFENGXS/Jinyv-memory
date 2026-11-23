@@ -32,7 +32,7 @@ jinyv_memory/
     ├── context_budget.py / scoring.py / control.py / disclosure.py
     ├── embedding.py / merge_ann.py / dream.py / intimacy.py
     ├── questions.py / gate.py / persona_guard.py / llm.py
-    ├── ledger.py / rhythm.py / recall_shadow.py  # 文本审计 / 重要性衰减 / 召回埋点
+    ├── ledger.py / forgetting.py / recall_shadow.py  # 文本审计 / 重要性衰减 / 召回埋点
     └── status.py / bubbles.py
 tools/                   # 宿主服务、健康检查、评测、Dream、backfill
 tests/                   # 核心回归 + 输出中间层回归
@@ -109,13 +109,13 @@ python tools/serve.py --port 8710 --db data/rp_memory.db
 | 模块 | 作用 | 命令 |
 |---|---|---|
 | `ledger.py` | 每条正文记 SHA256，只增不改；删除/合并走 `retire` 留痕 | `python -m jinyv_memory.core.ledger --db data/rp_memory.db --verify` |
-| `rhythm.py` | 长线记忆：默认只加固、不降低；`--decay` 才启用时间淡忘 | `python -m jinyv_memory.core.rhythm --db data/rp_memory.db --apply` |
+| `forgetting.py` | 长线记忆：默认只加固、不降低；`--decay` 才启用时间淡忘 | `python -m jinyv_memory.core.forgetting --db data/rp_memory.db --apply` |
 | `recall_shadow.py` | 只记录每轮召回特征与命中数，供以后定「什么时候该查」 | `python -m jinyv_memory.core.recall_shadow --db data/rp_memory.db` |
 
 - `ledger.retire` 记原因、被谁接管、原文片段；`/merge promises` 合并时自动调用。
-- `rhythm` 默认只演算；`--apply` 前先整库备份并 `integrity_check`。
+- `forgetting` 默认只演算；`--apply` 前先整库备份并 `integrity_check`。
   默认是**长线记忆**：放再久也不降低，只记录被想起时的加固；
-  确需淡忘时加 `--decay`（或 `RP_RHYTHM_DECAY=1`，单日最多掉 `0.03`，`importance >= 0.70` 不衰减）。
+  确需淡忘时加 `--decay`（或 `RP_FORGET_DECAY=1`，单日最多掉 `0.03`，`importance >= 0.70` 不衰减）。
 - `recall_shadow` 由 `add_recall_trace` 顺带写入，任何异常都吞掉，不影响回复。
 
 ## 测试
@@ -123,7 +123,7 @@ python tools/serve.py --port 8710 --db data/rp_memory.db
 ```bash
 python tests/test_regression.py        # 记忆语义全量回归
 python tests/test_style_middleware.py  # 输出中间层
-python tests/test_ledger_rhythm.py     # 审计 / 衰减 / 召回埋点
+python tests/test_ledger_forgetting.py # 审计 / 衰减 / 召回埋点
 python tools/eval_memory.py --min-recall 0.8 --min-holdout 0.7
 ```
 
@@ -173,9 +173,11 @@ Python 3.10–3.13。3.14 起标准库新增 `compression` 包，会与本仓库
 3 条「记错」为参考记忆过期，剔除后 0.917；人设硬违规 0/60；承重度 0.158。
 `python tools/eval_memory.py --real ...` 现在会直接打印这张表（token 用与线上水位线同一套本地估算）。
 
-> **外部基准 LongMemEval-S：未跑。** 仓库既不带该数据集，也不带官方 judge；没有可复现的判分脚本，
-> 所以不提供数字，也不把上表当成 LongMemEval 分数。要补这一项，需要自行下载数据集并接入 judge，
-> 再按同一口径（回答准确率 / 平均 prompt token / 延迟）记录。
+> **外部基准 LongMemEval-S：已接入适配脚本，但仍是「非官方口径」。** 数据集不入库；
+> `tools/eval_longmemeval.py` 把每个实例按 session 切成文档、用本仓库检索选证据、前台作答、judge 判分。
+> `--dry-run` 不需要任何 key（只验证证据命中），真跑需要 `RP_FRONT_KEY`（有 `RP_EMBED_KEY` 时自动开向量）。
+> 官方 LongMemEval 用 GPT-4o 判分、把整段历史塞进上下文，本适配不满足这两点，
+> 所以**不把它的数字当成 LongMemEval-S 官方分数**。
 
 ### 显著性（mentions / verified）
 

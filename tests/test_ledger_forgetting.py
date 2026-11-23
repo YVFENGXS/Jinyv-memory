@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """文本账本 / 重要性衰减 / 召回埋点 回归。
 
-运行：python tests/test_ledger_rhythm.py
+运行：python tests/test_ledger_forgetting.py
 """
 import os
 import sqlite3
@@ -17,7 +17,7 @@ if str(_CORE) not in sys.path:
 
 import ledger
 import recall_shadow
-import rhythm
+import forgetting
 
 MIN_SCHEMA = """
 CREATE TABLE durable_facts(
@@ -87,14 +87,14 @@ def test_ledger_promise():
     print("L2 承诺合并留痕: OK")
 
 
-def test_rhythm_fresh_protected():
+def test_forgetting_fresh_protected():
     path, conn = _db()
     conn.execute("INSERT INTO durable_facts(fact, importance, created_at)"
                  " VALUES('刚发生的事', 0.5, datetime('now'))")
     conn.execute("INSERT INTO durable_facts(fact, importance, created_at)"
                  " VALUES('刻在心里的事', 0.72, datetime('now','-30 day'))")
     conn.commit()
-    _rows, changes = rhythm.plan(conn)
+    _rows, changes = forgetting.preview(conn)
     ids = {c["id"] for c in changes}
     assert "1" not in ids, "6 小时内不该衰减"
     assert "2" not in ids, "0.70 以上受保护"
@@ -103,19 +103,19 @@ def test_rhythm_fresh_protected():
     print("L3 新鲜期与保护阈值: OK")
 
 
-def test_rhythm_decay_and_cap():
+def test_forgetting_decay_and_cap():
     path, conn = _db()
     conn.execute("INSERT INTO durable_facts(fact, importance, created_at)"
                  " VALUES('八天前的小事', 0.5, datetime('now','-8 day'))")
     conn.commit()
-    _rows, changes = rhythm.plan(conn, decay=True)
+    _rows, changes = forgetting.preview(conn, decay=True)
     assert len(changes) == 1
     item = changes[0]
     assert item["new"] < 0.5
-    assert item["importance"] - item["new"] <= rhythm.MAX_DAILY_DROP + 1e-9
-    assert item["new"] >= rhythm.FLOOR
-    assert item["phase"] in ("记得清楚", "有点模糊", "快忘了")
-    assert rhythm.apply(conn, changes, path) == 1
+    assert item["importance"] - item["new"] <= forgetting.DAILY_CAP + 1e-9
+    assert item["new"] >= forgetting.WEIGHT_FLOOR
+    assert item["phase"] in ("记得挺清", "细节记不清", "快记不住了")
+    assert forgetting.commit(conn, changes, path) == 1
     got = conn.execute("SELECT importance FROM durable_facts WHERE id=1").fetchone()[0]
     assert abs(got - item["new"]) < 1e-6
     assert conn.execute("SELECT COUNT(*) FROM rhythm_audit").fetchone()[0] == 1
@@ -124,13 +124,13 @@ def test_rhythm_decay_and_cap():
     print("L4 衰减写库与审计: OK")
 
 
-def test_rhythm_longterm_no_drop():
+def test_forgetting_longterm_no_drop():
     """默认长线记忆：放再久也不降低，只有被想起时才加固。"""
     path, conn = _db()
     conn.execute("INSERT INTO durable_facts(fact, importance, created_at)"
                  " VALUES('很久以前的小事', 0.5, datetime('now','-90 day'))")
     conn.commit()
-    rows, changes = rhythm.plan(conn, decay=False)
+    rows, changes = forgetting.preview(conn, decay=False)
     assert not changes, changes
     assert rows[0]["new"] == 0.5 and rows[0]["drop"] == 0.0, rows[0]
     conn.close()
@@ -138,22 +138,22 @@ def test_rhythm_longterm_no_drop():
     print("L4b 长线不衰减: OK")
 
 
-def test_rhythm_reinforce():
+def test_forgetting_reinforce():
     path, conn = _db()
     conn.execute("INSERT INTO durable_facts(fact, importance, attention_hits,"
                  " created_at) VALUES('被想起的事', 0.5, 1, datetime('now','-10 day'))")
     conn.commit()
-    _rows, changes = rhythm.plan(conn, decay=False)
-    rhythm.ensure(conn)
+    _rows, changes = forgetting.preview(conn, decay=False)
+    forgetting.prepare_schema(conn)
     conn.execute("INSERT OR REPLACE INTO rhythm_state(ref_id, hits, last_used)"
                  " VALUES('1', 1, '')")
     conn.commit()
     conn.execute("UPDATE durable_facts SET attention_hits=4 WHERE id=1")
     conn.commit()
-    _rows, changes = rhythm.plan(conn, decay=False)
+    _rows, changes = forgetting.preview(conn, decay=False)
     item = changes[0]
     assert item.get("reinforced", 0) > 0, item
-    assert item["new"] <= rhythm.REINFORCE_CAP
+    assert item["new"] <= forgetting.BOOST_CEIL
     conn.close()
     os.unlink(path)
     print("L5 回忆加固: OK")
@@ -175,9 +175,9 @@ def test_shadow():
 if __name__ == "__main__":
     test_ledger_roundtrip()
     test_ledger_promise()
-    test_rhythm_fresh_protected()
-    test_rhythm_decay_and_cap()
-    test_rhythm_longterm_no_drop()
-    test_rhythm_reinforce()
+    test_forgetting_fresh_protected()
+    test_forgetting_decay_and_cap()
+    test_forgetting_longterm_no_drop()
+    test_forgetting_reinforce()
     test_shadow()
-    print("\nledger / rhythm / shadow tests passed")
+    print("\nledger / forgetting / shadow tests passed")
