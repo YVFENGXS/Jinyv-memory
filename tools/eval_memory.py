@@ -407,8 +407,17 @@ def hybrid_rank(mw, db: DB, query: str, sid: str, limit: int = 4, cid: str = "")
             seen.add(eid)
             cand.append((s, c))
         cand = cand[:max(2 * rp.RERANK_POOL, 60)]
+        boost = {}
+        for rows, weight in ((summ, rp.RERANK_BOOST_SUM),
+                             (fvec, rp.RERANK_BOOST_FACT)):
+            peak = max((float(s or 0.0) for s, _ in rows), default=0.0)
+            if peak <= 0:
+                continue
+            for s, c in rows:
+                eid = c["event_id"]
+                boost[eid] = boost.get(eid, 0.0) + weight * float(s or 0.0) / peak
         if len(cand) > limit:
-            fused = mw._rerank_fused(query, cand)
+            fused = mw._rerank_fused(query, cand, boost)
     elif summ or tag or fvec:
         merged, have = [], set()
         for weight, rows in ((1.0, summ), (0.5, fvec), (0.35, tag)):

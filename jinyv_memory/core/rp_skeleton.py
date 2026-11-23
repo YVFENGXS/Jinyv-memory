@@ -817,29 +817,37 @@ try:
     RERANK_POOL = max(4, int(os.environ.get("RP_RERANK_POOL") or 20))
 except ValueError:
     RERANK_POOL = 20
+# 重排后的「第二证据」加权：摘要 BM25 / 词条 BM25 各自归一化后，加到 cross-encoder
+# 原始分上。重排只看语义相似，常把「字面完全对得上」的卡压到第 5~8 名；
+# 这一项只做同分附近的抬升，不改变候选集合。0 即关闭。
+try:
+    RERANK_BOOST_SUM = max(0.0, float(os.environ.get("RP_RERANK_BOOST_SUM") or 0.35))
+    RERANK_BOOST_FACT = max(0.0, float(os.environ.get("RP_RERANK_BOOST_FACT") or 0.15))
+except ValueError:
+    RERANK_BOOST_SUM, RERANK_BOOST_FACT = 0.35, 0.15
 # 标签倒排召回：不看 embedding，靠「全部」实体/关系标签 + IDF 捞长尾。
 # 关掉用 RP_TAG_RECALL=0，增益不够时整体回滚。
 TAG_RECALL_ON = (os.environ.get("RP_TAG_RECALL") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 try:
-    TAG_RECALL_LIMIT = max(4, int(os.environ.get("RP_TAG_LIMIT") or 12))
+    TAG_RECALL_LIMIT = max(4, int(os.environ.get("RP_TAG_LIMIT") or 20))
 except ValueError:
-    TAG_RECALL_LIMIT = 12
+    TAG_RECALL_LIMIT = 20
 # 摘要正文 BM25：钩子召回只看实体词，摘要里的事实句（「养的猫叫团子」）完全没进
 # 关键词索引，这正是库里 97.8% 答案所在的位置。纯词法，不依赖 embedding。
 SUMMARY_RECALL_ON = (os.environ.get("RP_SUMMARY_RECALL") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 try:
-    SUMMARY_RECALL_LIMIT = max(4, int(os.environ.get("RP_SUMMARY_LIMIT") or 12))
+    SUMMARY_RECALL_LIMIT = max(4, int(os.environ.get("RP_SUMMARY_LIMIT") or 20))
 except ValueError:
-    SUMMARY_RECALL_LIMIT = 12
+    SUMMARY_RECALL_LIMIT = 20
 # 词条 BM25：长期词条是「一条结论」，按 turn_end 映射回事件卡，补摘要漏掉的细节。
 FACT_RECALL_ON = (os.environ.get("RP_FACT_RECALL") or "1").strip().lower() not in {
     "0", "false", "no", "off"}
 try:
-    FACT_RECALL_LIMIT = max(2, int(os.environ.get("RP_FACT_RECALL_LIMIT") or 10))
+    FACT_RECALL_LIMIT = max(2, int(os.environ.get("RP_FACT_RECALL_LIMIT") or 15))
 except ValueError:
-    FACT_RECALL_LIMIT = 10
+    FACT_RECALL_LIMIT = 15
 # 本轮注入给前台的事件卡配额：按话题数放宽，封顶 10。
 # 词条不受这个上限约束——词条是压缩后的结论，一条就够用，且自带热力兜底。
 RECALL_CAP_BASE = max(1, int(os.environ.get("RP_RECALL_CAP") or 4))
@@ -3677,21 +3685,23 @@ class RPContextMiddleware:
                                    x[1].get("turn_end", 0)), reverse=True)
         return scored[:max(1, int(limit))]
 
-    def _rerank_fused(self, query, fused):
+    def _rerank_fused(self, query, fused, boost=None):
         """对融合候选做一次 cross-encoder 重排，只保留 recall_limit 张。
 
         重排结果必须换算成可比分数：后面的选择按分数排序，只改顺序会被排序抹掉。
         相关分（0~1）映射到 0.5~3.8，与钩子原始分同一刻度，高相关卡能压过泛钩子。
+        boost 是「第二证据」：摘要 BM25 / 词条 BM25 的归一化分，直接加在重排分上。
         """
         docs = [str(c.get("summary") or "")[:300] for _, c in fused]
         scored = embedding.rerank(query, docs)
         if not scored:
             return fused[:self.recall_limit]
-        order = sorted(scored, key=lambda x: x[1], reverse=True)[:self.recall_limit]
-        # 映射下限抬到 1.4：重排后的第 2~4 名若落在 0.5，会被后面的相对闸门
-        # （rel < RECALL_MIN_REL）当噪音丢掉——语义重排已经排过序，不该再被
-        # 字面分尺度的相对阈值二次过滤。1.4/3.8 ≈ 0.37，刚好高于 0.35。
-        return [(1.4 + 2.4 * max(0.0, min(1.0, float(s))), fused[i][1]) for i, s in order]
+        boost = boost or {}
+        rows = [(1.4 + 2.4 * max(0.0, min(1.0, float(s)))
+                 + float(boost.get(fused[i][1]["event_id"], 0.0)), fused[i][1])
+                for i, s in scored]
+        rows.sort(key=lambda x: x[0], reverse=True)
+        return rows[:self.recall_limit]
 
     def _decompose(self, query, sid, cid):
         """后台查询分解：只在困难问句上拆出 ≤3 条短查询，仅供向量通道使用。
@@ -4078,8 +4088,17 @@ class RPContextMiddleware:
                     seen.add(eid)
                     cand.append((s, c))
                 cand = cand[:max(2 * RERANK_POOL, 60)]
+                boost = {}
+                for rows, weight in ((sum_hits, RERANK_BOOST_SUM),
+                                     (fvec, RERANK_BOOST_FACT)):
+                    peak = max((float(s or 0.0) for s, _ in rows), default=0.0)
+                    if peak <= 0:
+                        continue
+                    for s, c in rows:
+                        eid = c["event_id"]
+                        boost[eid] = boost.get(eid, 0.0) + weight * float(s or 0.0) / peak
                 if len(cand) > self.recall_limit:
-                    fused = self._rerank_fused(query_used, cand)
+                    fused = self._rerank_fused(query_used, cand, boost)
             kw_top = max((float(s or 0.0) for s, _ in hits), default=0.0)
             f_top = max((float(s or 0.0) for s, _ in fused), default=0.0)
             # 向量只做补充，不许挤掉钩子已经命中的卡：recall_limit=2 时向量权重
