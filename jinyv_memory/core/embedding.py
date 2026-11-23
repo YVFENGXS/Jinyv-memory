@@ -34,7 +34,7 @@ DIM = max(1, int(float(os.environ.get("RP_EMBED_DIM") or 1024)))
 BATCH = max(1, int(float(os.environ.get("RP_EMBED_BATCH") or 16)))
 TIMEOUT = max(3.0, float(os.environ.get("RP_EMBED_TIMEOUT") or 15))
 # 重排单独给更短的超时：它挂在每轮 prompt 构建的同步路径上，15 秒会把回复拖死。
-RERANK_TIMEOUT = max(2.0, float(os.environ.get("RP_RERANK_TIMEOUT") or 4))
+RERANK_TIMEOUT = max(2.0, float(os.environ.get("RP_RERANK_TIMEOUT") or 8))
 BASE = (os.environ.get("RP_EMBED_BASE") or "https://api.siliconflow.cn/v1").rstrip("/")
 RERANK_MODEL = (os.environ.get("RP_RERANK_MODEL")
                 or "BAAI/bge-reranker-v2-m3").strip()

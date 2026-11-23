@@ -39,6 +39,16 @@ import rp_skeleton as rp
 from rp_skeleton import DB, RPContextMiddleware
 from demo import MockBack, MockFront, PERSONA
 
+# 评测必须用生产人设，否则库里记的是瑾瑜、prompt 里却是另一个人，答案会系统性失真。
+# 用 RP_EVAL_PERSONA 指向生产 persona.py（导出 PERSONA 字典）即可覆盖。
+_persona_path = (os.environ.get("RP_EVAL_PERSONA") or "").strip()
+if _persona_path and os.path.exists(_persona_path):
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_eval_persona", _persona_path)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    PERSONA = getattr(_mod, "PERSONA", PERSONA)
+
 SID, CID = "eval", "shenqingwu"
 
 _BACK = None
@@ -1057,10 +1067,11 @@ def run(real=False, out=None, corpus="small", ablate=False,
                 ptoks.append(rp.est_tokens(
                     "\n".join(str(m.get("content") or "") for m in ask), mw.profile))
                 t0 = time.perf_counter()
-                ans = front.chat(ask, temperature=0.0, max_tokens=200)
+                ans = front.chat(ask, temperature=0.0, max_tokens=400)
                 lat_ms.append((time.perf_counter() - t0) * 1000)
                 row = rows[[r["q"] for r in rows].index(q)]
-                row["ans"] = " ".join(str(ans or "").split())[:120]
+                # 裁判看的是完整回答：截到 120 字会把「先寒暄、后给事实」的回答误判成错。
+                row["ans"] = " ".join(str(ans or "").split())[:800]
                 if gt in BOUNDARY:
                     # 「守住」不等于「不提」：说出「一个字也不说出去」是守约，不是泄露。
                     guarded = _guarded(row["ans"])

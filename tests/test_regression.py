@@ -1986,7 +1986,7 @@ def test_disclosure_levels():
     assert disclosure.decide(card, group, 1.0)[0] == "full"        # 普通卡群聊不降级
     assert disclosure.decide(dict(card, knowledge_boundary="self"),
                              group, 1.0)[0] != "full"              # 秘密卡群聊降级
-    assert disclosure.decide(card, private, 0.4)[0] != "full"      # 相对分弱也不逐字
+    assert disclosure.decide(card, private, 0.4)[0] == "full"      # 私聊非秘密卡不按相对分降级
 
     # 边界与保密词：非信任场景不能 full（硬门的优先级不被披露层改写）
     assert disclosure.decide(dict(card, knowledge_boundary="self"),

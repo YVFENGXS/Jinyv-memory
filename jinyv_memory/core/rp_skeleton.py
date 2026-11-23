@@ -72,6 +72,32 @@ def _mmdd(ts):
         return ""
 
 
+_EVID_SPLIT = re.compile(r"[。！？；\n]+")
+
+
+def _best_sentence(text, query):
+    """从卡片摘要里挑与本句最接近的一句，作为「可直接引用」的证据。
+
+    合并卡常把好几件事写进同一段；整段给模型时，它容易答成另一件事。
+    只挑一句，能显著减少「记得这件事、答成那件事」。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    two, one = _fact_terms(query)
+    best, best_hit = "", 0
+    for part in _EVID_SPLIT.split(s):
+        part = part.strip()
+        if len(part) < 6:
+            continue
+        hit = 2 * sum(1 for g in two if g in part) + sum(1 for ch in one if ch in part)
+        if query and query in part:
+            hit += 6
+        if hit > best_hit:
+            best, best_hit = part, hit
+    return best if best_hit >= 6 else ""
+
+
 def _clip_sentence(text, limit):
     """按句读收口截断：宁可短一点，也不要把话切在半个词上。"""
     s = str(text or "").strip()
@@ -850,7 +876,7 @@ except ValueError:
     FACT_RECALL_LIMIT = 15
 # 本轮注入给前台的事件卡配额：按话题数放宽，封顶 10。
 # 词条不受这个上限约束——词条是压缩后的结论，一条就够用，且自带热力兜底。
-RECALL_CAP_BASE = max(1, int(os.environ.get("RP_RECALL_CAP") or 4))
+RECALL_CAP_BASE = max(1, int(os.environ.get("RP_RECALL_CAP") or 5))
 RECALL_CAP_MAX = max(RECALL_CAP_BASE, int(os.environ.get("RP_RECALL_CAP_MAX") or 10))
 # 低关联过滤只对事件卡：既没有字面钩子命中、相对分又低于此值，判为本轮噪音。
 # 不作用于词条，也不删任何记忆——只是这轮不塞进 prompt。
@@ -3835,7 +3861,7 @@ class RPContextMiddleware:
                 break
         return cards, hit
 
-    def _fact_recall(self, sid, cid, query, cards, exclude, limit=10):
+    def _fact_recall(self, sid, cid, query, cards, exclude, limit=10, with_text=False):
         """词条 BM25 召回：长期词条是「一条结论」，按 turn_end 映射回事件卡。
 
         摘要向量/正文描述「整段发生了什么」，用户只差一个称谓/数字时，结论层
@@ -3885,11 +3911,12 @@ class RPContextMiddleware:
                 continue
             if retriever.suspicious(card.get("summary")):
                 continue
-            if s > best.get(eid, (0.0, card))[0]:
-                best[eid] = (s, card)
-        return sorted(best.values(), key=lambda x: (x[0], x[1].get("importance", 0.5),
-                                                    x[1].get("turn_end", 0)),
-                      reverse=True)[:max(1, int(limit))]
+            if s > best.get(eid, (0.0, card, ""))[0]:
+                best[eid] = (s, card, turns[fid][1])
+        out = sorted(best.values(), key=lambda x: (x[0], x[1].get("importance", 0.5),
+                                                   x[1].get("turn_end", 0)),
+                     reverse=True)[:max(1, int(limit))]
+        return out if with_text else [(s, c) for s, c, _ in out]
 
     def _vector_recall(self, sid, cid, query, cards, exclude, limit=4, extra=()):
         """语义召回：查询向量 vs 本会话卡向量（bge-m3）。
@@ -4064,8 +4091,10 @@ class RPContextMiddleware:
         # base_mode 是评测消融，不掺新通道。
         sum_hits = [] if (time_only or base_mode or not SUMMARY_RECALL_ON) else summary_recall(
             all_cards, query_used, limit=SUMMARY_RECALL_LIMIT, exclude_ids=vec_exclude)
-        fvec = [] if (time_only or base_mode or not FACT_RECALL_ON) else self._fact_recall(
-            sid, cid, query_used, all_cards, vec_exclude, limit=FACT_RECALL_LIMIT)
+        fact_hits = [] if (time_only or base_mode or not FACT_RECALL_ON) else self._fact_recall(
+            sid, cid, query_used, all_cards, vec_exclude,
+            limit=FACT_RECALL_LIMIT, with_text=True)
+        fvec = [(s, c) for s, c, _ in fact_hits]
         tag_hits = [] if (time_only or base_mode or not TAG_RECALL_ON) else tag_recall(
             all_cards, query_used, limit=TAG_RECALL_LIMIT, exclude_ids=vec_exclude)
         vec_ids = {c["event_id"] for _, c in vec}
@@ -4087,7 +4116,8 @@ class RPContextMiddleware:
                         continue
                     seen.add(eid)
                     cand.append((s, c))
-                cand = cand[:max(2 * RERANK_POOL, 60)]
+                cand = cand[:max(2 * RERANK_POOL,
+                                  int(os.environ.get("RP_RERANK_CAND") or 160))]
                 boost = {}
                 for rows, weight in ((sum_hits, RERANK_BOOST_SUM),
                                      (fvec, RERANK_BOOST_FACT)):
@@ -4113,7 +4143,12 @@ class RPContextMiddleware:
                 fused = [(max(float(s or 0.0) / f_top if f_top > 0 else 0.0,
                               kw_norm.get(c["event_id"], 0.0)), c)
                          for s, c in fused]
-                fused += [(kw_norm[c["event_id"]], c)
+                # 只在「勾子召回、没进重排结果」的卡：重排已经裁决过顺序，这类卡
+                # 只能补在重排全序之后，不能拿归一化后的 1.0 反过来挤掉重排第 4 张。
+                # 泛词问句（「主人喜欢什么样的形象」）下，钩子命中的多是含「主人」
+                # 的无关卡，若与重排并列，会把语义正确的卡挤出注入配额。
+                floor = min((float(s or 0.0) for s, _ in fused), default=0.0)
+                fused += [(min(floor * 0.999, kw_norm[c["event_id"]]), c)
                           for _, c in hits if c["event_id"] not in kept]
             else:
                 fused += [(s, c) for s, c in hits if c["event_id"] not in kept]
@@ -4209,8 +4244,9 @@ class RPContextMiddleware:
             anchors[1]["content"] += (
                 f"\n【记忆库】本会话已存 {self.db.count_facts(sid, cid)} 条词条、"
                 f"{len(all_cards)} 张事件卡。涉及认识的人、发生过的事、答应过的事，"
-                "先对照下面的记忆回答，不许说「不记得」；但只能对【本轮记忆】里列出的"
-                "内容说「记得/翻到过」。里面没有的，先说「这条瑾瑜这边没存到原话」，"
+                "先对照下面的记忆回答，不许说「不记得」；但只能对【本轮记忆】"
+                "【相关回忆】【历史事件】【本轮证据】里列出的内容说「记得/翻到过」。"
+                "这些段里都没有的，才说「这条瑾瑜这边没存到原话」，"
                 "再按主人说的认下来；不许编「旧记录里翻到残片」，不许把猜的当记过的，"
                 "同一件事别反复说「没翻到」。【历史事件】「」里是对方原话，同一件事"
                 "别换问法再问；主人改时间、取消或改主意，立刻用 update_plan 改旧计划。")
@@ -4399,6 +4435,39 @@ class RPContextMiddleware:
                     anchors[1]["content"] += seal_note
             except Exception as exc:                  # noqa: BLE001
                 logger.warning("账本/封口注入失败 sid=%s cid=%s：%s", sid, cid, exc)
+        # 把本轮最贴近问句的原句压成一小段证据，放在所有系统段最后：
+        # 模型对最后一屏的利用率最高；合并卡也不会因为整段太杂而答成另一件事。
+        if not base_mode:
+            ev, seen_ev = [], set()
+
+            def _add_ev(when, text):
+                text = str(text or "").strip()
+                if len(text) < 4 or text in seen_ev or any(text in x for x in ev):
+                    return
+                seen_ev.add(text)
+                ev.append((f"（{when}）" if when else "") + text)
+
+            for _s, _fc, _ft in (fact_hits or ())[:3]:
+                _add_ev(_mmdd(_fc.get("created_at")), _ft)
+            for _, _c, _lv in visible or ():
+                if _lv != "full":
+                    continue
+                # 优先挑与问句最贴近的一句；挑不出来就退整段截断，
+                # 保证「已经召回到的卡」一定在最后一屏出现一次，不被字数条件漏掉。
+                _line = (_best_sentence(_c.get("summary"), query_used)
+                         or _clip_sentence(_c.get("summary"), 72))
+                _add_ev(_mmdd(_c.get("created_at")), _line)
+                if len(ev) >= 8:
+                    break
+            if ev:
+                sections.append((5, 0.0, {
+                    "role": "system",
+                    "content": ("【本轮证据·优先引用】" + MEMORY_LABEL + "\n"
+                                + "\n".join(f"- {x}" for x in ev[:8]) + "\n"
+                                "上面这些就是【本轮记忆】，直接用具体名字/时间/数量答；"
+                                "同一件事有多条时，按问句里的「最后/第一次/那天」挑对应那条，"
+                                "没指明就选和问法最贴近的一条；问「有没有/是不是」按对应那张卡"
+                                "的结论答，别拿相近的另一件事替换；这些段里都没有的才说没存到。")}))
         # 说话方式不写 prompt：长度、动作、语气交回模型和输出中间层。
         recent, prev_dt = [], None                          # 热窗时间标注：见 _stamp / RECENT_GAP_SECONDS
         now = datetime.now().astimezone()

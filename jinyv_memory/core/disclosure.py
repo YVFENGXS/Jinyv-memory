@@ -125,9 +125,15 @@ def exposure(card: dict, scene: Scene, rel: float) -> float:
     仍按 boundary 与 SECRET_MARK 压制（对那些场合才需要保密）。
     """
     trusted = bool(scene.is_private and scene.is_owner)
+    topic = max(0.0, min(1.0, float(rel or 0.0)))      # 先校验 rel，坏值仍回落 silence
+    # 私聊是一对一车道，长期记忆本来就属于当前用户；召回又已过相关性闸门。
+    # 再按「相对分」把第 2~4 张降成「记得有事、说不出细节」，会让回答准确率
+    # 直接掉一档（实测 6 条 top4 命中全错）。self 与敏感卡仍按原规则收紧。
+    if scene.is_private and (card.get("knowledge_boundary") or "both") != "self" \
+            and not sensitive(card):
+        return 1.0
     boundary = 1.0 if trusted else (
         BOUNDARY_SELF if (card.get("knowledge_boundary") or "both") == "self" else 1.0)
-    topic = max(0.0, min(1.0, float(rel or 0.0)))
     sens = 1.0 if trusted else (SENSITIVE if sensitive(card) else 1.0)
     score = boundary * audience_factor(scene) * topic * sens
     if _same_person(card.get("subject"), scene.speaker):
