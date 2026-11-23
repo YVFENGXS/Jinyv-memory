@@ -9,7 +9,7 @@
 
 用法（服务器上）：
     python3 intimacy.py add --db /opt/qqbot/data/rp_memory.db \
-        --sid qq-u3521544885 --cid jinyu --day 2026-11-06 \
+        --sid qq-u10001 --cid jinyu --day 2026-11-06 \
         --actor master --tag first "第一次，主人主动"
 
     python3 intimacy.py list --db ... --sid ... --cid ...

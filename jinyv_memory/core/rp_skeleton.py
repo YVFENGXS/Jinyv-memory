@@ -1115,7 +1115,7 @@ def _style_directive(query: str, warmth: float = 0.5) -> str:
 
 _OWNER_STYLE_CACHE = {}
 _OWNER_STYLE_TTL = 1800
-_OWNER_SID = (os.environ.get("RP_OWNER_SID") or "qq-u3521544885").strip()
+_OWNER_SID = (os.environ.get("RP_OWNER_SID") or "qq-u10001").strip()
 _OWNER_SKIP = re.compile(r"^(【B站@】|（|[【\[])")
 
 

@@ -2,7 +2,7 @@
 
 > 评测时间：2026-11-23
 > 主评测库：线上 `/opt/qqbot/data/rp_memory.db` 的只读备份（29 MB）
-> 账号：`qq-u3521544885` / 角色 `jinyu`，2026-10-25 ~ 11-23
+> 账号：`qq-u10001` / 角色 `jinyu`，2026-10-25 ~ 11-23
 > 密钥：取自服务器 `/opt/qqbot/bot/.env`（仅在进程环境内使用，未落盘、未写入报告）
 > 向量：`BAAI/bge-m3`（1024 维）· 裁判模型：`deepseek-v4.1-flash`
 
@@ -258,7 +258,7 @@ agent/MCP 是 GT（t104「不装」）与后续部署事实冲突；**两个角�
 ```bash
 RP_EVAL_PERSONA=/path/to/persona.py \
 python tools/eval_memory.py --cards-db live.db --questions real_questions_live.jsonl \
-  --sid qq-u3521544885 --cid jinyu --real --out live_real_ev4.json
+  --sid qq-u10001 --cid jinyu --real --out live_real_ev4.json
 python judge.py live_real_ev4.json   # {"n":46,"ok":37,"accuracy":0.804}
 ```
 
@@ -438,15 +438,15 @@ python tools/eval_db_from_export.py --src export.json --dst /tmp/eval.db
 
 # 2) 关键词 + 向量召回 / 消融
 python tools/eval_memory.py --cards-db /tmp/live_eval.db \
-  --questions data/real_q_live.jsonl --sid qq-u3521544885 --cid jinyu --ablate
+  --questions data/real_q_live.jsonl --sid qq-u10001 --cid jinyu --ablate
 
 # 3) 真实模型回答（需要 .env 里的 RP_FRONT_KEY / RP_ASR_KEY）
 python tools/eval_memory.py --cards-db /tmp/live_eval.db \
-  --questions data/real_q_live.jsonl --sid qq-u3521544885 --cid jinyu --real
+  --questions data/real_q_live.jsonl --sid qq-u10001 --cid jinyu --real
 
 # 4) 其余维度：预算/冗余/账本/衰减/埋点/性能/隐私
 python tools/eval_full.py --cards-db /tmp/live_eval.db \
-  --questions data/real_q_live.jsonl --sid qq-u3521544885 --cid jinyu \
+  --questions data/real_q_live.jsonl --sid qq-u10001 --cid jinyu \
   --out /tmp/eval_full.json
 ```
 

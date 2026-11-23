@@ -5,7 +5,7 @@
       时间衰减 / 召回埋点 / 性能 / 隐私边界 / prompt 段结构
 
 用法：
-  python tools/eval_full.py --cards-db data/memory.db     --questions data/real_q.jsonl --sid qq-u3521544885 --cid jinyu
+  python tools/eval_full.py --cards-db data/memory.db     --questions data/real_q.jsonl --sid qq-u10001 --cid jinyu
 
 注意：--cards-db 给的是只读副本；脚本会复制到临时目录再跑，绝不写回原库。
 """
@@ -25,7 +25,7 @@ from rp_skeleton import DB, RPContextMiddleware
 
 DB_SRC = Path("")
 Q_PATH = Path("")
-SID, CID = "qq-u3521544885", "jinyu"
+SID, CID = "qq-u10001", "jinyu"
 BUDGET = 26000
 WORKDIR = Path(tempfile.mkdtemp(prefix="jinyv-eval-"))
 
