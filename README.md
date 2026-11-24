@@ -276,6 +276,8 @@ RP_EMBED_KEY=... python tools/eval_memory.py --corpus scale  # 开向量
 
 ## 数据与历史文档
 
+- [LongMemEval 500 题评测报告](docs/longmemeval_500_report.md)
+- [LongMemEval 500 题 Excel 明细与图表](docs/LongMemEval_500_评测报告.xlsx)
 - [评测报告](docs/benchmark-report.md)
 - [检索与消融评测图](docs/benchmark-recall.svg)
 - [真实语料前台指标图](docs/benchmark-front.svg)
