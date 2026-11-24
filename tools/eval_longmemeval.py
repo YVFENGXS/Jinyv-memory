@@ -133,6 +133,7 @@ def retrieve(docs, query, topk, use_embed):
 
 MAX_RETRIES = 5
 PROVIDER_NAME = ""
+STRIP_DATES = False   # A/B：True 时不注入 [date]，用于验证事件时间的作用
 
 
 class ContentFiltered(Exception):
@@ -174,6 +175,9 @@ def _chat(messages, model, key, base, max_tokens=256, temperature=0.0):
             return (data["choices"][0]["message"].get("content") or "").strip()
         except urllib.error.HTTPError as exc:
             last = exc
+            if exc.code == 403:
+                print(f"  [403] {exc.read().decode('utf-8', 'ignore')[:300]}",
+                      file=sys.stderr, flush=True)
             if exc.code == 400:
                 body = exc.read().decode("utf-8", "ignore")
                 if ("data_inspection_failed" in body
@@ -209,11 +213,12 @@ def format_evidence(evidence, chronological=False):
     lines = []
     for _, doc in items:
         date = str(doc["date"])[:10]
+        prefix = "" if STRIP_DATES else f"[{date}] "
         for line in doc["text"].splitlines():
             line = line.strip()
             if not line or _BOILER.search(line):
                 continue
-            lines.append(f"[{date}] {line}")
+            lines.append(prefix + line)
     return "\n".join(lines)
 
 
@@ -270,7 +275,14 @@ def answer(inst, evidence, model, key, base, facts="", chronological=False):
                   if facts else "")
     user = (f"Current date: {inst['question_date']}\n"
             f"Question: {inst['question']}\n{note}\nEvidence:\n{ctx}{fact_block}")
-    return _chat([{"role": "system", "content": ANSWER_SYS},
+    sys_prompt = ANSWER_SYS
+    if STRIP_DATES:
+        sys_prompt = ANSWER_SYS.replace(
+            "Each evidence line starts with [date] and a role (user/assistant). The user's "
+            "own statements are authoritative; ignore assistant disclaimers.",
+            "Each evidence line starts with a role (user/assistant). The user's own "
+            "statements are authoritative; ignore assistant disclaimers.")
+    return _chat([{"role": "system", "content": sys_prompt},
                   {"role": "user", "content": user}],
                  model, key, base,
                  max_tokens=int(os.environ.get("RP_ANSWER_TOKENS") or 400))
@@ -327,13 +339,20 @@ def main():
     ap.add_argument("--max-retries", type=int, default=5,
                     help="单 provider 内 429/5xx 重试次数；池模式建议 1，快速切换")
     ap.add_argument("--provider-name", default="", help="写入结果的 provider 名")
+    ap.add_argument("--only-type", default="",
+                    help="只跑某个题型，如 temporal-reasoning")
+    ap.add_argument("--strip-dates", action="store_true",
+                    help="A/B 用：不向证据注入 [date]，验证事件时间的作用")
     args = ap.parse_args()
-    global MAX_RETRIES, PROVIDER_NAME
+    global MAX_RETRIES, PROVIDER_NAME, STRIP_DATES
     MAX_RETRIES = max(0, args.max_retries)
     PROVIDER_NAME = args.provider_name
+    STRIP_DATES = bool(args.strip_dates)
     load_env(args.env_file)
 
     data = json.load(open(args.data, encoding="utf-8"))
+    if args.only_type:
+        data = [x for x in data if x.get("question_type") == args.only_type]
     if args.offset or args.limit:
         end = args.offset + args.limit if args.limit else None
         data = data[args.offset:end]
