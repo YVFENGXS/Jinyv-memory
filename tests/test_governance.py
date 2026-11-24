@@ -70,6 +70,43 @@ def test_occurred_at():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_archive_stamps_event_time():
+    tmp = tempfile.mkdtemp()
+    try:
+        path, db = fresh_db(tmp)
+        with sqlite3.connect(path) as con:
+            con.execute("INSERT INTO turns(session_id,character_id,turn_idx,role,content,"
+                        "created_at) VALUES('s1','c1',4,'user','我们去了杭州','2026-05-01 09:30:00')")
+        eid = db.add_card("s1", "c1", "一起去了杭州", turn=4)
+        fid = db.add_fact("s1", "c1", "去过杭州", turn=4, speaker="用户")
+        with sqlite3.connect(path) as con:
+            card_t = con.execute("SELECT occurred_at FROM event_cards WHERE event_id=?",
+                                 (eid,)).fetchone()[0]
+            fact_t = con.execute("SELECT occurred_at FROM durable_facts WHERE id=?",
+                                 (fid,)).fetchone()[0]
+        assert card_t == "2026-05-01 09:30:00", card_t
+        assert fact_t == "2026-05-01 09:30:00", fact_t
+
+        # 合并：留存卡已有事件时间，不能被合并区间的终点改写
+        e2 = db.add_card("s1", "c1", "又聊到杭州", turn=4)
+        db.apply_card_merge("c1", eid, [e2], "去杭州并聊到", 4, 4)
+        with sqlite3.connect(path) as con:
+            merged_t = con.execute("SELECT occurred_at FROM event_cards WHERE event_id=?",
+                                   (eid,)).fetchone()[0]
+        assert merged_t == "2026-05-01 09:30:00", merged_t
+
+        # 显式传入的事件时间优先于轮次记录时间
+        fid2 = db.add_fact("s1", "c1", "去年三月去过杭州", turn=4,
+                           occurred_at="2025-03-04 10:00:00")
+        with sqlite3.connect(path) as con:
+            explicit = con.execute("SELECT occurred_at FROM durable_facts WHERE id=?",
+                                   (fid2,)).fetchone()[0]
+        assert explicit == "2025-03-04 10:00:00", explicit
+        print("OK 归档链路：自动补事件时间，合并不覆盖，显式值优先")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_typed_retraction_and_propagation():
     tmp = tempfile.mkdtemp()
     try:
@@ -186,6 +223,7 @@ def test_writer_lock():
 if __name__ == "__main__":
     test_schema_migration()
     test_occurred_at()
+    test_archive_stamps_event_time()
     test_typed_retraction_and_propagation()
     test_evidence_gate()
     test_contradiction_kept()

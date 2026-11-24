@@ -21,6 +21,13 @@ import threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+# Python 3.14 起标准库新增 compression 包，shutil 等会提前把它装进 sys.modules；
+# 本项目有同名模块，先剔除标准库那份缓存，否则拿到的是没有 write_atoms 的包。
+import sys as _sys
+_cached = _sys.modules.get("compression")
+if _cached is not None and "/compression/" in str(getattr(_cached, "__file__", "")):
+    _sys.modules.pop("compression", None)
+
 import conflict, context_budget, control, disclosure, embedding, gate, governance, gradient, intimacy
 import compression, ledger, merge_ann, promise, questions, recall_shadow, retention, retriever, scoring, sealing
 import style_middleware
@@ -1644,6 +1651,25 @@ def _card_params(card):
             str(card.get("created_at") or ""))
 
 
+def _turn_time(conn, sid, cid, turn):
+    """轮次的记录时间；卡/词条没带事件时间时，它是最接近「什么时候发生的」的锚。"""
+    if not turn:
+        return ""
+    row = conn.execute(
+        "SELECT created_at FROM turns WHERE session_id=? AND character_id=?"
+        " AND turn_idx=?", (sid, cid, int(turn))).fetchone()
+    return str(row["created_at"] or "") if row else ""
+
+
+def _stamp_occurred(conn, card):
+    """补事件时间：只在卡没带 occurred_at 时回落到轮次时间，绝不覆盖调用方给的值。"""
+    if card.get("occurred_at"):
+        return card
+    ts = _turn_time(conn, card["session_id"], card["character_id"],
+                    card.get("turn_end") or card.get("turn_start"))
+    return dict(card, occurred_at=ts) if ts else card
+
+
 class DB:
     def __init__(self, path: str):
         self.path = str(path)
@@ -1818,7 +1844,7 @@ class DB:
     def insert_card(self, card) -> bool:  # 幂等由 UNIQUE 兜底；撞键=重复投递，静默跳过
         try:
             with self._c() as c:
-                c.execute(INSERT_CARD, _card_params(card))
+                c.execute(INSERT_CARD, _card_params(_stamp_occurred(c, card)))
                 self._stamp_must_keep(c, card)
             return True
         except sqlite3.IntegrityError:
@@ -1832,7 +1858,7 @@ class DB:
         """
         with self._c() as c:
             try:
-                c.execute(INSERT_CARD, _card_params(card))
+                c.execute(INSERT_CARD, _card_params(_stamp_occurred(c, card)))
                 inserted = True
                 self._stamp_must_keep(c, card)
             except sqlite3.IntegrityError:
@@ -1840,6 +1866,7 @@ class DB:
             if inserted:
                 c.execute("INSERT OR REPLACE INTO state_ledger VALUES(?,?,?)",
                           (sid, cid, json.dumps(ledger, ensure_ascii=False)))
+            event_time = _turn_time(c, sid, cid, hi)
             for raw in facts or ():
                 f = _fact_item(raw)
                 if not f:
@@ -1849,12 +1876,12 @@ class DB:
                 c.execute("INSERT OR IGNORE INTO durable_facts"
                           "(session_id,character_id,turn_end,fact,tags,importance,"
                           " category,expires_at,speaker,bot_id,audience,subject,"
-                          " emotion,authority)"
-                          " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          " emotion,authority,occurred_at)"
+                          " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                           (sid, cid, hi, f["fact"], f["tags"], f["importance"],
                            f["category"], f["expires_at"], f["speaker"],
                            lane_bot(sid), default_audience(sid), f["speaker"],
-                           f["emotion"], f["authority"]))
+                           f["emotion"], f["authority"], event_time or None))
             c.execute("INSERT OR REPLACE INTO archive_cursor VALUES(?,?,?)", (sid, cid, hi))
             c.execute("DELETE FROM archive_failures WHERE session_id=? AND character_id=?"
                       " AND turn_start>=? AND turn_end<=?", (sid, cid, lo, hi))
@@ -2288,8 +2315,8 @@ class DB:
         返回 (实际删除数, 实际被删的 event_id 列表)，合并记录据此只登记真删的卡。
         """
         with self._c() as c:
-            keep = c.execute("SELECT event_id, importance, meta_json FROM event_cards"
-                             " WHERE event_id=? AND character_id=?",
+            keep = c.execute("SELECT event_id, session_id, importance, meta_json, occurred_at"
+                             " FROM event_cards WHERE event_id=? AND character_id=?",
                              (keep_id, cid)).fetchone()
             if not keep or _compressed_meta(keep["meta_json"]):
                 return 0, []                 # 压缩写过的卡不合并（原子/证据不迁移）
@@ -2312,10 +2339,13 @@ class DB:
                 return 0, []
             imp = float(keep["importance"] or 0.5) if importance is None else float(importance)
             # 合并进来的条目数就是「同一件事被重复记录」的次数：mention 累加，不覆盖。
+            # 事件时间取留存卡的原值；没有就用合并后区间起点的记录时间补上。
             c.execute("UPDATE event_cards SET summary=?, turn_start=?, turn_end=?,"
-                      " importance=?, mentions=COALESCE(mentions,0)+? "
+                      " importance=?, mentions=COALESCE(mentions,0)+?,"
+                      " occurred_at=COALESCE(occurred_at, ?)"
                       " WHERE event_id=? AND character_id=?",
                       (summary, int(turn_start), int(turn_end), imp, len(drop),
+                       _turn_time(c, keep["session_id"], cid, turn_start) or None,
                        keep_id, cid))
             marks = ",".join("?" * len(drop))
             cur = c.execute(f"DELETE FROM event_cards WHERE character_id=?"
@@ -2481,7 +2511,7 @@ class DB:
                 "conflict_flags": [], "precision": "normal",
                 "idempotency_key": f"manual:{eid}"}
         with self._c() as c:
-            c.execute(INSERT_CARD, _card_params(card))
+            c.execute(INSERT_CARD, _card_params(_stamp_occurred(c, card)))
             self._stamp_must_keep(c, card)
         return eid
 
@@ -2560,6 +2590,7 @@ class DB:
         if not fact:
             return 0
         with self._c() as c:
+            ts = str(occurred_at or "") or _turn_time(c, sid, cid, turn)
             try:
                 cur = c.execute(
                     "INSERT INTO durable_facts(session_id,character_id,turn_end,fact,"
@@ -2568,7 +2599,7 @@ class DB:
                     " VALUES(?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)",
                     (sid, cid, int(turn), fact, "[]", float(importance), "", speaker,
                      lane_bot(sid), default_audience(sid), speaker, 1.0,
-                     str(occurred_at or "") or None, str(evidence_layer or "unknown")))
+                     ts or None, str(evidence_layer or "unknown")))
             except sqlite3.IntegrityError:
                 return 0
         return int(cur.lastrowid or 0)
