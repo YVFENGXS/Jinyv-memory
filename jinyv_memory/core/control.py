@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS memory_units(
   frozen INTEGER NOT NULL DEFAULT 0,
   frozen_hash TEXT,
   supersedes TEXT,
+  invalidated_by TEXT NOT NULL DEFAULT '',
   retrieval_count INTEGER NOT NULL DEFAULT 0,
   retention_until TEXT,
   created_at TEXT NOT NULL,
@@ -178,6 +179,9 @@ def _c(db):
 def ensure_schema(conn) -> None:
     """幂等建表；DB.__init__ 与旧库升级都走这里。"""
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(memory_units)")}
+    if "invalidated_by" not in cols:
+        conn.execute("ALTER TABLE memory_units ADD COLUMN invalidated_by TEXT NOT NULL DEFAULT ''")
 
 
 def _json(value, default):
@@ -455,9 +459,11 @@ def get_unit(db, unit_id) -> Optional[dict]:
 
 
 def list_units(db, cid, level=None, min_salience=None, episode_id=None,
-               limit=200) -> list[dict]:
+               limit=200, include_invalidated=False) -> list[dict]:
     sql = "SELECT * FROM memory_units WHERE character_id=?"
     args = [cid]
+    if not include_invalidated:
+        sql += " AND IFNULL(invalidated_by,'')=''"
     if level is not None:
         sql += " AND level=?"
         args.append(int(level))

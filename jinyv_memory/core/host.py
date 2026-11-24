@@ -19,6 +19,7 @@ from typing import Optional
 from llm import from_env
 from persona import PERSONA
 from rp_skeleton import DB, RPContextMiddleware
+import writer_lock
 
 
 class _NoLLM:
@@ -58,6 +59,11 @@ class JinyuHost:
         self.sid = str(sid or "host-" + uuid.uuid4().hex[:8])
         path = str(db_path or os.environ.get("RP_DB") or "data/rp_memory.db")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # 单一写入者：跨进程互斥；同进程多会话只加引用计数。RP_WRITER_LOCK=0 可关。
+        lock_on = (os.environ.get("RP_WRITER_LOCK") or "1").lower() not in (
+            "0", "false", "off", "no")
+        self._writes_locked = writer_lock.acquire(path, enabled=lock_on)
+        self._db_path = path
         self.db = DB(path)
         self.mw = RPContextMiddleware(
             front_llm or _llm_or_stub("front"),
@@ -79,11 +85,18 @@ class JinyuHost:
         with self._lock:
             return str(self.mw.chat(text, self.persona, self.sid, self.cid) or "")
 
-    def remember(self, text: str, speaker: str = "", importance: float = 0.7) -> int:
-        """直接补一条长期词条，返回新 id（0 = 空文本或重复被拒）。"""
+    def remember(self, text: str, speaker: str = "", importance: float = 0.7,
+                 occurred_at: str = "", evidence_layer: str = "unknown") -> int:
+        """直接补一条长期词条，返回新 id（0 = 空文本或重复被拒）。
+
+        occurred_at 填事件真正发生的时间；evidence_layer 默认 unknown，
+        调用方明确知道来源时再填 experienced/hearsay/found/inferred/imagined。
+        """
         with self._lock:
             return int(self.db.add_fact(self.sid, self.cid, str(text or ""), 0,
-                                        str(speaker or ""), float(importance)))
+                                        str(speaker or ""), float(importance),
+                                        occurred_at=str(occurred_at or ""),
+                                        evidence_layer=str(evidence_layer or "unknown")))
 
     def recall(self, query: str = "", limit: int = 6) -> dict:
         """只读召回：相关长期词条 + 最近事件卡。"""
@@ -112,3 +125,6 @@ class JinyuHost:
                 return
             self._closed = True
             self.mw.shutdown()
+            if getattr(self, "_writes_locked", False):
+                writer_lock.release(self._db_path)
+                self._writes_locked = False

@@ -21,7 +21,7 @@ import threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-import conflict, context_budget, control, disclosure, embedding, gate, gradient, intimacy
+import conflict, context_budget, control, disclosure, embedding, gate, governance, gradient, intimacy
 import compression, ledger, merge_ann, promise, questions, recall_shadow, retention, retriever, scoring, sealing
 import style_middleware
 from persona_guard import PersonaGuard
@@ -1238,6 +1238,9 @@ CREATE TABLE IF NOT EXISTS event_cards(
   bot_id TEXT NOT NULL DEFAULT '',
   audience TEXT NOT NULL DEFAULT '',
   subject TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT DEFAULT NULL,
+  retract_kind TEXT NOT NULL DEFAULT '',
+  evidence_layer TEXT NOT NULL DEFAULT 'unknown',
   retracted_at TEXT DEFAULT NULL,
   retracted_by TEXT NOT NULL DEFAULT '',
   revision INTEGER NOT NULL DEFAULT 1,
@@ -1275,6 +1278,9 @@ CREATE TABLE IF NOT EXISTS durable_facts(
   bot_id TEXT NOT NULL DEFAULT '',
   audience TEXT NOT NULL DEFAULT '',
   subject TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT DEFAULT NULL,
+  retract_kind TEXT NOT NULL DEFAULT '',
+  evidence_layer TEXT NOT NULL DEFAULT 'unknown',
   retracted_at TEXT DEFAULT NULL,
   retracted_by TEXT NOT NULL DEFAULT '',
   revision INTEGER NOT NULL DEFAULT 1,
@@ -1512,6 +1518,9 @@ CARD_EXTRA_COLS = {
     "bot_id": "TEXT NOT NULL DEFAULT ''",
     "audience": "TEXT NOT NULL DEFAULT ''",
     "subject": "TEXT NOT NULL DEFAULT ''",
+    "occurred_at": "TEXT DEFAULT NULL",
+    "retract_kind": "TEXT NOT NULL DEFAULT ''",
+    "evidence_layer": "TEXT NOT NULL DEFAULT 'unknown'",
     "retracted_at": "TEXT DEFAULT NULL",
     "retracted_by": "TEXT NOT NULL DEFAULT ''",
     "revision": "INTEGER NOT NULL DEFAULT 1",
@@ -1540,6 +1549,9 @@ FACT_EXTRA_COLS = {
     "bot_id": "TEXT NOT NULL DEFAULT ''",
     "audience": "TEXT NOT NULL DEFAULT ''",
     "subject": "TEXT NOT NULL DEFAULT ''",
+    "occurred_at": "TEXT DEFAULT NULL",
+    "retract_kind": "TEXT NOT NULL DEFAULT ''",
+    "evidence_layer": "TEXT NOT NULL DEFAULT 'unknown'",
     "retracted_at": "TEXT DEFAULT NULL",
     "retracted_by": "TEXT NOT NULL DEFAULT ''",
     "revision": "INTEGER NOT NULL DEFAULT 1",
@@ -1595,8 +1607,9 @@ def _card(row) -> dict:
 INSERT_CARD = ("INSERT INTO event_cards(event_id,session_id,character_id,turn_start,turn_end,"
                "summary,state_changes,entity_hooks,rel_hooks,knowledge_boundary,importance,"
                "conflict_flags,precision,mentions,verified,bot_id,audience,subject,"
+               "occurred_at,evidence_layer,"
                "revision,supersedes_id,idempotency_key,quotes,layer,covers,created_at)"
-               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
                " COALESCE(NULLIF(?,''), datetime('now')))")
 
 # 承诺类句子的确定性兜底：摘要可以压缩，答应过什么必须留原话
@@ -1620,6 +1633,8 @@ def _card_params(card):
             card.get("bot_id") or lane_bot(sid),
             card.get("audience") or default_audience(sid),
             card.get("subject") or "",
+            card.get("occurred_at") or None,
+            card.get("evidence_layer") or "unknown",
             int(card.get("revision") or 1),
             card.get("supersedes_id") or "",
             card["idempotency_key"],
@@ -1701,6 +1716,9 @@ class DB:
                                  " AND audience=''", (aud, r["session_id"]))
             if rows:
                 logger.info("%s 已回填 audience：%d 个会话", table, len(rows))
+        # 治理层（C8）：事件时间、撤回类型、证据分层、失效留痕、矛盾边。
+        # 必须放在 durable_facts 重建之后，否则新列会被旧表重建吞掉。
+        governance.ensure_schema(conn)
 
     @contextmanager
     def _c(self):
@@ -1931,7 +1949,8 @@ class DB:
         with self._c() as c:
             rows = c.execute("SELECT id, fact, tags, importance, category, expires_at,"
                              " turn_end, speaker, mentions, verified, audience, emotion,"
-                             " authority, attention_hits, last_used_at, created_at"
+                             " authority, attention_hits, last_used_at, created_at,"
+                             " occurred_at, evidence_layer"
                              " FROM durable_facts"
                              f" WHERE character_id=? AND {cond}"
                              " AND retracted_at IS NULL"
@@ -1965,13 +1984,16 @@ class DB:
                     text_hit = 1
             hit = (3.0 if tag_hit else 0.0) + text_hit
             spk = str(r["speaker"] or "")
-            day = _mmdd(r["created_at"])
+            # 事件时间优先：occurred_at 才是「什么时候发生的」，created_at 只是「什么时候记下的」
+            day = _mmdd(r["occurred_at"] or r["created_at"])
             # 词条必须自带日期：不带日期时模型会把「昨天没课」当成永久设定，
             # 今天照样按它判断。设定类不标日期（本来就长期有效），其余标到天。
             mark = "[设定]" if cat == "设定" else f"[{day + ' ' if day else ''}{cat}]"
             label = f"{mark} " + (f"[{spk}] {r['fact']}" if spk else r["fact"])
             item = {"id": r["id"], "label": label, "tags": tags, "date": day,
-                    "cat": cat, "turn_end": int(r["turn_end"] or 0)}
+                    "cat": cat, "turn_end": int(r["turn_end"] or 0),
+                    "occurred_at": r["occurred_at"] or "",
+                    "evidence_layer": r["evidence_layer"] or "unknown"}
             bias = SPEAKER_BIAS if (speaker and spk == speaker) else 1.0
             if not FACT_SCORE_ON:
                 scored.append((hit * (0.5 + heat) * bias if hit else 0.0,
@@ -2527,8 +2549,13 @@ class DB:
                 (value, cid, row["fact"], row["speaker"], base, base + "#%"))
         return float(row["importance"] or 0), max(0, cur.rowcount)
 
-    def add_fact(self, sid, cid, text, turn=0, speaker="", importance=0.7):
-        """手工补一条长期词条；标签留空，检索仍按正文命中。返回新 id 或 0。"""
+    def add_fact(self, sid, cid, text, turn=0, speaker="", importance=0.7,
+                 occurred_at="", evidence_layer="unknown"):
+        """手工补一条长期词条；标签留空，检索仍按正文命中。返回新 id 或 0。
+
+        occurred_at 是事件真正发生的时间（可空），与写入时间 created_at 分开；
+        evidence_layer 取 experienced/hearsay/found/inferred/imagined/unknown。
+        """
         fact = _clip_sentence(text, 160)
         if not fact:
             return 0
@@ -2537,10 +2564,11 @@ class DB:
                 cur = c.execute(
                     "INSERT INTO durable_facts(session_id,character_id,turn_end,fact,"
                     " tags,importance,category,expires_at,speaker,bot_id,audience,subject,"
-                    " authority)"
-                    " VALUES(?,?,?,?,?,?,?,NULL,?,?,?,?,?)",
+                    " authority,occurred_at,evidence_layer)"
+                    " VALUES(?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)",
                     (sid, cid, int(turn), fact, "[]", float(importance), "", speaker,
-                     lane_bot(sid), default_audience(sid), speaker, 1.0))
+                     lane_bot(sid), default_audience(sid), speaker, 1.0,
+                     str(occurred_at or "") or None, str(evidence_layer or "unknown")))
             except sqlite3.IntegrityError:
                 return 0
         return int(cur.lastrowid or 0)

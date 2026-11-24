@@ -80,6 +80,8 @@ python tools/serve.py --port 8710 --db data/rp_memory.db
 
 除 `/health` 外都要 `Authorization: Bearer <RP_HOST_TOKEN>`。
 **同一个 `RP_DB` 只能有一个写入进程**，多进程会抢归档游标。
+`JinyuHost` 启动时用文件锁强制这一点（同进程多会话共享计数，跨进程第二者直接报错；
+确需并行设 `RP_WRITER_LOCK=0`）。
 
 ## 环境变量
 
@@ -93,6 +95,7 @@ python tools/serve.py --port 8710 --db data/rp_memory.db
 | `RP_HOST_TOKEN` | HTTP 宿主服务令牌 |
 | `RP_STYLE_MIDDLE` | 输出中间层开关，默认开 |
 | `RP_SESSION_EPOCH_HOURS` | 闲置多少小时轮换会话，默认 48 |
+| `RP_WRITER_LOCK` | 单一写入者锁，默认开；`0` 关闭 |
 
 ## 硬约束
 
@@ -118,12 +121,36 @@ python tools/serve.py --port 8710 --db data/rp_memory.db
   确需淡忘时加 `--decay`（或 `RP_FORGET_DECAY=1`，单日最多掉 `0.03`，`importance >= 0.70` 不衰减）。
 - `recall_shadow` 由 `add_recall_trace` 顺带写入，任何异常都吞掉，不影响回复。
 
+## 治理层
+
+`core/governance.py` 把「事件时间、撤回、证据、矛盾」四件事收在一处，全部是增量列/表，
+老库启动时自动迁移。设计参考 QingyiPersonal 的认知账本，只保留与平台无关的部分。
+
+| 能力 | 落点 | 规则 |
+|---|---|---|
+| 事件时间 | `event_cards.occurred_at`、`durable_facts.occurred_at` | 展示与排序优先用发生时间，空值回落 `created_at` |
+| 类型化撤回 | `retract_kind` | `invalid_observation` / `misunderstanding` / `belief_correction` / `scope_revoke` |
+| 失效传播 | `memory_invalidations`、`memory_units.invalidated_by` | 只标记不删除；同轮次记忆单元与 `supersedes` 派生行一并失效 |
+| 证据分层 | `evidence_layer` | 亲历/听说/查到/推测/想象/未知；推测与想象永不 `verified` |
+| 矛盾并列 | `memory_contradictions` | 直接矛盾两条都留，不自动覆盖；`(a,b)` 与 `(b,a)` 归一幂等 |
+
+```python
+import governance
+governance.retract(db, "event", event_id, "misunderstanding", by="mind")
+governance.record_contradiction(db, "fact", a_id, "fact", b_id, cid="c1")
+governance.set_verified(db, "fact", fid)   # 非亲历/查到会返回 False
+```
+
+`list_units()` 默认过滤 `invalidated_by` 非空的单元，传 `include_invalidated=True`
+可以查看留痕。
+
 ## 测试
 
 ```bash
 python tests/test_regression.py        # 记忆语义全量回归
 python tests/test_style_middleware.py  # 输出中间层
 python tests/test_ledger_forgetting.py # 审计 / 衰减 / 召回埋点
+python tests/test_governance.py        # 事件时间 / 撤回传播 / 证据闸门 / 写锁
 python tools/eval_memory.py --min-recall 0.8 --min-holdout 0.7
 ```
 
