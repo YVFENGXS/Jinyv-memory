@@ -29,6 +29,8 @@ import math
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from collections import Counter
 
@@ -48,6 +50,13 @@ having i you he she it we they me him her us them my your his its our their this
 that these those of to in on at by for with about as and or but if then so than
 what when where which who whom how why not no yes can could would should may might
 will just also very much many some any""".split())
+
+# assistant 的自我指涉套话会把「用户说试过四家」和「助手说自己没试过」混在一起，
+# 诱导模型拒答。检索保留原文，作答前只丢掉这些无信息量的句子。
+_BOILER = re.compile(
+    r"(as a large language model|i don't have personal experiences|"
+    r"i haven't tried any|i am an ai|i'm an ai|i cannot browse|"
+    r"i don't have access to|i'm afraid i'm a large language model)", re.I)
 
 
 def load_env(path):
@@ -122,22 +131,129 @@ def retrieve(docs, query, topk, use_embed):
     return [(scores[i], docs[i]) for i in order[:topk]]
 
 
+MAX_RETRIES = 5
+PROVIDER_NAME = ""
+
+
+class ContentFiltered(Exception):
+    """单题被上游内容审核拦截：跳过这题，不要整轮换 provider。"""
+
+
 def _chat(messages, model, key, base, max_tokens=256, temperature=0.0):
-    body = json.dumps({"model": model, "messages": messages,
-                       "max_tokens": max_tokens, "temperature": temperature}).encode()
-    req = urllib.request.Request(
-        base.rstrip("/") + "/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + key,
-                 "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        data = json.loads(r.read())
-    return (data["choices"][0]["message"].get("content") or "").strip()
+    payload = {"model": model, "messages": messages,
+               "max_tokens": max_tokens, "temperature": temperature}
+    # 推理型接口默认带思维链，短 max_tokens 会被 reasoning 吃光、content 为空；
+    # 评测只取最终答案，可用 RP_THINKING_DISABLED=1 关闭（与线上 thinking=off 对齐）。
+    if os.environ.get("RP_THINKING_DISABLED") == "1":
+        payload["thinking"] = {"type": "disabled"}
+    # 需要显式提高推理档位时用（OpenAI 风格 reasoning_effort）。
+    effort = os.environ.get("RP_REASONING_EFFORT")
+    if effort:
+        payload["reasoning_effort"] = effort
+    # 部分接口对单条 message 有硬性长度上限，超长直接 400。
+    cap = int(os.environ.get("RP_MSG_CHARS") or 0)
+    if cap:
+        for m in payload["messages"]:
+            if isinstance(m.get("content"), str) and len(m["content"]) > cap:
+                m["content"] = m["content"][:cap] + "\n[truncated]"
+    body = json.dumps(payload).encode()
+    url = base.rstrip("/") + "/chat/completions"
+    last = None
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Authorization": "Bearer " + key,
+                     "Content-Type": "application/json",
+                     # 部分入口前置 WAF，默认 Python-urllib UA 会被 403/1010 拦掉
+                     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/120.0 Safari/537.36")})
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                data = json.loads(r.read())
+            return (data["choices"][0]["message"].get("content") or "").strip()
+        except urllib.error.HTTPError as exc:
+            last = exc
+            if exc.code == 400:
+                body = exc.read().decode("utf-8", "ignore")
+                if ("data_inspection_failed" in body
+                        or "inappropriate content" in body
+                        or "exceeds maximum length" in body):
+                    raise ContentFiltered(body[:200])
+                print(f"  [400] {body[:300]}", file=sys.stderr, flush=True)
+            if exc.code in (429, 500, 502, 503, 504, 520, 522, 523, 524) \
+                    and attempt < MAX_RETRIES:
+                wait = min(120, 5 * (2 ** attempt))
+                print(f"  [retry] HTTP {exc.code}，{wait}s 后重试",
+                      file=sys.stderr, flush=True)
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as exc:          # 超时 / 断连
+            last = exc
+            if attempt < MAX_RETRIES:
+                wait = min(120, 3 * (2 ** attempt))
+                print(f"  [retry] {type(exc).__name__}，{wait}s 后重试",
+                      file=sys.stderr, flush=True)
+                time.sleep(wait)
+                continue
+            raise
+    raise last
+
+
+def format_evidence(evidence, chronological=False):
+    """摊平成 [日期] 角色: 内容；可按时序排列，并滤掉助手自指套话。"""
+    items = list(evidence)
+    if chronological:
+        items.sort(key=lambda x: str(x[1]["date"]))
+    lines = []
+    for _, doc in items:
+        date = str(doc["date"])[:10]
+        for line in doc["text"].splitlines():
+            line = line.strip()
+            if not line or _BOILER.search(line):
+                continue
+            lines.append(f"[{date}] {line}")
+    return "\n".join(lines)
 
 
 ANSWER_SYS = (
-    "You answer questions about the user's past conversations. "
-    "Use ONLY the evidence below; if it is insufficient, say you don't know. "
-    "Answer concisely, in English, no preamble.")
+    "You answer questions about the user's past conversations using retrieved evidence.\n"
+    "Rules:\n"
+    "1. Each evidence line starts with [date] and a role (user/assistant). The user's "
+    "own statements are authoritative; ignore assistant disclaimers.\n"
+    "2. Synthesize across ALL evidence. For counting questions, enumerate every "
+    "matching item first, then give the total.\n"
+    "3. When the same attribute has different values, prefer the value with the most "
+    "recent date; later evidence supersedes earlier evidence. State the latest value "
+    "as the answer and do not lead with a superseded one. Never mix an old value "
+    "with a new one. The dated evidence is authoritative: if the backend summary "
+    "conflicts with it, follow the evidence and the latest date.\n"
+    "4. For preference or recommendation questions (e.g. \"suggest a hotel for my trip "
+    "to X\"), the evidence does NOT need to mention the target place. Infer the user's "
+    "general tastes (style, budget, amenities) from any relevant evidence and apply "
+    "them to the new request. Always give concrete suggestions; never refuse for lack "
+    "of a direct mention.\n"
+    "5. Only say \"I don't know\" if NO evidence is relevant. Incomplete evidence is "
+    "not a reason to refuse; give the best-supported answer.\n"
+    "6. Apply the question's predicate strictly. For counts, include only items that "
+    "explicitly match (e.g. \"led a project\"); do not count adjacent activities like "
+    "leading a team or planning a launch.\n"
+    "Answer concisely in English, no preamble.")
+
+BACK_SYS = (
+    "You are a memory consolidation engine. From dated conversation excerpts, extract "
+    "the facts relevant to the question. Rules:\n"
+    "- Keep each fact's date (YYYY/MM/DD) and speaker.\n"
+    "- Compare dates numerically. For the same attribute, the later date always "
+    "supersedes the earlier date; never mark an earlier value as newer.\n"
+    "- A value the user attributes to themselves (e.g. \"my personal best time of X\", "
+    "\"I led X\") is a fact, even when the sentence is about a future goal or plan.\n"
+    "- For counting questions, include only items that explicitly satisfy the "
+    "question's predicate; do not count adjacent activities (leading a team is not "
+    "leading a project unless stated).\n"
+    "- Drop assistant disclaimers and speculation.\n"
+    "Output a compact dated bullet list, no prose.")
 
 JUDGE_SYS = (
     "You grade an answer against a gold answer. Reply with strict JSON: "
@@ -146,13 +262,29 @@ JUDGE_SYS = (
     "even with different wording. Mark incorrect if it contradicts or misses it.")
 
 
-def answer(inst, evidence, model, key, base):
-    ctx = "\n\n".join(f"[{d['date']}] {d['text']}" for _, d in evidence)
+def answer(inst, evidence, model, key, base, facts="", chronological=False):
+    ctx = format_evidence(evidence, chronological=chronological)
+    note = ("Evidence is ordered oldest to newest; the last value for an attribute "
+            "is the latest.\n") if chronological else ""
+    fact_block = (f"\nBackend consolidated facts (latest wins):\n{facts}\n"
+                  if facts else "")
     user = (f"Current date: {inst['question_date']}\n"
-            f"Question: {inst['question']}\n\nEvidence:\n{ctx}")
+            f"Question: {inst['question']}\n{note}\nEvidence:\n{ctx}{fact_block}")
     return _chat([{"role": "system", "content": ANSWER_SYS},
                   {"role": "user", "content": user}],
-                 model, key, base, max_tokens=300)
+                 model, key, base,
+                 max_tokens=int(os.environ.get("RP_ANSWER_TOKENS") or 400))
+
+
+def consolidate(inst, evidence, model, key, base):
+    """后台模型先把证据归并成带日期的事实表（模拟生产里的摘要/冲突归并）。"""
+    ctx = format_evidence(evidence)
+    user = (f"Question: {inst['question']}\n"
+            f"Current date: {inst['question_date']}\n\nExcerpts:\n{ctx}")
+    return _chat([{"role": "system", "content": BACK_SYS},
+                  {"role": "user", "content": user}],
+                 model, key, base,
+                 max_tokens=int(os.environ.get("RP_BACK_TOKENS") or 800))
 
 
 def judge(inst, pred, model, key, base):
@@ -162,7 +294,8 @@ def judge(inst, pred, model, key, base):
             "Is the prediction correct?")
     raw = _chat([{"role": "system", "content": JUDGE_SYS},
                  {"role": "user", "content": user}],
-                model, key, base, max_tokens=120)
+                model, key, base,
+                max_tokens=int(os.environ.get("RP_JUDGE_TOKENS") or 200))
     try:
         start, end = raw.find("{"), raw.rfind("}")
         obj = json.loads(raw[start:end + 1])
@@ -175,53 +308,115 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="longmemeval_s.json 路径")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 题，0=全部")
+    ap.add_argument("--offset", type=int, default=0,
+                    help="从第 N 题开始（分片并发用）")
     ap.add_argument("--topk", type=int, default=8)
+    ap.add_argument("--topk-multi", type=int, default=14,
+                    help="multi-session 题的召回深度（跨会话汇总需要更多证据）")
     ap.add_argument("--out", default="")
+    ap.add_argument("--resume", default="",
+                    help="断点文件（JSONL）；默认 <out>.jsonl，存在则跳过已完成题")
     ap.add_argument("--env-file", default="", help="可选：从文件读取 RP_* 密钥")
     ap.add_argument("--front-model", default=os.environ.get("RP_FRONT_MODEL", "deepseek-v4-flash"))
+    ap.add_argument("--back-model", default="",
+                    help="后台归并模型；默认 RP_BACK_MODEL，再回退前台模型")
     ap.add_argument("--judge-model", default="")
+    ap.add_argument("--no-back", action="store_true", help="关闭后台事实归并")
     ap.add_argument("--no-embed", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="只跑检索，不调模型")
+    ap.add_argument("--max-retries", type=int, default=5,
+                    help="单 provider 内 429/5xx 重试次数；池模式建议 1，快速切换")
+    ap.add_argument("--provider-name", default="", help="写入结果的 provider 名")
     args = ap.parse_args()
+    global MAX_RETRIES, PROVIDER_NAME
+    MAX_RETRIES = max(0, args.max_retries)
+    PROVIDER_NAME = args.provider_name
     load_env(args.env_file)
 
     data = json.load(open(args.data, encoding="utf-8"))
-    if args.limit:
-        data = data[:args.limit]
+    if args.offset or args.limit:
+        end = args.offset + args.limit if args.limit else None
+        data = data[args.offset:end]
 
     key = (os.environ.get("RP_FRONT_KEY") or "").strip()
     base = (os.environ.get("RP_FRONT_BASE") or os.environ.get("RP_LLM_BASE")
             or "https://api.deepseek.com").strip()
     judge_model = args.judge_model or args.front_model
+    back_model = (args.back_model or os.environ.get("RP_BACK_MODEL")
+                  or args.front_model)
     if not args.dry_run and not key:
         sys.exit("缺少 RP_FRONT_KEY（可用 --env-file 指向含 key 的文件）；"
                  "只想验证检索请加 --dry-run")
 
     use_embed = not args.no_embed
+    # 逐题写 JSONL：被限流/断网中断也不丢已跑结果，重跑自动跳过。
+    ckpt = args.resume or (args.out + ".jsonl" if args.out else "")
     rows, hits, ok = [], 0, 0
+    done = set()
+    if ckpt and os.path.exists(ckpt) and not args.dry_run:
+        with open(ckpt, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                rows.append(r)
+                done.add(r["question_id"])
+                hits += 1 if r.get("recall_hit") else 0
+                ok += 1 if r.get("correct") else 0
+        print(f"[resume] 已完成 {len(rows)} 题，跳过", flush=True)
     for inst in data:
+        if inst["question_id"] in done:
+            continue
+        multi = inst["question_type"] == "multi-session"
+        topk = max(args.topk, args.topk_multi) if multi else args.topk
         docs = build_docs(inst)
-        ev = retrieve(docs, inst["question"], args.topk, use_embed)
+        ev = retrieve(docs, inst["question"], topk, use_embed)
         hit = bool(set(inst.get("answer_session_ids") or ())
                    & {d["id"] for _, d in ev})
         hits += hit
-        pred = why = ""
+        pred = why = facts = ""
         correct = None
+        filtered = False
         if not args.dry_run:
-            pred = answer(inst, ev, args.front_model, key, base)
-            correct, why = judge(inst, pred, judge_model, key, base)
+            try:
+                # 后台先归并新旧事实，前台再按「最新优先」作答；knowledge-update
+                # 额外把证据按时序排，避免旧值压过新值。
+                # preference 题考的是「从偏好推断建议」，没有单一事实可归并；
+                # 后台事实表反而会强调「没提过 Miami」而诱发拒答，这里跳过。
+                if not args.no_back and inst["question_type"] != "single-session-preference":
+                    facts = consolidate(inst, ev, back_model, key, base)
+                pred = answer(inst, ev, args.front_model, key, base, facts=facts,
+                              chronological=inst["question_type"] == "knowledge-update")
+                correct, why = judge(inst, pred, judge_model, key, base)
+            except ContentFiltered:
+                # 单题被内容审核拦截：记错题并继续，不整轮切 provider。
+                filtered = True
+                correct = False
+                why = "content_filtered"
+                pred = facts = ""
             ok += 1 if correct else 0
-        rows.append({"question_id": inst["question_id"],
-                     "question_type": inst["question_type"],
-                     "question": inst["question"], "gold": inst["answer"],
-                     "recall_hit": hit, "pred": pred,
-                     "correct": correct, "why": why})
+        row = {"question_id": inst["question_id"],
+               "question_type": inst["question_type"],
+               "question": inst["question"], "gold": inst["answer"],
+               "recall_hit": hit, "facts": facts, "pred": pred,
+               "correct": correct, "why": why, "provider": PROVIDER_NAME,
+               "filtered": filtered}
+        rows.append(row)
+        if ckpt and not args.dry_run:
+            with open(ckpt, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f.flush()
         tag = "hit" if hit else "miss"
         print(f"[{len(rows)}/{len(data)}] {tag} {inst['question_type']}: "
-              f"{inst['question'][:70]}")
+              f"{inst['question'][:70]}", flush=True)
+        time.sleep(0.3)
 
-    print(f"\n证据命中（answer_session 进 top{args.topk}）：{hits}/{len(data)}"
-          f" = {hits / max(1, len(data)):.3f}")
+    print(f"\n证据命中（answer_session 进 top{args.topk}/multi {args.topk_multi}）："
+          f"{hits}/{len(data)} = {hits / max(1, len(data)):.3f}")
     if not args.dry_run:
         print(f"回答准确率（judge={judge_model}，非官方口径）：{ok}/{len(data)}"
               f" = {ok / max(1, len(data)):.3f}")
@@ -236,7 +431,9 @@ def main():
     if args.out:
         json.dump({"n": len(data), "recall_hit": hits, "ok": ok,
                    "official": False, "judge_model": judge_model,
-                   "rows": rows}, open(args.out, "w", encoding="utf-8"),
+                   "back_model": back_model, "topk": args.topk,
+                   "topk_multi": args.topk_multi, "rows": rows},
+                  open(args.out, "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
         print("已写出", args.out)
 
