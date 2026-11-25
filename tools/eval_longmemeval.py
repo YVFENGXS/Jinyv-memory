@@ -423,6 +423,8 @@ def main():
                "question": inst["question"], "gold": inst["answer"],
                "recall_hit": hit, "facts": facts, "pred": pred,
                "correct": correct, "why": why, "provider": PROVIDER_NAME,
+               "judge_model": judge_model,
+               "judge_self": judge_model == args.front_model,
                "filtered": filtered}
         rows.append(row)
         if ckpt and not args.dry_run:

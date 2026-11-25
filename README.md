@@ -205,6 +205,10 @@ Python 3.10–3.13。3.14 起标准库新增 `compression` 包，会与本仓库
 > `--dry-run` 不需要任何 key（只验证证据命中），真跑需要 `RP_FRONT_KEY`（有 `RP_EMBED_KEY` 时自动开向量）。
 > 官方 LongMemEval 用 GPT-4o 判分、把整段历史塞进上下文，本适配不满足这两点，
 > 所以**不把它的数字当成 LongMemEval-S 官方分数**。
+> 另外，`eval_longmemeval.py` 的检索与归并在脚本内自建，**不经过本仓库的记忆中间层**；
+> 93.0% 还是 5 模型并集（best-of-N on failures）。要衡量中间层本身，用
+> `tools/eval_via_memory.py`（回放会话 → 事件卡 → 中间层 retriever）；同 48 题对照为
+> 29/48 = 60.4%，逐题数据见 [longmemeval_500_report.md](docs/longmemeval_500_report.md)。
 
 ### 显著性（mentions / verified）
 

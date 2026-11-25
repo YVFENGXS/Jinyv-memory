@@ -493,3 +493,58 @@ d=sqlite3.connect('data/memory.db'); s.backup(d); d.close()"
 前台真实语料评测使用一次性脚本（与 `tools/eval_memory.py` 同一套 `_build_messages`；回答温度 0、`max_tokens=200`；裁判为后台模型 `deepseek-flash`，先判相关再判对错；承重度按抽掉 top-1 卡复问），不随仓库分发。`--sid` / `--cid` 写错会直接报错并列出副本中实际存在的会话，不会静默输出全 0。
 
 CI 门槛建议：合成集 `recall@4 ≥ 0.8`、holdout `≥ 0.7`；真实语料只看趋势与区间，不设固定门槛。
+
+## 14. 公开基准：LongMemEval（口径另计）
+
+公开基准单独记账，不与上面 87 条真实语料 / 合成集混算：
+
+| 口径 | 结果 | 说明 |
+|---|---|---|
+| `eval_longmemeval.py`，500 题并集 | 465/500 = 93.0% | 5 个模型 best-of-N on failures；扣掉定向救回约 449/500 ≈ 89.8% |
+| 同上，检索命中 | 492/500 = 98.4% | BM25 + 向量，脚本内自建 |
+| 同上，48 题分层子集（每型前 8 题） | 47/48 = 97.9%，检索 48/48 | 与下面同一批题 |
+| `eval_via_memory.py`，同 48 题 | **29/48 = 60.4%**，检索 38/48 = 79.2% | 回放会话 → 规则事件卡 → 中间层 retriever |
+
+逐题型（同 48 题）：
+
+| 题型 | 中间层检索 | 中间层准确率 | 原流水线准确率 |
+|---|---|---|---|
+| single-session-user | 7/8 | 7/8 | 8/8 |
+| single-session-assistant | 8/8 | 8/8 | 8/8 |
+| single-session-preference | 3/8 | 3/8 | 8/8 |
+| knowledge-update | 6/8 | 4/8 | 8/8 |
+| temporal-reasoning | 7/8 | 4/8 | 8/8 |
+| multi-session | 7/8 | 3/8 | 7/8 |
+| **合计** | **38/48** | **29/48** | **47/48** |
+
+结论：**同一批题，原流水线 97.9%，真正走中间层是 60.4%**。差距的构成：
+
+| 环节 | 损失 |
+|---|---|
+| 检索：48/48 → 38/48，未命中的 10 题只答对 1 题 | 约 −9 题 |
+| 证据/作答：命中后准确率 73.7%（28/38），原流水线接近 100% | 约 −9 题 |
+
+检索缺口集中在 preference（3/8）：问句说「推荐视频剪辑资源」，会话里说的是具体软件名，
+中间层 retriever 是实体钩子字面匹配，不做 BM25 全量词项或向量语义；这一路 v1 没有
+写入 bge-m3 向量，也没有线上 LLM 摘要产出的 durable_facts。
+证据缺口集中在 multi-session（命中后 2/8 对）与 temporal-reasoning（命中后 4/8 对）：
+卡片摘要是整段原始对话，10–14 张长文里数数/算相对时间容易漏；原流水线有一步
+「后台事实归并」把证据压成带日期的事实表，中间层 v1 没有复现这一步。
+knowledge-update 的 Rachel 题取了旧值 Chicago，是因为没写 `durable_facts`，
+缺少「最新值优先」的事实层。
+
+另有一个评测噪声已修正：首轮用推理型 provider 时，长证据的 reasoning 会吃光
+`max_tokens=400`，48 题里有 10 题返回空 content（multi-session 4/8），
+把分数压到 56.2%。关闭思考（或把答案预算提到 1200）后空答案消失，
+这才是 60.4% 的口径。这张表不是给中间层定分，而是证明 **93.0% 不能代表中间层**。
+
+
+关键限定：
+
+1. **93.0% 不是单系统单轮成绩**，也不是 LongMemEval 官方分数（官方用 GPT-4o 判分、整段上下文）。
+2. **93.0% 不经过中间层**：检索、归并、作答都在评测脚本内完成，只复用了 `embedding` 适配器。
+3. 只有 `eval_via_memory.py` 走事件卡 / `commit_archive` / `retriever`；它的摘要与钩子是规则构造，**不能当作线上 LLM 摘要链路的结果**。
+4. 判分模型默认回退为作答模型（`judge_model = --judge-model or --front-model`），逐题结果的 `judge_model` / `judge_self` 字段可核查。
+
+完整数据与逐题明细：[longmemeval_500_report.md](longmemeval_500_report.md)、[longmemeval_500_results.jsonl](longmemeval_500_results.jsonl)。
+
