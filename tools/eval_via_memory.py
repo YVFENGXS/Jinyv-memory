@@ -55,6 +55,11 @@ for p in (CORE, TOOLS):
 import retriever                      # noqa: E402  中间层检索
 from rp_skeleton import DB            # noqa: E402  中间层存储
 
+try:
+    import embedding                   # noqa: E402  本仓库 bge-m3 适配器
+except Exception:                      # pragma: no cover
+    embedding = None
+
 import eval_longmemeval as base       # noqa: E402  复用 _chat / ANSWER_SYS / JUDGE_SYS
 
 CJK = "\u4e00-\u9fff"
@@ -152,6 +157,66 @@ def recall_via_memory(db, sid, cid, question, topk):
     return hits, source
 
 
+def recall_hybrid(db, sid, cid, question, topk, kw_weight=None, vec_weight=None):
+    """P1：钩子召回 + bge-m3 语义召回，走中间层自己的 RRF fuse。
+
+    向量对象是事件卡摘要（线上同一条链路），不是评测脚本另建的索引；
+    embedding 不可用时退回纯钩子，行为与 v1 一致。
+    """
+    cards = db.all_cards(sid, cid)
+    keyword = retriever.retrieve(cards, str(question or "").lower(),
+                                 limit=max(topk, 20))
+    if not (embedding and embedding.enabled()):
+        return recall_via_memory(db, sid, cid, question, topk)
+    try:
+        qv = embedding.embed_query(question)
+        vecs = embedding.embed_documents([str(c.get("summary") or "") for c in cards])
+        dim = embedding.dim()
+        vector = sorted(((max(0.0, embedding.dot(qv, v, dim)), c)
+                         for c, v in zip(cards, vecs)),
+                        key=lambda x: x[0], reverse=True)[:max(topk, 20)]
+    except Exception as exc:
+        print(f"[warn] embedding 失败，退回钩子：{exc}", file=sys.stderr, flush=True)
+        return recall_via_memory(db, sid, cid, question, topk)
+    fused = retriever.fuse(keyword, vector, limit=topk,
+                           keyword_weight=(retriever.FUSE_KEYWORD_WEIGHT
+                                           if kw_weight is None else kw_weight),
+                           vector_weight=(retriever.FUSE_VECTOR_WEIGHT
+                                          if vec_weight is None else vec_weight))
+    if not fused:
+        return recall_via_memory(db, sid, cid, question, topk)
+    return fused, "fuse"
+
+
+def write_facts(db, sid, cid, hits, question, topk):
+    """P2：把召回卡写进 durable_facts（带 occurred_at），再用中间层的
+    list_facts_detail 读回来。线上由后台模型在归档时抽事实；这里用检索到的
+    卡摘要代填，属于实验近似，结果里会标 facts_written 与 facts_n。
+    """
+    for _, c in hits:
+        try:
+            db.add_fact(sid, cid, str(c.get("summary") or "")[:800],
+                        int(c.get("turn_end") or 0), "", 0.6,
+                        occurred_at=str(c.get("occurred_at") or ""),
+                        evidence_layer="experienced")
+        except Exception:
+            continue
+    try:
+        facts = db.list_facts_detail(sid, cid, limit=max(4, topk), query=question)
+    except Exception:
+        return []
+    labels = [str(f.get("label") or "") for f in facts if str(f.get("label") or "")]
+    # 按卡的事件时间排：facts 行里只有「月-日」，跨年不可靠；用回写时的 occurred_at 定序
+    def when(label):
+        for _, c in hits:
+            head = str(c.get("summary") or "")[:60]
+            if head and head in label:
+                return str(c.get("occurred_at") or "")
+        return ""
+    labels.sort(key=when)
+    return labels
+
+
 def format_evidence(hits):
     """按 turn 时序摊平成「[日期] 角色: 内容」，保留日期给时间题。"""
     items = sorted((c for _, c in hits), key=lambda c: c.get("turn_start") or 0)
@@ -217,6 +282,22 @@ def build_fact_table(inst, evidence_text, model, key, base_url):
                       max_tokens=int(os.environ.get("RP_TABLE_TOKENS") or 900))
 
 
+_SUMMARY_SYS = (
+    "Compress the evidence into dated bullet notes.\n"
+    "One bullet per session: [date] key facts, names, numbers.\n"
+    "Keep every distinct item when the question asks for a count. No preamble.")
+
+
+def summarize_evidence(inst, evidence_text, model, key, base_url):
+    """P3：用模型把召回证据压成带日期的要点，替代规则拼接的原文摘要。"""
+    user = (f"Current date: {inst['question_date']}\n"
+            f"Question: {inst['question']}\nEvidence:\n{evidence_text}")
+    return base._chat([{"role": "system", "content": _SUMMARY_SYS},
+                       {"role": "user", "content": user}],
+                      model, key, base_url,
+                      max_tokens=int(os.environ.get("RP_SUMMARY_TOKENS") or 700))
+
+
 def parse_con(raw):
     """CoN：只把 'Answer:' 之后的最后一段交给判分，避免把笔记当答案。"""
     m = re.findall(r"Answer\s*[:：]\s*(.+)", str(raw or ""), re.S)
@@ -262,10 +343,24 @@ def main():
     ap.add_argument("--keep-db", action="store_true", help="保留每题的临时库（调试）")
     ap.add_argument("--p0", action="store_true",
                     help="开启 P0 补充方法：查询改写 + 事实表 + Chain-of-Note")
+    ap.add_argument("--p1", action="store_true",
+                    help="P1：钩子 + bge-m3 向量，走 retriever.fuse 融合")
+    ap.add_argument("--p2", action="store_true",
+                    help="P2：把召回卡写入 durable_facts 再经 list_facts_detail 读回")
+    ap.add_argument("--p3", action="store_true",
+                    help="P3：用模型把证据压成带日期的会话要点")
+    ap.add_argument("--all", action="store_true",
+                    help="P0+P2+P3（不含 P1：默认融合权重在英文 QA 上是负收益）")
+    ap.add_argument("--fuse-kw", type=float, default=None,
+                    help="P1 融合的钩子权重（默认沿用 retriever.FUSE_KEYWORD_WEIGHT）")
+    ap.add_argument("--fuse-vec", type=float, default=None,
+                    help="P1 融合的向量权重（默认沿用 retriever.FUSE_VECTOR_WEIGHT）")
     ap.add_argument("--query-expand", action="store_true", help="P0：检索前改写问句")
     ap.add_argument("--fact-table", action="store_true", help="P0：作答前把证据压成事实表")
     ap.add_argument("--con", action="store_true", help="P0：Chain-of-Note 两步作答")
     args = ap.parse_args()
+    if args.all:
+        args.p0 = args.p2 = args.p3 = True
     if args.p0:
         args.query_expand = args.fact_table = args.con = True
     base.PROVIDER_NAME = args.provider_name
@@ -337,7 +432,10 @@ def main():
                         query = query + " " + expanded
                 except base.ContentFiltered:
                     expanded = ""
-            hits_list, source = recall_via_memory(db, sid, cid, query, topk)
+            hits_list, source = (recall_hybrid(db, sid, cid, query, topk,
+                                               args.fuse_kw, args.fuse_vec)
+                                 if args.p1
+                                 else recall_via_memory(db, sid, cid, query, topk))
             got = {lsid for _, c in hits_list for lsid in (c.get("covers") or [])}
             hit = bool(set(inst.get("answer_session_ids") or ()) & got)
             hits += hit
@@ -347,8 +445,21 @@ def main():
             filtered = False
             raw_answer = ""
             table = ""
+            summary = ""
+            facts = []
             if not args.dry_run:
                 try:
+                    if args.p3 and evidence_text:
+                        summary = summarize_evidence(inst, evidence_text,
+                                                     front_model, key, base_url)
+                        if summary.strip():
+                            evidence_text = "Session notes:\n" + summary
+                    if args.p2 and hits_list:
+                        facts = write_facts(db, sid, cid, hits_list, query, topk)
+                        if facts:
+                            evidence_text = ("Durable facts (retrieved from memory):\n"
+                                             + "\n".join(f"- {f}" for f in facts)
+                                             + "\n\nEvidence:\n" + evidence_text)
                     if args.fact_table and evidence_text:
                         table = build_fact_table(inst, evidence_text,
                                                  front_model, key, base_url)
@@ -387,6 +498,9 @@ def main():
                    "query_expanded": expanded,
                    "fact_table": bool(table),
                    "con": args.con,
+                   "summary": bool(summary),
+                   "facts_written": len(facts),
+                   "recall_mode": source,
                    "raw_answer": str(raw_answer)[:600] if args.con else "",
                    "sec": round(time.time() - t0, 1)}
             rows.append(row)
@@ -428,9 +542,10 @@ def main():
                    "judge_model": judge_model, "judge_self": judge_self,
                    "provider": base.PROVIDER_NAME,
                    "topk": args.topk, "topk_multi": args.topk_multi,
-                   "cards_rule_built": True, "facts_written": False,
+                   "cards_rule_built": not args.p3, "facts_written": args.p2,
                    "p0": {"query_expand": args.query_expand,
                           "fact_table": args.fact_table, "con": args.con},
+                   "p1": args.p1, "p2": args.p2, "p3": args.p3,
                    "rows": rows},
                   open(args.out, "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
