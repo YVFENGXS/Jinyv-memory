@@ -30,6 +30,10 @@ v1 的已知口径限制（必须随结果一起读）：
     # 真作答 + 判分（50 题子集）
     python tools/eval_via_memory.py --data /path/longmemeval_s.json \
         --limit 50 --out lme_via_memory_50.json --env-file /path/your.env
+
+    # P0 补充方法消融（查询改写 + 事实表 + Chain-of-Note）
+    python tools/eval_via_memory.py --data /path/longmemeval_s.json \
+        --sample-per-type 2 --p0 --out lme_p0_12.json --env-file /path/your.env
 """
 import argparse
 import json
@@ -162,15 +166,61 @@ def format_evidence(hits):
     return "\n".join(lines)
 
 
-def answer(inst, evidence_text, model, key, base_url):
+def answer(inst, evidence_text, model, key, base_url, con=False):
     note = ("Evidence is ordered oldest to newest; the last value for an attribute "
             "is the latest.\n") if inst["question_type"] == "knowledge-update" else ""
+    extra = ""
+    if con:
+        extra = (
+            "\nWork in two steps.\n"
+            "Step 1 - Notes: for each evidence block, write one line "
+            "[date] copied fact. Keep every distinct item when the question asks for a count.\n"
+            "Step 2 - Answer: reason over the notes, then put the final answer alone on the "
+            "last line prefixed with 'Answer:'. For date arithmetic, write the two absolute "
+            "dates and the difference explicitly instead of estimating.")
     user = (f"Current date: {inst['question_date']}\n"
-            f"Question: {inst['question']}\n{note}\nEvidence:\n{evidence_text}")
+            f"Question: {inst['question']}\n{note}\nEvidence:\n{evidence_text}{extra}")
     return base._chat([{"role": "system", "content": base.ANSWER_SYS},
                        {"role": "user", "content": user}],
                       model, key, base_url,
-                      max_tokens=int(os.environ.get("RP_ANSWER_TOKENS") or 400))
+                      max_tokens=int(os.environ.get("RP_ANSWER_TOKENS") or 1200))
+
+
+_EXPAND_SYS = (
+    "Rewrite the user's memory question into retrieval keywords.\n"
+    "If it asks for a recommendation, name concrete objects, tools, brands, or "
+    "attributes that would appear in past conversations.\n"
+    "Output one line of lowercase space-separated keywords. No explanation.")
+
+_TABLE_SYS = (
+    "Extract atomic facts from the evidence into a compact table.\n"
+    "One row per fact: entity | attribute | value | date.\n"
+    "Keep every distinct item when the question asks for a count or a total.\n"
+    "Output only the table, no prose.")
+
+
+def expand_query(inst, model, key, base_url):
+    """P0：把抽象问句改写成可字面命中的关键词。"""
+    raw = base._chat([{"role": "system", "content": _EXPAND_SYS},
+                      {"role": "user", "content": f"Question: {inst['question']}"}],
+                     model, key, base_url, max_tokens=80)
+    return " ".join(re.findall(r"[a-z0-9]+", raw.lower()))[:300]
+
+
+def build_fact_table(inst, evidence_text, model, key, base_url):
+    """P0：把长证据压成 (实体, 属性, 值, 日期) 表，计数在行上做。"""
+    user = (f"Current date: {inst['question_date']}\n"
+            f"Question: {inst['question']}\nEvidence:\n{evidence_text}")
+    return base._chat([{"role": "system", "content": _TABLE_SYS},
+                       {"role": "user", "content": user}],
+                      model, key, base_url,
+                      max_tokens=int(os.environ.get("RP_TABLE_TOKENS") or 900))
+
+
+def parse_con(raw):
+    """CoN：只把 'Answer:' 之后的最后一段交给判分，避免把笔记当答案。"""
+    m = re.findall(r"Answer\s*[:：]\s*(.+)", str(raw or ""), re.S)
+    return (m[-1] if m else str(raw or "")).strip()[:500]
 
 
 def judge(inst, pred, model, key, base_url):
@@ -210,7 +260,14 @@ def main():
     ap.add_argument("--provider-name", default="", help="写入结果的 provider 名")
     ap.add_argument("--dry-run", action="store_true", help="只回放+检索，不调模型")
     ap.add_argument("--keep-db", action="store_true", help="保留每题的临时库（调试）")
+    ap.add_argument("--p0", action="store_true",
+                    help="开启 P0 补充方法：查询改写 + 事实表 + Chain-of-Note")
+    ap.add_argument("--query-expand", action="store_true", help="P0：检索前改写问句")
+    ap.add_argument("--fact-table", action="store_true", help="P0：作答前把证据压成事实表")
+    ap.add_argument("--con", action="store_true", help="P0：Chain-of-Note 两步作答")
     args = ap.parse_args()
+    if args.p0:
+        args.query_expand = args.fact_table = args.con = True
     base.PROVIDER_NAME = args.provider_name
     base.load_env(args.env_file)
     front_model = (args.front_model or os.environ.get("RP_FRONT_MODEL")
@@ -261,6 +318,7 @@ def main():
     for inst in data:
         if inst["question_id"] in done:
             continue
+        t0 = time.time()
         multi = inst["question_type"] == "multi-session"
         topk = max(args.topk, args.topk_multi) if multi else args.topk
         tmpdir = tempfile.mkdtemp(prefix="lme-via-")
@@ -270,8 +328,16 @@ def main():
         cid = "eval"
         try:
             order = replay_instance(inst, db, sid, cid)
-            hits_list, source = recall_via_memory(db, sid, cid,
-                                                  inst["question"], topk)
+            query = inst["question"]
+            expanded = ""
+            if args.query_expand and not args.dry_run:
+                try:
+                    expanded = expand_query(inst, front_model, key, base_url)
+                    if expanded:
+                        query = query + " " + expanded
+                except base.ContentFiltered:
+                    expanded = ""
+            hits_list, source = recall_via_memory(db, sid, cid, query, topk)
             got = {lsid for _, c in hits_list for lsid in (c.get("covers") or [])}
             hit = bool(set(inst.get("answer_session_ids") or ()) & got)
             hits += hit
@@ -279,10 +345,20 @@ def main():
             pred = why = ""
             correct = None
             filtered = False
+            raw_answer = ""
+            table = ""
             if not args.dry_run:
                 try:
+                    if args.fact_table and evidence_text:
+                        table = build_fact_table(inst, evidence_text,
+                                                 front_model, key, base_url)
+                    if table:
+                        evidence_text = ("Extracted fact table:\n" + table
+                                         + "\n\nRaw evidence:\n" + evidence_text)
                     for attempt in range(3):
-                        pred = answer(inst, evidence_text, front_model, key, base_url)
+                        raw_answer = answer(inst, evidence_text, front_model, key,
+                                            base_url, con=args.con)
+                        pred = parse_con(raw_answer) if args.con else raw_answer
                         if str(pred).strip():
                             break
                         # 上游偶发返回空 content（限流/断连重试后 200 空体）：
@@ -307,7 +383,12 @@ def main():
                    "judge_model": judge_model, "judge_self": judge_self,
                    "via_memory": True, "filtered": filtered,
                    "empty_answer": not str(pred).strip(),
-                   "sessions": len(order)}
+                   "sessions": len(order),
+                   "query_expanded": expanded,
+                   "fact_table": bool(table),
+                   "con": args.con,
+                   "raw_answer": str(raw_answer)[:600] if args.con else "",
+                   "sec": round(time.time() - t0, 1)}
             rows.append(row)
             if ckpt and not args.dry_run:
                 with open(ckpt, "a", encoding="utf-8") as f:
@@ -348,6 +429,8 @@ def main():
                    "provider": base.PROVIDER_NAME,
                    "topk": args.topk, "topk_multi": args.topk_multi,
                    "cards_rule_built": True, "facts_written": False,
+                   "p0": {"query_expand": args.query_expand,
+                          "fact_table": args.fact_table, "con": args.con},
                    "rows": rows},
                   open(args.out, "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
