@@ -141,8 +141,12 @@ class ContentFiltered(Exception):
 
 
 def _chat(messages, model, key, base, max_tokens=256, temperature=0.0):
+    max_tokens = int(os.environ.get("RP_CHAT_TOKENS") or max_tokens)
     payload = {"model": model, "messages": messages,
-               "max_tokens": max_tokens, "temperature": temperature}
+               "max_tokens": max_tokens}
+    # 部分入口（如 relaycore 部分分组）拒绝 temperature 参数，设置此开关时不携带该键。
+    if os.environ.get("RP_DROP_TEMPERATURE") != "1":
+        payload["temperature"] = temperature
     # 推理型接口默认带思维链，短 max_tokens 会被 reasoning 吃光、content 为空；
     # 评测只取最终答案，可用 RP_THINKING_DISABLED=1 关闭（与线上 thinking=off 对齐）。
     if os.environ.get("RP_THINKING_DISABLED") == "1":
@@ -161,6 +165,7 @@ def _chat(messages, model, key, base, max_tokens=256, temperature=0.0):
     url = base.rstrip("/") + "/chat/completions"
     last = None
     for attempt in range(MAX_RETRIES + 1):
+        time.sleep(max(0.0, float(os.environ.get("RP_REQUEST_INTERVAL") or 0)))
         req = urllib.request.Request(
             url, data=body,
             headers={"Authorization": "Bearer " + key,
@@ -187,7 +192,10 @@ def _chat(messages, model, key, base, max_tokens=256, temperature=0.0):
                 print(f"  [400] {body[:300]}", file=sys.stderr, flush=True)
             if exc.code in (429, 500, 502, 503, 504, 520, 522, 523, 524) \
                     and attempt < MAX_RETRIES:
-                wait = min(120, 5 * (2 ** attempt))
+                wait = min(300, 30 * (2 ** attempt))
+                retry_after = exc.headers.get("Retry-After", "")
+                if retry_after.isdigit():
+                    wait = max(wait, int(retry_after))
                 print(f"  [retry] HTTP {exc.code}，{wait}s 后重试",
                       file=sys.stderr, flush=True)
                 time.sleep(wait)

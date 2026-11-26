@@ -29,7 +29,7 @@ if _cached is not None and "/compression/" in str(getattr(_cached, "__file__", "
     _sys.modules.pop("compression", None)
 
 import conflict, context_budget, control, disclosure, embedding, gate, governance, gradient, intimacy
-import compression, ledger, merge_ann, promise, questions, recall_shadow, retention, retriever, scoring, sealing
+import compression, ledger, merge_ann, promise, question_count, questions, recall_shadow, retention, retriever, scoring, sealing
 import style_middleware
 from persona_guard import PersonaGuard
 from summarizer import parse as parse_json, summarize
@@ -3586,6 +3586,18 @@ class RPContextMiddleware:
         label = source_label(source)
         msgs.append({"role": "user",
                      "content": f"{label}{user_input}" if label else user_input})   # R1：只注入一次
+        # 计数/汇总两遍（灰度 RP_COUNT_TWOPASS=1）：先抽原始清单，再在正常回复里按口径计数
+        if question_count.should_run(user_input):
+            try:
+                _ev = question_count.build_evidence(self.db, sid, cid, turn)
+                _inv = question_count.extract_inventory(self.front, user_input, _ev)
+                if _inv:
+                    question_count.inject(msgs, _inv)
+                    logger.info("计数两遍 sid=%s cid=%s 清单行=%d",
+                                sid, cid, _inv.count("\n") + 1)
+            except Exception as exc:              # noqa: BLE001 计数失败不拖垮对话
+                logger.warning("计数两遍失败，回退普通回复 sid=%s cid=%s：%s",
+                               sid, cid, exc)
         reply = self._guard_reply(msgs, persona, sid, cid, tool_context)
         if reply_filter is not None:          # 落库前清洗（如群聊里模型照抄「昵称：」前缀）
             try:
